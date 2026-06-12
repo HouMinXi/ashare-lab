@@ -12,6 +12,8 @@ dependencies = [
     "requests",
     "tushare",
     "baostock",
+    "exchange-calendars>=4.13.2",
+    "easy-tdx>=1.11.1",
 ]
 
 [dependency-groups]

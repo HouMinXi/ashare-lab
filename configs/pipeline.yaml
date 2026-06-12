@@ -1,0 +1,17 @@
+data:
+  provider_uri: ~/.qlib/qlib_data/cn_data
+  chenditc_repo: chenditc/investment_data
+  download_timeout_s: 1800
+  retry_intervals_h: [2, 4]
+
+validation:
+  spot_check_symbols: [SH600000, SZ000001, SH601318]
+  lookback_days: 5
+
+fallback:
+  baostock_timeout_s: 25
+  max_symbols_per_session: 50
+
+calendar:
+  exchange: XSHG
+  timezone: Asia/Shanghai
