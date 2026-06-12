@@ -18,15 +18,24 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+log = logging.getLogger(__name__)
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
-    bootstrap()
-    return 0
+    try:
+        bootstrap()
+        return 0
+    except Exception as exc:
+        log.error("bootstrap failed: %s", exc)
+        return 2
 
 
 def cmd_update(args: argparse.Namespace) -> int:
-    return daily_refresh()
+    try:
+        return daily_refresh()
+    except Exception as exc:
+        log.error("update failed: %s", exc)
+        return 2
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -35,6 +44,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
     inst = validate_instruments()
     print(json.dumps({"raw_check": raw, "return_check": ret, "instruments": inst}, indent=2))
     failed = any(v.get("status") == "FAIL" for v in raw.values())
+    if raw and all(v.get("status") == "SKIP" for v in raw.values()):
+        log.warning("all symbols skipped in raw check -- data sources unreachable")
+        return 1
     if inst.get("status") == "FAIL":
         failed = True
     return 2 if failed else 0

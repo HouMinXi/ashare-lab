@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 
-from ashare_lab.data.calendar import is_trading_day, latest_trading_day
+from ashare_lab.data.calendar import latest_trading_day
 
 log = logging.getLogger(__name__)
 
@@ -89,12 +89,16 @@ def _download_tarball(url: str, dest: Path) -> Path:
             f.write(chunk)
 
     actual_size = out.stat().st_size
-    expected_size = resp.headers.get("Content-Length")
-    if expected_size and actual_size < int(expected_size):
-        out.unlink()
-        raise RuntimeError(
-            f"incomplete download: got {actual_size}, expected {expected_size}"
-        )
+    content_length = resp.headers.get("Content-Length")
+    if content_length:
+        # For resume (Range request): Content-Length is the partial bytes sent,
+        # so expected total = previously downloaded + newly received.
+        expected_total = existing + int(content_length)
+        if actual_size < expected_total:
+            out.unlink()
+            raise RuntimeError(
+                f"incomplete download: got {actual_size}, expected {expected_total}"
+            )
     log.info("download complete: %s (%d bytes)", out, actual_size)
     return out
 
@@ -181,10 +185,6 @@ def daily_refresh(
     Raises on fatal errors (network, extraction, filesystem).
     """
     expected = latest_trading_day()
-    if not is_trading_day(expected):
-        log.info("not a trading day (%s), skipping", expected)
-        return 0
-
     current_last = _read_calendar_last_date(provider_uri)
     if current_last and current_last >= expected.isoformat():
         log.info("data already current (last=%s, expected=%s)", current_last, expected)

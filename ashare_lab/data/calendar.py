@@ -35,7 +35,9 @@ def latest_trading_day(as_of: dt.date | None = None) -> dt.date:
     if ts > cal.last_session:
         return cal.last_session.date()
     if ts < cal.first_session:
-        return cal.first_session.date()
+        raise ValueError(
+            f"as_of {as_of} predates calendar start {cal.first_session.date()}"
+        )
     if cal.is_session(ts):
         return ts.date()
     prev = cal.previous_close(ts).normalize()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from pathlib import Path
 
@@ -29,7 +30,10 @@ def _load_qlib_feature(
     bin_path = provider_uri / "features" / symbol.lower() / f"{field}.day.bin"
     if not bin_path.exists():
         return None
-    data = np.fromfile(bin_path, dtype="<f")
+    try:
+        data = np.fromfile(bin_path, dtype="<f")
+    except OSError:
+        return None
     if len(data) < 2:
         return None
     start_idx = int(data[0])
@@ -75,6 +79,9 @@ def _fetch_baostock_raw(
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")
         return df
+    except Exception as exc:
+        log.warning("baostock query failed for %s: %s", symbol, exc)
+        return None
     finally:
         bs.logout()
 
@@ -89,11 +96,12 @@ def spot_check_raw(
         symbols = DEFAULT_SYMBOLS
 
     ltd = latest_trading_day()
-    days = trading_days_between(
-        ltd.replace(day=max(1, ltd.day - lookback * 2)), ltd
-    )
+    start = ltd - dt.timedelta(days=lookback * 3)
+    days = trading_days_between(start, ltd)
     if len(days) > lookback:
         days = days[-lookback:]
+    if not days:
+        return {}
     start_str = days[0].isoformat()
     end_str = days[-1].isoformat()
 
@@ -110,7 +118,8 @@ def spot_check_raw(
             results[sym] = {"status": "SKIP", "reason": "no baostock data"}
             continue
 
-        qlib_raw = qlib_close / qlib_factor
+        qlib_factor_safe = qlib_factor.where(qlib_factor != 0)
+        qlib_raw = qlib_close / qlib_factor_safe
 
         common = qlib_raw.index.intersection(bs_df.index)
         if len(common) == 0:
@@ -121,6 +130,10 @@ def spot_check_raw(
         bs_vals = bs_df.loc[common, "close"]
         diff = (qlib_vals - bs_vals).abs()
         max_diff = diff.max()
+
+        if pd.isna(max_diff):
+            results[sym] = {"status": "SKIP", "reason": "price diff NaN (check factor values)"}
+            continue
 
         if max_diff > RAW_TOLERANCE:
             results[sym] = {
@@ -150,9 +163,8 @@ def check_return_consistency(
         symbols = DEFAULT_SYMBOLS
 
     ltd = latest_trading_day()
-    days = trading_days_between(
-        ltd.replace(day=max(1, ltd.day - lookback * 2)), ltd
-    )
+    start = ltd - dt.timedelta(days=lookback * 3)
+    days = trading_days_between(start, ltd)
     start_str = days[0].isoformat() if days else ltd.isoformat()
     end_str = days[-1].isoformat() if days else ltd.isoformat()
 
@@ -165,7 +177,8 @@ def check_return_consistency(
             results[sym] = {"status": "SKIP"}
             continue
 
-        qlib_raw = qlib_close / qlib_factor
+        qlib_factor_safe = qlib_factor.where(qlib_factor != 0)
+        qlib_raw = qlib_close / qlib_factor_safe
 
         common = qlib_raw.index.intersection(bs_df.index)
         if len(common) < 3:
@@ -197,10 +210,16 @@ def validate_instruments(
     if not inst_file.exists():
         return {"status": "FAIL", "reason": f"{inst_file} not found"}
 
-    df = pd.read_csv(inst_file, sep="\t", header=None, names=["symbol", "start", "end"])
+    try:
+        df = pd.read_csv(inst_file, sep="\t", header=None, names=["symbol", "start", "end"])
+    except Exception as exc:
+        return {"status": "FAIL", "reason": f"cannot parse instruments file: {exc}"}
     total_rows = len(df)
 
-    df["end"] = pd.to_datetime(df["end"])
+    try:
+        df["end"] = pd.to_datetime(df["end"])
+    except (ValueError, TypeError) as exc:
+        return {"status": "FAIL", "reason": f"malformed end date in instruments: {exc}"}
     ltd = pd.Timestamp(latest_trading_day())
     current = df[df["end"] >= ltd - pd.Timedelta(days=10)]
     active_count = current["symbol"].nunique()

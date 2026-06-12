@@ -16,6 +16,9 @@ dependencies = [
     "easy-tdx>=1.11.1",
 ]
 
+[tool.setuptools.packages.find]
+include = ["ashare_lab*"]
+
 [dependency-groups]
 dev = [
     "pytest",
