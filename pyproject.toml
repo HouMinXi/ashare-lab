@@ -16,6 +16,9 @@ dependencies = [
     "easy-tdx>=1.11.1",
 ]
 
+[project.scripts]
+ashare-baseline = "ashare_lab.research.report:main"
+
 [tool.setuptools.packages.find]
 include = ["ashare_lab*"]
 
