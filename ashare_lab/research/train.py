@@ -1,6 +1,6 @@
 """Walk-forward window training: Alpha158 + LGBModel on CSI500/CSI300.
 
-Provides _apply_price_filter() and train_window(). All qlib imports are
+Provides apply_price_filter() and train_window(). All qlib imports are
 deferred inside function bodies so this module is importable without a
 qlib runtime (required for unit test isolation).
 """
@@ -14,8 +14,12 @@ from ashare_lab.config import load_config
 
 log = logging.getLogger(__name__)
 
+# Alpha158 requires ~1 year of price history before the first train_start.
+# This constant is shared with smoke_test.py; both must use the same value.
+ALPHA158_WARMUP_START = "2017-01-01"
 
-def _apply_price_filter(
+
+def apply_price_filter(
     pred,
     test_start: str,
     test_end: str,
@@ -90,7 +94,7 @@ def train_window(
     """Train an LGBModel on one walk-forward window and return predictions.
 
     Initialises qlib, builds Alpha158 handler with the given universe and
-    warmup start 2017-01-01, wraps it in DatasetH with train/valid/test
+    warmup start ALPHA158_WARMUP_START, wraps it in DatasetH with train/valid/test
     segments from window, trains LGBModel(random_state=42, verbose=-1),
     persists the model to exp_dir/models/w{window_id}.pkl, generates
     predictions on the test set, applies price filter, and extracts labels.
@@ -111,6 +115,7 @@ def train_window(
                 next-period return labels for the test set.
     """
     import qlib  # noqa: PLC0415
+    from qlib.config import REG_CN  # noqa: PLC0415
     from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
     from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
     from qlib.data.dataset import DatasetH  # noqa: PLC0415
@@ -131,14 +136,14 @@ def train_window(
         universe,
     )
 
-    qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+    qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
     # Alpha158 is a DataHandlerLP (NOT a Dataset); wrap it in DatasetH.
-    # Warmup start 2017-01-01 provides ~1 year of history for lookback
+    # Warmup start ALPHA158_WARMUP_START provides ~1 year of history for lookback
     # features before train_start 2018-01-01.
     handler = Alpha158(
         instruments=universe,
-        start_time="2017-01-01",
+        start_time=ALPHA158_WARMUP_START,
         end_time=window["test_end"],
         fit_start_time=window["train_start"],
         fit_end_time=window["train_end"],
@@ -171,7 +176,7 @@ def train_window(
     pred = model.predict(dataset, segment="test")
 
     # Apply price filter (modifies pred in-place logically; returns new Series).
-    pred = _apply_price_filter(pred, window["test_start"], window["test_end"], universe)
+    pred = apply_price_filter(pred, window["test_start"], window["test_end"], universe)
 
     # Extract test labels: first column of the label DataFrame (typically "LABEL0").
     label = dataset.prepare("test", col_set="label").iloc[:, 0]

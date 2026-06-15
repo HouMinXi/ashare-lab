@@ -395,7 +395,7 @@ class TestCsi300Reference:
 
         with (
             patch(
-                "ashare_lab.research.rolling.run_full_walk_forward",
+                "ashare_lab.research.supplementary.run_full_walk_forward",
                 return_value=[fake_csi300_window],
             ),
             patch(

@@ -116,7 +116,7 @@ def build_verdict(
     n_windows: int = len(window_results)
 
     # pos_pct denominator = n_windows (all completed windows, including those
-    # with None IC -- None IC only affects the mean, not the positive flag).
+    # with None IC; None IC only affects the mean, not the positive flag).
     if n_windows == 0:
         pos_pct = 0.0
         mean_ic = None
@@ -136,9 +136,8 @@ def build_verdict(
 
     gate = compute_gate(mean_ic, pos_pct, gate_config)
 
-    n_positive = sum(
-        1 for w in window_results if w.get("is_positive_excess", False)
-    )
+    # Reuse n_pos computed above (avoid identical second sum).
+    n_positive = n_pos if n_windows > 0 else 0
 
     # rejected_orders_lot_skip: sum of non-None lot_skip_count values.
     # None if ALL windows have lot_skip_count=None.
@@ -161,7 +160,7 @@ def build_verdict(
     ]
 
     # Human-readable note.
-    ic_str = f"{mean_ic}" if mean_ic is not None else "None"
+    ic_str = f"{mean_ic:.4f}" if mean_ic is not None else "None"
     note = (
         f"Gate {gate}: mean_rank_ic={ic_str}, "
         f"positive_excess_pct={pos_pct:.0%}"

@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from ashare_lab.config import MODELS_DIR, load_config
+from ashare_lab.research.rolling import run_full_walk_forward
 from ashare_lab.research.verdict import _serialize_verdict, build_verdict
 
 log = logging.getLogger(__name__)
@@ -358,10 +359,8 @@ def run_slippage_sensitivity(
         }
     ]
 
-    # Track which window_ids were re-backtested successfully across all levels.
-    # Used to recompute baseline denominator if any window is skipped.
-    all_backtested_ids: set[int] = set()
-    per_level_results: list[dict] = []  # store intermediate for recompute
+    # Collect per-level re-backtest results.
+    per_level_results: list[dict] = []
 
     for level in levels:
         level_results: list[dict] = []
@@ -377,29 +376,39 @@ def run_slippage_sensitivity(
                 level_results.append(result)
                 level_backtested_ids.add(w["window_id"])
 
-        all_backtested_ids.update(level_backtested_ids)
         per_level_results.append(
             {"level": level, "results": level_results, "ids": level_backtested_ids}
         )
 
-    # Check if any window was skipped across ALL levels combined.
+    # Update CSV Row 0 baseline if any window was skipped across any level.
     all_input_ids = {w["window_id"] for w in main_window_results}
-    # Find windows that are missing in at least one level's results.
-    # We use the intersection of successfully backtested IDs across all levels
-    # to determine which windows contribute consistently.
-    if all_backtested_ids and all_backtested_ids != all_input_ids:
-        # Some windows were skipped; recompute baseline using matched windows only.
+    # Intersection of per-level backtested IDs: only windows present in EVERY level.
+    # Using intersection guarantees that CSV Row 0 (baseline) is computed from the
+    # same window population visible in all level rows, making visual comparison
+    # correct. Union would mask cross-level mismatches and leave Row 0 computed
+    # from a different sample than the level rows that compare against it.
+    # Include empty sets in the intersection: if any level produced zero results,
+    # set.intersection(..., set()) = set(), so all_seen_ids correctly becomes
+    # empty, triggering baseline recomputation from no windows (handled by the
+    # guard below). Filtering out empty sets would exclude those levels from the
+    # intersection and silently produce a non-empty all_seen_ids.
+    level_id_sets = [entry["ids"] for entry in per_level_results]
+    all_seen_ids: set[int] = (
+        set.intersection(*level_id_sets) if level_id_sets else set()
+    )
+
+    if all_seen_ids and all_seen_ids != all_input_ids:
         matched_windows = [
-            w for w in main_window_results if w["window_id"] in all_backtested_ids
+            w for w in main_window_results if w["window_id"] in all_seen_ids
         ]
         recomputed_baseline = float(
             sum(w["cumulative_excess_return"] for w in matched_windows)
             / len(matched_windows)
         )
         log.warning(
-            "run_slippage_sensitivity: %d/%d windows matched; "
-            "recomputing baseline from matched windows (%.6f -> %.6f)",
-            len(all_backtested_ids),
+            "run_slippage_sensitivity: %d/%d windows present in every level; "
+            "updating baseline row (%.6f -> %.6f)",
+            len(all_seen_ids),
             len(all_input_ids),
             baseline_mean,
             recomputed_baseline,
@@ -432,13 +441,31 @@ def run_slippage_sensitivity(
             }
         )
 
-    # Compute fragility: any non-baseline row has rel_drop > threshold.
+    # Compute fragility: compare each level against a baseline from the SAME
+    # windows that level successfully backtested. Using a different-sized
+    # baseline sample for each level's rel_drop gives consistent denominators.
     is_fragile = False
-    for row in rows:
-        if row["is_baseline"]:
-            continue
+    for entry in per_level_results:
+        level_results = entry["results"]
+        if not level_results:
+            # Zero matched windows: treat as maximally fragile.
+            log.warning(
+                "run_slippage_sensitivity: level %s has zero matched windows; "
+                "flagging as fragile",
+                entry["level"],
+            )
+            is_fragile = True
+            break
+
+        level_mean = float(
+            sum(r["cumulative_excess_return"] for r in level_results)
+            / len(level_results)
+        )
+        # Compare against baseline_mean, which is exactly what CSV Row 0 shows
+        # (intersection-based or original if no windows were skipped). Using
+        # baseline_mean keeps the fragility decision visible from the CSV output.
         denominator = max(abs(baseline_mean), abs_tol)
-        rel_drop = (baseline_mean - row["mean_cumulative_excess"]) / denominator
+        rel_drop = (baseline_mean - level_mean) / denominator
         if rel_drop > rel_drop_threshold:
             is_fragile = True
             break
@@ -554,8 +581,6 @@ def run_csi300_reference(exp_dir: Path) -> tuple[Path, Path]:
     Returns:
         (csi300_verdict_path, csi300_control_verdict_path) in that order.
     """
-    from ashare_lab.research.rolling import run_full_walk_forward  # noqa: PLC0415
-
     cfg = load_config()
     gate_config: dict = cfg["gate"]
     topk: int = cfg["strategy"]["topk"]

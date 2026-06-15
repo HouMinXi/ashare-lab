@@ -194,12 +194,13 @@ class TestAggregateWindowMetrics:
         assert result["mean_rank_ic"] == pytest.approx(0.04, rel=1e-6)
 
     def test_zero_excess_is_not_positive(self):
-        """Cumulative excess of exactly 0.0 -> is_positive_excess=False (strict)."""
+        """Cumulative excess of exactly 0.0 -> is_positive_excess=False (strict > 0 rule)."""
         rank_ic = self._basic_rank_ic()
-        # portfolio and bench move by exactly the same amount
+        # Portfolio return matches benchmark return exactly: excess = 0.0.
+        # bench pct_change([100.0, 100.5]) = [0.005]; portfolio return = 0.005.
         portfolio_df = _make_portfolio_df(["2023-01-04"], [0.005])
         bench_close = _make_bench_close(["2023-01-03", "2023-01-04"], [100.0, 100.5])
         result = aggregate_window_metrics(rank_ic, portfolio_df, bench_close, 5, 0)
-        # excess may be near-zero; test the strict > 0 rule explicitly with zero
-        result["cumulative_excess_return"] = 0.0
-        assert not (result["cumulative_excess_return"] > 0)
+        # Verify actual computed values -- do not mutate result before asserting.
+        assert result["cumulative_excess_return"] == pytest.approx(0.0, abs=1e-10)
+        assert result["is_positive_excess"] is False  # strict: 0.0 > 0 is False

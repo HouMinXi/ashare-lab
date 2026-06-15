@@ -76,7 +76,7 @@ def _make_window():
 
 
 # ---------------------------------------------------------------------------
-# Tests for _apply_price_filter
+# Tests for apply_price_filter
 # ---------------------------------------------------------------------------
 
 
@@ -97,7 +97,7 @@ class TestApplyPriceFilter:
             "ashare_lab.research.train.load_config",
             return_value={"universe": {"exclude_close_above_cny": 300}},
         ):
-            result = train_mod._apply_price_filter(pred, "2023-01-03", "2023-06-30", "csi500")
+            result = train_mod.apply_price_filter(pred, "2023-01-03", "2023-06-30", "csi500")
 
         mock_D.features.assert_not_called()
         assert result.empty
@@ -134,7 +134,7 @@ class TestApplyPriceFilter:
             "ashare_lab.research.train.load_config",
             return_value={"universe": {"exclude_close_above_cny": 300}},
         ):
-            result = train_mod._apply_price_filter(pred, "2023-01-03", "2023-01-03", "csi500")
+            result = train_mod.apply_price_filter(pred, "2023-01-03", "2023-01-03", "csi500")
 
         result_syms = result.index.get_level_values("instrument").tolist()
         assert "CHEAP" in result_syms
@@ -326,9 +326,8 @@ class TestRunFullWalkForward:
             )
 
         assert len(results) == 2
-        warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("only 2 windows completed" in str(m) for m in warning_msgs), (
-            f"Expected 'only 2 windows completed' warning; got: {warning_msgs}"
+        assert "only 2 windows completed" in caplog.text, (
+            f"Expected 'only 2 windows completed' warning; got: {caplog.text!r}"
         )
 
     def test_pred_path_naming_convention(self, tmp_path):

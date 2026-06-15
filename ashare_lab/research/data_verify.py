@@ -7,8 +7,8 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Date threshold for "active" instrument (end_date string comparison is safe
-# because qlib uses YYYY-MM-DD format -- lexicographic order matches date order).
+# Date threshold for "active" instrument (end_date string comparison is safe;
+# qlib uses YYYY-MM-DD format so lexicographic order matches date order).
 _ACTIVE_CUTOFF = "2026-01-01"
 _MIN_ACTIVE_COUNT = 500
 
