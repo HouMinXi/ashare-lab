@@ -160,7 +160,7 @@ def build_verdict(
     ]
 
     # Human-readable note.
-    ic_str = f"{mean_ic}" if mean_ic is not None else "None"
+    ic_str = f"{mean_ic:.4f}" if mean_ic is not None else "None"
     note = (
         f"Gate {gate}: mean_rank_ic={ic_str}, "
         f"positive_excess_pct={pos_pct:.0%}"

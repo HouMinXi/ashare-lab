@@ -442,8 +442,6 @@ def run_slippage_sensitivity(
     is_fragile = False
     for entry in per_level_results:
         level_results = entry["results"]
-        level_ids = entry["ids"]
-
         if not level_results:
             # Zero matched windows: treat as maximally fragile.
             log.warning(
@@ -458,16 +456,11 @@ def run_slippage_sensitivity(
             sum(r["cumulative_excess_return"] for r in level_results)
             / len(level_results)
         )
-        # Baseline recomputed from same windows (consistent denominator).
-        level_baseline_windows = [
-            w for w in main_window_results if w["window_id"] in level_ids
-        ]
-        level_baseline = float(
-            sum(w["cumulative_excess_return"] for w in level_baseline_windows)
-            / len(level_baseline_windows)
-        )
-        denominator = max(abs(level_baseline), abs_tol)
-        rel_drop = (level_baseline - level_mean) / denominator
+        # Compare against baseline_mean, which is exactly what CSV Row 0 shows
+        # (intersection-based or original if no windows were skipped). Using
+        # baseline_mean keeps the fragility decision visible from the CSV output.
+        denominator = max(abs(baseline_mean), abs_tol)
+        rel_drop = (baseline_mean - level_mean) / denominator
         if rel_drop > rel_drop_threshold:
             is_fragile = True
             break
