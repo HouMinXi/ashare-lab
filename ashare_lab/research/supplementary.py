@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from ashare_lab.config import MODELS_DIR, load_config
+from ashare_lab.research.rolling import run_full_walk_forward
 from ashare_lab.research.verdict import _serialize_verdict, build_verdict
 
 log = logging.getLogger(__name__)
@@ -582,8 +583,6 @@ def run_csi300_reference(exp_dir: Path) -> tuple[Path, Path]:
     Returns:
         (csi300_verdict_path, csi300_control_verdict_path) in that order.
     """
-    from ashare_lab.research.rolling import run_full_walk_forward  # noqa: PLC0415
-
     cfg = load_config()
     gate_config: dict = cfg["gate"]
     topk: int = cfg["strategy"]["topk"]
