@@ -314,7 +314,7 @@ class TestVerdictBackfill:
 
         # slippage_sensitivity must now be a dict (not None).
         assert isinstance(result["slippage_sensitivity"], dict)
-        assert "rows" in result["slippage_sensitivity"]
+        assert "levels" in result["slippage_sensitivity"]
         assert "is_fragile" in result["slippage_sensitivity"]
 
 

@@ -11,6 +11,7 @@ without qlib.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest import mock
 
 import pandas as pd
@@ -328,4 +329,38 @@ class TestRunFullWalkForward:
         warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("only 2 windows completed" in str(m) for m in warning_msgs), (
             f"Expected 'only 2 windows completed' warning; got: {warning_msgs}"
+        )
+
+    def test_pred_path_naming_convention(self, tmp_path):
+        """Persisted predictions follow PredictionFile schema: pred_w{N}.parquet."""
+        import ashare_lab.research.rolling as rolling_mod
+
+        windows = [self._make_window(1)]
+        pred, label = self._pred_and_label()
+        portfolio_df, bench_close = self._portfolio_and_bench()
+
+        def mock_train(window, exp_dir, universe):
+            return (tmp_path / f"w{window['window_id']}.pkl", pred, label)
+
+        def mock_backtest(window, pred, n_drop, slippage_override):
+            return portfolio_df, bench_close, 0
+
+        with mock.patch.object(
+            rolling_mod, "get_all_windows", return_value=windows
+        ), mock.patch.object(
+            rolling_mod, "train_window", side_effect=mock_train
+        ), mock.patch.object(
+            rolling_mod, "run_backtest", side_effect=mock_backtest
+        ), mock.patch(
+            "ashare_lab.research.rolling.load_config",
+            return_value={"walk_forward": {"min_windows": 1}},
+        ):
+            results = rolling_mod.run_full_walk_forward(
+                exp_dir=tmp_path, n_drop=1, universe="csi500"
+            )
+
+        assert len(results) == 1
+        pred_path = Path(results[0]["pred_path"])
+        assert pred_path.name == "pred_w1.parquet", (
+            f"PredictionFile schema requires 'pred_w{{N}}.parquet'; got {pred_path.name!r}"
         )

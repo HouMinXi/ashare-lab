@@ -458,7 +458,7 @@ def run_slippage_sensitivity(
         for r in rows
     ]
     slippage_sensitivity_dict = {
-        "rows": sensitivity_rows,
+        "levels": sensitivity_rows,
         "is_fragile": is_fragile,
     }
 

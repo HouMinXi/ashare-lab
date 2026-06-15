@@ -112,7 +112,7 @@ def run_full_walk_forward(
             )
 
             # Step 5: persist predictions as parquet (PredictionFile schema).
-            pred_path = pred_dir / f"w{window_id}_pred.parquet"
+            pred_path = pred_dir / f"pred_w{window_id}.parquet"
             pred.to_frame("score").to_parquet(pred_path)
             log.info("W%d: predictions persisted -> %s", window_id, pred_path)
 
