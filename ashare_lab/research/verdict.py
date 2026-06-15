@@ -136,9 +136,8 @@ def build_verdict(
 
     gate = compute_gate(mean_ic, pos_pct, gate_config)
 
-    n_positive = sum(
-        1 for w in window_results if w.get("is_positive_excess", False)
-    )
+    # Reuse n_pos computed above (avoid identical second sum).
+    n_positive = n_pos if n_windows > 0 else 0
 
     # rejected_orders_lot_skip: sum of non-None lot_skip_count values.
     # None if ALL windows have lot_skip_count=None.

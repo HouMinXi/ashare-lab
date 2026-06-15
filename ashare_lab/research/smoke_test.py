@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from pathlib import Path
 
+import pandas as pd
 from dateutil.relativedelta import relativedelta
 
 from ashare_lab.config import load_config
 from ashare_lab.data.calendar import latest_trading_day
+from ashare_lab.research.train import _apply_price_filter
 
 log = logging.getLogger(__name__)
 
@@ -115,8 +118,6 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
             n_predictions (int): number of predictions after price filter
             ok (bool): rank_ic is finite and non-NaN
     """
-    import math  # noqa: PLC0415
-
     import qlib  # noqa: PLC0415
     from qlib.config import REG_CN  # noqa: PLC0415
     from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
@@ -131,7 +132,6 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
 
     qlib.init(provider_uri=str(provider_uri), region=REG_CN)
 
-    cfg = load_config()
     w1 = get_window(0)
 
     log.info(
@@ -175,16 +175,13 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
     # Extract labels for the test period.
     label = dataset.prepare("test", col_set="label").iloc[:, 0]
 
-    # Apply price filter: exclude stocks with close > threshold on each date.
-    threshold = cfg["universe"]["exclude_close_above_cny"]
-    pred = _apply_price_filter(pred, w1["test_start"], w1["test_end"], threshold)
+    # Apply price filter via shared helper from train.py (threshold read from config).
+    pred = _apply_price_filter(pred, w1["test_start"], w1["test_end"], universe="csi500")
 
     n_predictions = len(pred)
     log.info("predictions after price filter: %d", n_predictions)
 
     # Inline Spearman RankIC across all (date, instrument) pairs.
-    import pandas as pd  # noqa: PLC0415
-
     pred_df = pred.unstack("instrument")
     label_df = label.unstack("instrument")
     common_dates = pred_df.index.intersection(label_df.index)
@@ -210,42 +207,3 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
         "n_predictions": n_predictions,
         "ok": ok,
     }
-
-
-def _apply_price_filter(
-    pred,
-    test_start: str,
-    test_end: str,
-    threshold: float,
-):
-    """Remove predictions for stocks with close > threshold.
-
-    Fetches daily close prices for all instruments in pred over the test
-    period, then drops (date, instrument) pairs where close > threshold.
-
-    Args:
-        pred: MultiIndex Series (datetime, instrument) -> score.
-        test_start: Test period start, YYYY-MM-DD.
-        test_end: Test period end, YYYY-MM-DD.
-        threshold: Maximum allowed close price in CNY.
-
-    Returns:
-        Filtered Series with same structure as pred.
-    """
-    from qlib.data import D  # noqa: PLC0415
-
-    instruments = pred.index.get_level_values("instrument").unique().tolist()
-    close_df = D.features(
-        instruments=instruments,
-        fields=["$close"],
-        start_time=test_start,
-        end_time=test_end,
-    )
-    if close_df is None or close_df.empty:
-        log.warning("price filter: no close data; returning pred unfiltered")
-        return pred
-
-    close_series = close_df["$close"]
-    valid_mask = close_series <= threshold
-    valid_idx = close_series[valid_mask].index
-    return pred[pred.index.isin(valid_idx)]
