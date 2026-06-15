@@ -16,6 +16,10 @@ dependencies = [
     "easy-tdx>=1.11.1",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project.scripts]
 ashare-baseline = "ashare_lab.research.report:main"
 
