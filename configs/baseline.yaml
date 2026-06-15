@@ -1,0 +1,41 @@
+---
+universe:
+  primary: csi500
+  reference: csi300
+  exclude_close_above_cny: 300
+walk_forward:
+  train_start: "2018-01-01"
+  base_train_end: "2022-12-31"
+  step_months: 6
+  min_windows: 5
+strategy:
+  # shared by all tracks; 20K CNY per position at 300K capital
+  topk: 15
+  main:
+    n_drop: 1
+  control:
+    n_drop: 2
+cost_model:
+  account: 300000
+  trade_unit: 100
+  # documentation-only; NOT passed to strategy ctor (see binding table)
+  risk_degree: 0.95
+  benchmark: "SH000300"
+  deal_price: close
+  open_cost: 0.00026
+  close_cost: 0.00076
+  min_cost: 5
+  slippage: 0.001
+  limit_threshold: 0.099
+gate:
+  min_mean_rank_ic: 0.02
+  min_positive_excess_pct: 0.60
+  border_pass_ic_upper: 0.022
+  border_pass_excess_upper: 0.66
+# extra levels above cost_model.slippage baseline
+slippage_sensitivity: [0.0015, 0.002]
+slippage_fragility:
+  # fragile if excess drops > 50% vs baseline at any level
+  rel_drop_threshold: 0.50
+  # treat abs(excess) <= this as flat (no float-noise sign flip)
+  abs_tol: 0.0005
