@@ -45,7 +45,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     print(json.dumps({"raw_check": raw, "return_check": ret, "instruments": inst}, indent=2))
     failed = any(v.get("status") == "FAIL" for v in raw.values())
     if raw and all(v.get("status") == "SKIP" for v in raw.values()):
-        log.warning("all symbols skipped in raw check -- data sources unreachable")
+        log.warning("all symbols skipped in raw check; data sources unreachable")
         return 1
     if inst.get("status") == "FAIL":
         failed = True

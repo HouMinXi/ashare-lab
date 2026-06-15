@@ -197,7 +197,7 @@ def daily_refresh(
 
     if tag < expected.isoformat():
         log.warning(
-            "chenditc release %s is behind expected %s -- data stale",
+            "chenditc release %s behind expected %s, data stale",
             tag,
             expected,
         )

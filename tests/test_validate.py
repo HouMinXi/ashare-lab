@@ -61,14 +61,11 @@ def test_validate_instruments_real_data():
     assert "NaN" not in j
 
 
-def test_spot_check_raw_empty_days_returns_empty_dict():
-    """spot_check_raw returns {} if no trading days in range."""
+def test_spot_check_raw_no_data_returns_dict():
+    """spot_check_raw returns a dict when provider_uri has no qlib data."""
     from ashare_lab.data.validate import spot_check_raw
-    # With lookback=0, days window collapses to empty
-    # We test via real path: if provider_uri is empty, returns SKIP not crash
     with tempfile.TemporaryDirectory() as tmp:
         result = spot_check_raw(provider_uri=Path(tmp))
-    # Should return dict (may be {} or {sym: SKIP})
     assert isinstance(result, dict)
 
 
