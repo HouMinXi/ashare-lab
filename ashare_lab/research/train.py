@@ -8,6 +8,7 @@ qlib runtime (required for unit test isolation).
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from ashare_lab.config import load_config
@@ -114,6 +115,11 @@ def train_window(
             label: MultiIndex Series (datetime, instrument) -> float,
                 next-period return labels for the test set.
     """
+    # mlflow >=2.x deprecated the filesystem tracking backend used by qlib's
+    # experiment recorder.  Set the opt-out flag before any qlib/mlflow import
+    # so the file store remains usable until a tracking backend migration is done.
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
     import qlib  # noqa: PLC0415
     from qlib.config import REG_CN  # noqa: PLC0415
     from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
