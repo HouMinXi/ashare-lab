@@ -116,7 +116,7 @@ def build_verdict(
     n_windows: int = len(window_results)
 
     # pos_pct denominator = n_windows (all completed windows, including those
-    # with None IC -- None IC only affects the mean, not the positive flag).
+    # with None IC; None IC only affects the mean, not the positive flag).
     if n_windows == 0:
         pos_pct = 0.0
         mean_ic = None

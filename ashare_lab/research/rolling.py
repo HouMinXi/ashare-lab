@@ -33,7 +33,7 @@ def run_full_walk_forward(
     windows are skipped (not included in the returned list).
 
     All windows from get_all_windows() are evaluated regardless of
-    is_complete (D-02: incomplete windows counted in denominator with no
+    is_complete (incomplete windows count in the denominator with no
     special treatment). is_complete=False windows are logged for visibility.
 
     Args:
