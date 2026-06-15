@@ -111,6 +111,7 @@ def train_window(
                 next-period return labels for the test set.
     """
     import qlib  # noqa: PLC0415
+    from qlib.config import REG_CN  # noqa: PLC0415
     from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
     from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
     from qlib.data.dataset import DatasetH  # noqa: PLC0415
@@ -131,7 +132,7 @@ def train_window(
         universe,
     )
 
-    qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+    qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
     # Alpha158 is a DataHandlerLP (NOT a Dataset); wrap it in DatasetH.
     # Warmup start 2017-01-01 provides ~1 year of history for lookback

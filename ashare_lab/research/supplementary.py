@@ -358,10 +358,8 @@ def run_slippage_sensitivity(
         }
     ]
 
-    # Track which window_ids were re-backtested successfully across all levels.
-    # Used to recompute baseline denominator if any window is skipped.
-    all_backtested_ids: set[int] = set()
-    per_level_results: list[dict] = []  # store intermediate for recompute
+    # Collect per-level re-backtest results.
+    per_level_results: list[dict] = []
 
     for level in levels:
         level_results: list[dict] = []
@@ -377,29 +375,28 @@ def run_slippage_sensitivity(
                 level_results.append(result)
                 level_backtested_ids.add(w["window_id"])
 
-        all_backtested_ids.update(level_backtested_ids)
         per_level_results.append(
             {"level": level, "results": level_results, "ids": level_backtested_ids}
         )
 
-    # Check if any window was skipped across ALL levels combined.
+    # Update CSV Row 0 baseline if any window was skipped across any level.
     all_input_ids = {w["window_id"] for w in main_window_results}
-    # Find windows that are missing in at least one level's results.
-    # We use the intersection of successfully backtested IDs across all levels
-    # to determine which windows contribute consistently.
-    if all_backtested_ids and all_backtested_ids != all_input_ids:
-        # Some windows were skipped; recompute baseline using matched windows only.
+    all_seen_ids: set[int] = set()
+    for entry in per_level_results:
+        all_seen_ids.update(entry["ids"])
+
+    if all_seen_ids and all_seen_ids != all_input_ids:
         matched_windows = [
-            w for w in main_window_results if w["window_id"] in all_backtested_ids
+            w for w in main_window_results if w["window_id"] in all_seen_ids
         ]
         recomputed_baseline = float(
             sum(w["cumulative_excess_return"] for w in matched_windows)
             / len(matched_windows)
         )
         log.warning(
-            "run_slippage_sensitivity: %d/%d windows matched; "
-            "recomputing baseline from matched windows (%.6f -> %.6f)",
-            len(all_backtested_ids),
+            "run_slippage_sensitivity: %d/%d windows matched across levels; "
+            "updating baseline row (%.6f -> %.6f)",
+            len(all_seen_ids),
             len(all_input_ids),
             baseline_mean,
             recomputed_baseline,
@@ -432,13 +429,38 @@ def run_slippage_sensitivity(
             }
         )
 
-    # Compute fragility: any non-baseline row has rel_drop > threshold.
+    # Compute fragility: compare each level against a baseline from the SAME
+    # windows that level successfully backtested. Using a different-sized
+    # baseline sample for each level's rel_drop gives consistent denominators.
     is_fragile = False
-    for row in rows:
-        if row["is_baseline"]:
-            continue
-        denominator = max(abs(baseline_mean), abs_tol)
-        rel_drop = (baseline_mean - row["mean_cumulative_excess"]) / denominator
+    for entry in per_level_results:
+        level_results = entry["results"]
+        level_ids = entry["ids"]
+
+        if not level_results:
+            # Zero matched windows: treat as maximally fragile.
+            log.warning(
+                "run_slippage_sensitivity: level %s has zero matched windows; "
+                "flagging as fragile",
+                entry["level"],
+            )
+            is_fragile = True
+            break
+
+        level_mean = float(
+            sum(r["cumulative_excess_return"] for r in level_results)
+            / len(level_results)
+        )
+        # Baseline recomputed from same windows (consistent denominator).
+        level_baseline_windows = [
+            w for w in main_window_results if w["window_id"] in level_ids
+        ]
+        level_baseline = float(
+            sum(w["cumulative_excess_return"] for w in level_baseline_windows)
+            / len(level_baseline_windows)
+        )
+        denominator = max(abs(level_baseline), abs_tol)
+        rel_drop = (level_baseline - level_mean) / denominator
         if rel_drop > rel_drop_threshold:
             is_fragile = True
             break
