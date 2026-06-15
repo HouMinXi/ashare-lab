@@ -16,12 +16,9 @@ from dateutil.relativedelta import relativedelta
 
 from ashare_lab.config import load_config
 from ashare_lab.data.calendar import latest_trading_day
-from ashare_lab.research.train import _apply_price_filter
+from ashare_lab.research.train import ALPHA158_WARMUP_START, apply_price_filter
 
 log = logging.getLogger(__name__)
-
-# Warmup period: Alpha158 requires ~1 year of history before train_start.
-_ALPHA158_WARMUP_START = "2017-01-01"
 
 # Minimum test span in calendar days to mark a window as "complete".
 # Derived from step_months=6 minus weekends/holidays (~170 days).
@@ -147,7 +144,7 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
     # Alpha158 is a DataHandlerLP (NOT a Dataset); wrap in DatasetH.
     handler = Alpha158(
         instruments="csi500",
-        start_time=_ALPHA158_WARMUP_START,
+        start_time=ALPHA158_WARMUP_START,
         end_time=w1["test_end"],
         fit_start_time=w1["train_start"],
         fit_end_time=w1["train_end"],
@@ -176,7 +173,7 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
     label = dataset.prepare("test", col_set="label").iloc[:, 0]
 
     # Apply price filter via shared helper from train.py (threshold read from config).
-    pred = _apply_price_filter(pred, w1["test_start"], w1["test_end"], universe="csi500")
+    pred = apply_price_filter(pred, w1["test_start"], w1["test_end"], universe="csi500")
 
     n_predictions = len(pred)
     log.info("predictions after price filter: %d", n_predictions)

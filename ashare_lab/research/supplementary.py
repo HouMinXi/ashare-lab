@@ -381,9 +381,15 @@ def run_slippage_sensitivity(
 
     # Update CSV Row 0 baseline if any window was skipped across any level.
     all_input_ids = {w["window_id"] for w in main_window_results}
-    all_seen_ids: set[int] = set()
-    for entry in per_level_results:
-        all_seen_ids.update(entry["ids"])
+    # Intersection of per-level backtested IDs: only windows present in EVERY level.
+    # Using intersection guarantees that CSV Row 0 (baseline) is computed from the
+    # same window population visible in all level rows, making visual comparison
+    # correct. Union would mask cross-level mismatches and leave Row 0 computed
+    # from a different sample than the level rows that compare against it.
+    level_id_sets = [entry["ids"] for entry in per_level_results if entry["ids"]]
+    all_seen_ids: set[int] = (
+        set.intersection(*level_id_sets) if level_id_sets else set()
+    )
 
     if all_seen_ids and all_seen_ids != all_input_ids:
         matched_windows = [
@@ -394,7 +400,7 @@ def run_slippage_sensitivity(
             / len(matched_windows)
         )
         log.warning(
-            "run_slippage_sensitivity: %d/%d windows matched across levels; "
+            "run_slippage_sensitivity: %d/%d windows present in every level; "
             "updating baseline row (%.6f -> %.6f)",
             len(all_seen_ids),
             len(all_input_ids),

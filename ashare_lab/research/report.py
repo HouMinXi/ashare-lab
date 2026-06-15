@@ -110,14 +110,17 @@ def run_verdict_phase(
         sys.exit(1)
 
     # PASS or BORDER_PASS: trigger supplementary analysis from plan 02-04.
-    # Catch ALL exceptions (ImportError when module not yet created, and any
-    # runtime error from supplementary steps) to avoid a bare stack trace.
+    # Steps 1-2 inside run_all_supplementary are fail-fast (finalize_artifacts,
+    # write_feature_importance); let their exceptions propagate so the operator
+    # knows artifact production failed.  Steps 3-5 are internally wrapped and
+    # log+continue on their own.  ImportError is caught separately to allow
+    # phased rollout where the supplementary module does not yet exist.
     try:
         from ashare_lab.research.supplementary import run_all_supplementary  # noqa: PLC0415
-
+    except ImportError as e:
+        log.warning("supplementary module not available: %s", e)
+    else:
         run_all_supplementary(window_results, exp_dir)
-    except Exception as e:
-        log.warning("supplementary failed: %s", e)
 
     return verdict_dict
 
