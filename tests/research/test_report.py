@@ -7,7 +7,6 @@ for unit testing.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from unittest import mock
 
@@ -18,10 +17,9 @@ class TestMakeExpDir:
     def test_creates_directory(self, tmp_path):
         """make_exp_dir creates a timestamped subdirectory under experiments/."""
         from ashare_lab.research.report import make_exp_dir
-        from ashare_lab.config import PROJECT_ROOT
 
         # Redirect experiments/ to tmp_path so we don't pollute the real tree.
-        fake_experiments = tmp_path / "experiments"
+        tmp_path / "experiments"
         with mock.patch("ashare_lab.research.report.PROJECT_ROOT", tmp_path):
             result = make_exp_dir()
 
@@ -42,7 +40,6 @@ class TestMakeExpDir:
 class TestRunVerdictPhase:
     def test_fail_gate_calls_sys_exit(self, tmp_path):
         """run_verdict_phase calls sys.exit(1) when gate is FAIL."""
-        import json
         from ashare_lab.research.report import run_verdict_phase
 
         cfg = {

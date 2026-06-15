@@ -387,7 +387,12 @@ def run_slippage_sensitivity(
     # same window population visible in all level rows, making visual comparison
     # correct. Union would mask cross-level mismatches and leave Row 0 computed
     # from a different sample than the level rows that compare against it.
-    level_id_sets = [entry["ids"] for entry in per_level_results if entry["ids"]]
+    # Include empty sets in the intersection: if any level produced zero results,
+    # set.intersection(..., set()) = set(), so all_seen_ids correctly becomes
+    # empty, triggering baseline recomputation from no windows (handled by the
+    # guard below). Filtering out empty sets would exclude those levels from the
+    # intersection and silently produce a non-empty all_seen_ids.
+    level_id_sets = [entry["ids"] for entry in per_level_results]
     all_seen_ids: set[int] = (
         set.intersection(*level_id_sets) if level_id_sets else set()
     )

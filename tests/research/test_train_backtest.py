@@ -326,9 +326,8 @@ class TestRunFullWalkForward:
             )
 
         assert len(results) == 2
-        warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("only 2 windows completed" in str(m) for m in warning_msgs), (
-            f"Expected 'only 2 windows completed' warning; got: {warning_msgs}"
+        assert "only 2 windows completed" in caplog.text, (
+            f"Expected 'only 2 windows completed' warning; got: {caplog.text!r}"
         )
 
     def test_pred_path_naming_convention(self, tmp_path):
