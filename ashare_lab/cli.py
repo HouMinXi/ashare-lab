@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 
+from ashare_lab.data.fallback import gap_fill
 from ashare_lab.data.update import bootstrap, daily_refresh
 from ashare_lab.data.validate import (
     check_return_consistency,
@@ -38,6 +39,19 @@ def cmd_update(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    try:
+        rc = gap_fill(args.from_date, args.to_date)
+        if rc == 1:
+            log.info("backfill: no gap detected")
+        elif rc == 2:
+            log.warning("backfill: partial fill -- some dates still missing")
+        return rc
+    except Exception as exc:
+        log.error("backfill failed: %s", exc)
+        return 2
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     raw = spot_check_raw()
     ret = check_return_consistency()
@@ -60,6 +74,10 @@ def main() -> int:
     sub.add_parser("update", help="daily data refresh")
     sub.add_parser("validate", help="cross-source spot-check")
 
+    p_backfill = sub.add_parser("backfill", help="gap-fill missing dates from baostock")
+    p_backfill.add_argument("from_date", help="start date YYYY-MM-DD (inclusive)")
+    p_backfill.add_argument("to_date", help="end date YYYY-MM-DD (inclusive)")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -69,6 +87,7 @@ def main() -> int:
         "bootstrap": cmd_bootstrap,
         "update": cmd_update,
         "validate": cmd_validate,
+        "backfill": cmd_backfill,
     }
     return commands[args.command](args)
 
