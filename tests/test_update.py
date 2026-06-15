@@ -1,8 +1,6 @@
 """Tests for ashare_lab.data.update (non-network functions)."""
 import tempfile
-import datetime as dt
 from pathlib import Path
-import pytest
 from ashare_lab.data.update import (
     _download_url,
     _read_calendar_last_date,

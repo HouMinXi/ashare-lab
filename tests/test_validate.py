@@ -63,7 +63,6 @@ def test_validate_instruments_real_data():
 
 def test_spot_check_raw_no_data_returns_dict():
     """spot_check_raw returns a dict when provider_uri has no qlib data."""
-    from ashare_lab.data.validate import spot_check_raw
     with tempfile.TemporaryDirectory() as tmp:
         result = spot_check_raw(provider_uri=Path(tmp))
     assert isinstance(result, dict)
