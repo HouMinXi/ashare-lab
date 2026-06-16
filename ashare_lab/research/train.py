@@ -179,8 +179,30 @@ def train_window(
         },
     )
 
-    model = LGBModel(random_state=42, verbose=-1)
-    model.fit(dataset)
+    # Build LGBModel kwargs from config (falls back to safe defaults).
+    cfg_model = load_config().get("model", {})
+    lgb_device = cfg_model.get("device", "cpu")
+    lgb_kwargs: dict = {
+        "loss": "mse",
+        "learning_rate": cfg_model.get("learning_rate", 0.0421),
+        "colsample_bytree": cfg_model.get("colsample_bytree", 0.8879),
+        "subsample": cfg_model.get("subsample", 0.8789),
+        "lambda_l1": cfg_model.get("lambda_l1", 205.6999),
+        "lambda_l2": cfg_model.get("lambda_l2", 580.9768),
+        "max_depth": cfg_model.get("max_depth", 8),
+        "num_leaves": cfg_model.get("num_leaves", 210),
+        "device": lgb_device,
+        "random_state": 42,
+        "verbose": -1,
+    }
+    if lgb_device == "gpu":
+        lgb_kwargs["gpu_platform_id"] = cfg_model.get("gpu_platform_id", 0)
+        lgb_kwargs["gpu_device_id"] = cfg_model.get("gpu_device_id", 0)
+    num_boost_round = cfg_model.get("num_boost_round", 500)
+    log.info("W%d: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
+
+    model = LGBModel(**lgb_kwargs)
+    model.fit(dataset, num_boost_round=num_boost_round)
 
     # Persist model.
     models_dir = exp_dir / "models"
