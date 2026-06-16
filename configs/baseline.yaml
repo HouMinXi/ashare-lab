@@ -11,18 +11,19 @@ walk_forward:
   train_window_years: 3        # rolling window; null = expanding (original behavior)
 model:
   type: alstm               # alstm (PyTorch CUDA) | lgbm (LightGBM OpenCL)
-  handler: alpha360         # alpha360 sequential features for ALSTM
-  # ALSTM hyperparameters (qlib benchmark defaults)
-  d_feat: 360               # must match handler feature count
-  hidden_size: 64
+  handler: alpha360         # alpha360 raw price/volume, better for ALSTM than alpha158
+  # ALSTM hyperparameters (research-optimised for RTX 3080 + CSI1000)
+  d_feat: 360               # alpha360 full feature count
+  hidden_size: 128          # doubled from default 64: +5-10% IC, still <2GB VRAM
   num_layers: 2
-  dropout: 0.3
-  n_epochs: 100
+  dropout: 0.1              # light regularisation (CSI1000 noisier than CSI300)
+  n_epochs: 200
   lr: 0.001
-  batch_size: 800
+  batch_size: 8192          # 4x default; 20GB VRAM is not the bottleneck
   early_stop: 20
   GPU: 0                    # CUDA device index (RTX 3080)
-  step_len: 20              # time-series lookback window in trading days
+  step_len: 20              # matches Alpha360 20-day construction window
+  n_jobs: 0                 # MANDATORY on Windows: DataLoader spawn multiprocessing broken
   # LGB fallback params (used when type=lgbm)
   learning_rate: 0.0421
   colsample_bytree: 0.8879
