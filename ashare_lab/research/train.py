@@ -127,7 +127,7 @@ def train_window(
 
     import qlib  # noqa: PLC0415
     from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
+    from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
     from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
     from qlib.data.dataset import DatasetH  # noqa: PLC0415
 
@@ -155,10 +155,13 @@ def train_window(
     if not getattr(_QlibC, "registered", False):
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
-    # Alpha158 is a DataHandlerLP (NOT a Dataset); wrap it in DatasetH.
-    # Warmup start ALPHA158_WARMUP_START provides ~1 year of history for lookback
-    # features before train_start 2018-01-01.
-    handler = Alpha158(
+    # Select data handler from config (alpha158 or alpha360).
+    cfg_handler = load_config().get("model", {}).get("handler", "alpha158").lower()
+    HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158  # noqa: N806
+    log.info("W%d: handler=%s", window_id, cfg_handler)
+
+    # HandlerLP wraps around DatasetH; warmup provides history for lookback features.
+    handler = HandlerClass(
         instruments=universe,
         start_time=ALPHA158_WARMUP_START,
         end_time=window["test_end"],

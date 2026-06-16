@@ -21,13 +21,14 @@ model:
   num_leaves: 210
   num_boost_round: 500
   device: gpu               # OpenCL GPU on RTX 3080; falls back to cpu on error
+  handler: alpha360         # alpha158 (default) or alpha360 (raw price/volume features)
 strategy:
-  # CSI500 + topk=30: 6% holdings, ~10K CNY per position at 300K capital
-  topk: 30
+  # Back to concentrated bets: topk=30 diluted alpha, topk=15 is better
+  topk: 15
   main:
-    n_drop: 2    # compromise: faster than 1 but less friction than 3
+    n_drop: 1
   control:
-    n_drop: 3
+    n_drop: 2
 cost_model:
   account: 300000
   trade_unit: 100
