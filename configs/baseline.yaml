@@ -10,8 +10,8 @@ walk_forward:
   min_windows: 5
   train_window_years: 3        # rolling window; null = expanding (original behavior)
 model:
-  type: alstm               # alstm (PyTorch CUDA) | lgbm (LightGBM OpenCL)
-  handler: alpha360         # alpha360 raw price/volume, better for ALSTM than alpha158
+  type: lgbm                # QUICK FIX RUN: verify benchmark change impact
+  handler: alpha158         # alpha158 for LGB; alpha360 for ALSTM
   # ALSTM hyperparameters (research-optimised for RTX 3080 + CSI1000)
   d_feat: 360               # alpha360 full feature count
   hidden_size: 128          # doubled from default 64: +5-10% IC, still <2GB VRAM
@@ -46,7 +46,7 @@ cost_model:
   trade_unit: 100
   # documentation-only; NOT passed to strategy ctor (see binding table)
   risk_degree: 0.95
-  benchmark: "SH000300"
+  benchmark: "SH000852"    # CSI1000 index -- matches universe (was incorrectly SH000300=CSI300)
   deal_price: close
   open_cost: 0.00026
   close_cost: 0.00076
