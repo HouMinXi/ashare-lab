@@ -47,8 +47,14 @@ def get_window(step: int) -> dict:
     step_months: int = wf["step_months"]
 
     base_end = dt.date.fromisoformat(base_train_end)
+    train_window_years: int | None = wf.get("train_window_years")  # None = expanding
 
     train_end = base_end + relativedelta(months=step * step_months)
+    if train_window_years:
+        # Rolling window: train_start = train_end - N years (floored by safety floor)
+        rolling_start = train_end - relativedelta(years=train_window_years)
+        safety_floor = dt.date.fromisoformat(train_start)
+        train_start = str(max(rolling_start, safety_floor))
     valid_start = train_end + relativedelta(days=1)
     valid_end = valid_start + relativedelta(months=step_months) - relativedelta(days=1)
     test_start = valid_end + relativedelta(days=1)
