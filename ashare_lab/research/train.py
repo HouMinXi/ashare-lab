@@ -212,7 +212,8 @@ def train_window(
     # Build model.
     # -----------------------------------------------------------------------
     if model_type == "alstm":
-        from qlib.contrib.model.pytorch_alstm import ALSTM  # noqa: PLC0415
+        # pytorch_alstm_ts is the TSDatasetH-compatible variant
+        from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
 
         d_feat = cfg_model.get("d_feat", 360)
         log.info("W%d: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
