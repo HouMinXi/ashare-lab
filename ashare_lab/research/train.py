@@ -72,6 +72,11 @@ def apply_price_filter(
 
     close_series = close_df["$close"]
 
+    # qlib D.features returns MultiIndex (instrument, datetime);
+    # pred has (datetime, instrument).  Swap levels so reindex aligns correctly.
+    if close_series.index.names[0] != pred.index.names[0]:
+        close_series = close_series.swaplevel().sort_index()
+
     # Align to pred index before masking (pred may have dates not in close_df).
     aligned_close = close_series.reindex(pred.index)
     mask = aligned_close.notna() & (aligned_close <= threshold)
@@ -142,7 +147,13 @@ def train_window(
         universe,
     )
 
-    qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
+    # qlib.init() must only be called once per process; subsequent calls while
+    # a QlibRecorder is active raise RecorderInitializationError.  Guard here
+    # so walk-forward windows W2..W6 don't re-initialize.
+    from qlib.config import C as _QlibC  # noqa: PLC0415
+
+    if not getattr(_QlibC, "registered", False):
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
     # Alpha158 is a DataHandlerLP (NOT a Dataset); wrap it in DatasetH.
     # Warmup start ALPHA158_WARMUP_START provides ~1 year of history for lookback
