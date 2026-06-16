@@ -22,12 +22,12 @@ model:
   num_boost_round: 500
   device: gpu               # OpenCL GPU on RTX 3080; falls back to cpu on error
 strategy:
-  # shared by all tracks; 20K CNY per position at 300K capital
-  topk: 15
+  # CSI500 + topk=30: 6% holdings, ~10K CNY per position at 300K capital
+  topk: 30
   main:
-    n_drop: 3    # increased from 1: faster rotation to capture signal before it decays
+    n_drop: 2    # compromise: faster than 1 but less friction than 3
   control:
-    n_drop: 2
+    n_drop: 3
 cost_model:
   account: 300000
   trade_unit: 100
