@@ -1,7 +1,7 @@
 ---
 universe:
-  primary: csi500
-  reference: csi300
+  primary: csi1000      # try: more alpha in smaller/mid caps than csi500
+  reference: csi500
   exclude_close_above_cny: 300
 walk_forward:
   train_start: "2018-01-01"    # absolute earliest allowed train start (safety floor)
@@ -21,7 +21,7 @@ model:
   num_leaves: 210
   num_boost_round: 500
   device: gpu               # OpenCL GPU on RTX 3080; falls back to cpu on error
-  handler: alpha360         # alpha158 (default) or alpha360 (raw price/volume features)
+  handler: alpha158         # alpha158 (default); alpha360 hurt LGB IC
 strategy:
   # Back to concentrated bets: topk=30 diluted alpha, topk=15 is better
   topk: 15
