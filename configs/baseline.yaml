@@ -10,8 +10,20 @@ walk_forward:
   min_windows: 5
   train_window_years: 3        # rolling window; null = expanding (original behavior)
 model:
-  # qlib benchmark-tuned LightGBM hyperparameters (Alpha158 CSI500)
-  # Source: qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml
+  type: alstm               # alstm (PyTorch CUDA) | lgbm (LightGBM OpenCL)
+  handler: alpha360         # alpha360 sequential features for ALSTM
+  # ALSTM hyperparameters (qlib benchmark defaults)
+  d_feat: 360               # must match handler feature count
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.3
+  n_epochs: 100
+  lr: 0.001
+  batch_size: 800
+  early_stop: 20
+  GPU: 0                    # CUDA device index (RTX 3080)
+  step_len: 20              # time-series lookback window in trading days
+  # LGB fallback params (used when type=lgbm)
   learning_rate: 0.0421
   colsample_bytree: 0.8879
   subsample: 0.8789
@@ -20,8 +32,7 @@ model:
   max_depth: 8
   num_leaves: 210
   num_boost_round: 500
-  device: gpu               # OpenCL GPU on RTX 3080; falls back to cpu on error
-  handler: alpha158         # alpha158 (default); alpha360 hurt LGB IC
+  device: gpu
 strategy:
   # CSI1000: IC high, try n_drop=3 to capture signal faster before decay
   topk: 15

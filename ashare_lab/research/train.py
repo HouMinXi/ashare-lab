@@ -129,7 +129,7 @@ def train_window(
     from qlib.config import REG_CN  # noqa: PLC0415
     from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
     from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
-    from qlib.data.dataset import DatasetH  # noqa: PLC0415
+    from qlib.data.dataset import DatasetH, TSDatasetH  # noqa: PLC0415
 
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
 
@@ -160,60 +160,109 @@ def train_window(
     HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158  # noqa: N806
     log.info("W%d: handler=%s", window_id, cfg_handler)
 
-    # HandlerLP wraps around DatasetH; warmup provides history for lookback features.
+    cfg_model = load_config().get("model", {})
+    model_type = cfg_model.get("type", "lgbm").lower()
+
+    # -----------------------------------------------------------------------
+    # Build data handler + dataset.
+    # Neural-network models (ALSTM, LSTM) need feature normalisation and a
+    # time-series dataset (TSDatasetH); LGB uses tabular DatasetH.
+    # -----------------------------------------------------------------------
+    if model_type == "alstm":
+        learn_procs = [
+            {"class": "DropnaLabel"},
+            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+        ]
+        infer_procs = [
+            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+            {"class": "Fillna"},
+        ]
+    else:
+        learn_procs = [
+            {"class": "DropnaLabel"},
+            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+        ]
+        infer_procs = []
+
+    # HandlerLP wraps around DatasetH/TSDatasetH; warmup provides lookback history.
     handler = HandlerClass(
         instruments=universe,
         start_time=ALPHA158_WARMUP_START,
         end_time=window["test_end"],
         fit_start_time=window["train_start"],
         fit_end_time=window["train_end"],
-        learn_processors=[
-            {"class": "DropnaLabel"},
-            {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-            # Note: CSRankNorm on features hurts LGB IC; tree models don't need
-            # feature normalisation. Industry neutralisation handled by label norm.
-        ],
+        learn_processors=learn_procs,
+        **({"infer_processors": infer_procs} if infer_procs else {}),
     )
 
-    dataset = DatasetH(
-        handler=handler,
-        segments={
-            "train": (window["train_start"], window["train_end"]),
-            "valid": (window["valid_start"], window["valid_end"]),
-            "test": (window["test_start"], window["test_end"]),
-        },
-    )
-
-    # Build LGBModel kwargs from config (falls back to safe defaults).
-    cfg_model = load_config().get("model", {})
-    lgb_device = cfg_model.get("device", "cpu")
-    lgb_kwargs: dict = {
-        "loss": "mse",
-        "learning_rate": cfg_model.get("learning_rate", 0.0421),
-        "colsample_bytree": cfg_model.get("colsample_bytree", 0.8879),
-        "subsample": cfg_model.get("subsample", 0.8789),
-        "lambda_l1": cfg_model.get("lambda_l1", 205.6999),
-        "lambda_l2": cfg_model.get("lambda_l2", 580.9768),
-        "max_depth": cfg_model.get("max_depth", 8),
-        "num_leaves": cfg_model.get("num_leaves", 210),
-        "device": lgb_device,
-        "random_state": 42,
-        "verbose": -1,
+    segs = {
+        "train": (window["train_start"], window["train_end"]),
+        "valid": (window["valid_start"], window["valid_end"]),
+        "test": (window["test_start"], window["test_end"]),
     }
-    if lgb_device == "gpu":
-        lgb_kwargs["gpu_platform_id"] = cfg_model.get("gpu_platform_id", 0)
-        lgb_kwargs["gpu_device_id"] = cfg_model.get("gpu_device_id", 0)
-    num_boost_round = cfg_model.get("num_boost_round", 500)
-    log.info("W%d: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
 
-    model = LGBModel(**lgb_kwargs)
-    model.fit(dataset, num_boost_round=num_boost_round)
+    if model_type == "alstm":
+        step_len = cfg_model.get("step_len", 20)
+        dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
+    else:
+        dataset = DatasetH(handler=handler, segments=segs)
 
-    # Persist model.
+    # -----------------------------------------------------------------------
+    # Build model.
+    # -----------------------------------------------------------------------
+    if model_type == "alstm":
+        from qlib.contrib.model.pytorch_alstm import ALSTM  # noqa: PLC0415
+
+        d_feat = cfg_model.get("d_feat", 360)
+        log.info("W%d: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
+        model = ALSTM(
+            d_feat=d_feat,
+            hidden_size=cfg_model.get("hidden_size", 64),
+            num_layers=cfg_model.get("num_layers", 2),
+            dropout=cfg_model.get("dropout", 0.3),
+            n_epochs=cfg_model.get("n_epochs", 100),
+            lr=cfg_model.get("lr", 1e-3),
+            batch_size=cfg_model.get("batch_size", 800),
+            early_stop=cfg_model.get("early_stop", 20),
+            GPU=cfg_model.get("GPU", 0),
+            seed=42,
+        )
+        model.fit(dataset)
+    else:
+        lgb_device = cfg_model.get("device", "cpu")
+        lgb_kwargs: dict = {
+            "loss": "mse",
+            "learning_rate": cfg_model.get("learning_rate", 0.0421),
+            "colsample_bytree": cfg_model.get("colsample_bytree", 0.8879),
+            "subsample": cfg_model.get("subsample", 0.8789),
+            "lambda_l1": cfg_model.get("lambda_l1", 205.6999),
+            "lambda_l2": cfg_model.get("lambda_l2", 580.9768),
+            "max_depth": cfg_model.get("max_depth", 8),
+            "num_leaves": cfg_model.get("num_leaves", 210),
+            "device": lgb_device,
+            "random_state": 42,
+            "verbose": -1,
+        }
+        if lgb_device == "gpu":
+            lgb_kwargs["gpu_platform_id"] = cfg_model.get("gpu_platform_id", 0)
+            lgb_kwargs["gpu_device_id"] = cfg_model.get("gpu_device_id", 0)
+        num_boost_round = cfg_model.get("num_boost_round", 500)
+        log.info("W%d: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
+        model = LGBModel(**lgb_kwargs)
+        model.fit(dataset, num_boost_round=num_boost_round)
+
+    # Persist model (ALSTM uses torch.save; LGB uses pickle).
     models_dir = exp_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-    model_path = models_dir / f"w{window_id}.pkl"
-    model.to_pickle(path=str(model_path))
+    if model_type == "alstm":
+        import torch  # noqa: PLC0415
+
+        model_path = models_dir / f"w{window_id}.pt"
+        torch.save(model, str(model_path))
+    else:
+        model_path = models_dir / f"w{window_id}.pkl"
+        model.to_pickle(path=str(model_path))
     log.info("W%d: model saved -> %s", window_id, model_path)
 
     # Predict on test set; returns MultiIndex Series (datetime, instrument).
