@@ -23,12 +23,12 @@ model:
   device: gpu               # OpenCL GPU on RTX 3080; falls back to cpu on error
   handler: alpha158         # alpha158 (default); alpha360 hurt LGB IC
 strategy:
-  # Back to concentrated bets: topk=30 diluted alpha, topk=15 is better
+  # CSI1000: IC high, try n_drop=3 to capture signal faster before decay
   topk: 15
   main:
-    n_drop: 1
+    n_drop: 3
   control:
-    n_drop: 2
+    n_drop: 5
 cost_model:
   account: 300000
   trade_unit: 100
