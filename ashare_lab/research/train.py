@@ -167,9 +167,8 @@ def train_window(
         learn_processors=[
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
-            # Cross-sectional rank normalisation on features: reduces size/industry
-            # bias without requiring explicit industry dummy data (partial neutralisation).
-            {"class": "CSRankNorm", "kwargs": {"fields_group": "feature"}},
+            # Note: CSRankNorm on features hurts LGB IC; tree models don't need
+            # feature normalisation. Industry neutralisation handled by label norm.
         ],
     )
 
