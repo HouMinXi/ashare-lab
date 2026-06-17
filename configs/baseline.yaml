@@ -52,10 +52,11 @@ model:
   num_boost_round: 500
   device: gpu
 strategy:
-  # CSI1000: IC high, try n_drop=3 to capture signal faster before decay
+  # R12: n_drop=1 to reduce turnover cost -- TRA IC=0.040 is strong but
+  # n_drop=3 burned W4 (+2.5% vs LGB's +19.9% on same signal strength 0.058)
   topk: 15
   main:
-    n_drop: 3
+    n_drop: 1
   control:
     n_drop: 5
 cost_model:
