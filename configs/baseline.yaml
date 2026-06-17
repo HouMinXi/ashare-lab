@@ -11,12 +11,13 @@ walk_forward:
   train_window_years: 3        # rolling window; null = expanding (original behavior)
 model:
   type: tra                 # R10: TRA (Temporal Routing Adaptor, KDD 2021)
-  handler: alpha360         # TRA uses raw price/volume features (360-dim)
-  step_len: 60              # MTSDatasetH lookback window (trading days; paper default)
+  handler: alpha158         # Alpha360 triggers qlib 0.9.7 multiprocessing bug on Windows;
+                            # Alpha158 loads correctly (same as R9 LGB baseline)
+  step_len: 20              # Alpha158 natural lookback; shorter than Alpha360's 60
 
-  # TRA backbone: GRU with concat-attention (same architecture as paper)
+  # TRA backbone: GRU with concat-attention
   backbone:
-    input_size: 360         # must match Alpha360 feature count
+    input_size: 158         # must match Alpha158 feature count (was 360 for Alpha360)
     hidden_size: 64         # paper default
     num_layers: 2
     rnn_arch: GRU
