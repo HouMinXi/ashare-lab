@@ -190,13 +190,21 @@ def train_window(
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+            # Scope Fillna to features only (NOT labels):
+            #   - Labels are already clean after DropnaLabel + CSZScoreNorm.
+            #   - Unscoped Fillna would silently replace NaN labels with 0
+            #     (the median after z-score), corrupting degenerate training
+            #     samples instead of surfacing the error.
+            # ALSTM fix: NaN features -> NaN predictions -> NaN IC ->
+            #   best_param never assigned -> UnboundLocalError at model load.
         ]
         # infer_processors is intentionally omitted for neural models:
         #   TRA:   MTSDatasetH always uses _learn data (source FIXME: cannot switch to _infer).
         #   ALSTM: qlib 0.9.7 bug -- passing infer_processors triggers TypeError
         #          (LocalDatasetProvider.dataset() gets inst_processors twice).
-        #   Feature normalization for test is applied via learn_procs since there is
-        #   no separate _infer branch; nan_to_num in MTSDatasetH fills residual NaN.
+        #   Feature NaN is handled by Fillna in learn_procs (applied to all splits)
+        #   and by np.nan_to_num() inside MTSDatasetH.setup_data() for TRA.
     else:
         learn_procs = [
             {"class": "DropnaLabel"},
