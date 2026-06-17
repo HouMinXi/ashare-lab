@@ -1,8 +1,13 @@
-"""Walk-forward window training: Alpha158 + LGBModel on CSI500/CSI300.
+"""Walk-forward window training: multi-model (LGB / ALSTM / TRA) on CSI1000.
 
 Provides apply_price_filter() and train_window(). All qlib imports are
 deferred inside function bodies so this module is importable without a
 qlib runtime (required for unit test isolation).
+
+Supported model types (config model.type):
+  lgbm  -- LightGBM + DatasetH (tabular, GPU OpenCL)
+  alstm -- Attention-LSTM + TSDatasetH (time-series, CUDA)
+  tra   -- Temporal Routing Adaptor + MTSDatasetH (multi-pattern, CUDA)
 """
 
 from __future__ import annotations
@@ -97,20 +102,29 @@ def train_window(
     exp_dir: Path,
     universe: str,
 ) -> tuple:
-    """Train an LGBModel on one walk-forward window and return predictions.
+    """Train a model on one walk-forward window and return predictions.
 
-    Initialises qlib, builds Alpha158 handler with the given universe and
-    warmup start ALPHA158_WARMUP_START, wraps it in DatasetH with train/valid/test
-    segments from window, trains LGBModel(random_state=42, verbose=-1),
-    persists the model to exp_dir/models/w{window_id}.pkl, generates
+    Supports three model types selected via config model.type:
+      lgbm  -- LightGBM + DatasetH; saves w{id}.pkl via to_pickle()
+      alstm -- Attention-LSTM + TSDatasetH; saves w{id}.pt via torch.save()
+      tra   -- Temporal Routing Adaptor + MTSDatasetH; saves w{id}.pt via torch.save()
+
+    Initialises qlib once per process (guarded), builds the handler for the
+    configured feature set (Alpha158 or Alpha360), wraps it in the appropriate
+    dataset class, trains the model, persists it to exp_dir/models/, generates
     predictions on the test set, applies price filter, and extracts labels.
+
+    TRA note: TRAModel.predict() returns a DataFrame with columns
+    [score, label, score_0..N].  The 'score' column is extracted as the
+    prediction Series; labels are taken from the 'label' column (processed
+    by learn_procs; rank-IC-safe since rank correlation is scale-invariant).
 
     Args:
         window: WindowDict with keys: window_id, train_start, train_end,
             valid_start, valid_end, test_start, test_end.
         exp_dir: Experiment output directory. The model is saved under
-            exp_dir/models/w{window_id}.pkl (directory created if needed).
-        universe: Qlib universe string (e.g. "csi500", "csi300").
+            exp_dir/models/w{window_id}.{pkl|pt} (directory created if needed).
+        universe: Qlib universe string (e.g. "csi1000", "csi500").
 
     Returns:
         Tuple (model_path, pred, label):
@@ -130,6 +144,7 @@ def train_window(
     from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
     from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
     from qlib.data.dataset import DatasetH, TSDatasetH  # noqa: PLC0415
+    from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
 
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
 
@@ -165,10 +180,12 @@ def train_window(
 
     # -----------------------------------------------------------------------
     # Build data handler + dataset.
-    # Neural-network models (ALSTM, LSTM) need feature normalisation and a
-    # time-series dataset (TSDatasetH); LGB uses tabular DatasetH.
+    # Neural-network models need feature normalisation.  Dataset class differs:
+    #   lgbm  -> DatasetH (tabular, no time-axis batching)
+    #   alstm -> TSDatasetH (fixed-length rolling windows)
+    #   tra   -> MTSDatasetH (per-stock memory, required by TRAModel)
     # -----------------------------------------------------------------------
-    if model_type == "alstm":
+    if model_type in ("alstm", "tra"):
         learn_procs = [
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
@@ -185,7 +202,7 @@ def train_window(
         ]
         infer_procs = []
 
-    # HandlerLP wraps around DatasetH/TSDatasetH; warmup provides lookback history.
+    # HandlerLP wraps around DatasetH/TSDatasetH/MTSDatasetH; warmup provides lookback history.
     handler = HandlerClass(
         instruments=universe,
         start_time=ALPHA158_WARMUP_START,
@@ -205,6 +222,31 @@ def train_window(
     if model_type == "alstm":
         step_len = cfg_model.get("step_len", 20)
         dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
+    elif model_type == "tra":
+        step_len = cfg_model.get("step_len", 60)
+        routing_cfg: dict = dict(cfg_model.get("routing", {}))
+        num_states: int = routing_cfg.get("num_states", 0)
+        if num_states < 1:
+            raise ValueError(
+                "model.routing.num_states must be >= 1 for TRA "
+                "(got %r); add routing.num_states to configs/baseline.yaml" % num_states
+            )
+        # MTSDatasetH maintains per-stock loss memory for TRA's optimal transport.
+        # batch_size=-1 selects daily sampling (one batch = all stocks for one trading day),
+        # which aligns with daily financial data structure; matches the MTSDatasetH default.
+        # Note: batch_size<0 is required only for memory_mode='daily', not 'sample' (see
+        # MTSDatasetH source: assert memory_mode=="sample" or batch_size<0).
+        # num_states must match routing_cfg["num_states"] passed to TRAModel below.
+        dataset = MTSDatasetH(
+            handler=handler,
+            segments=segs,
+            seq_len=step_len,
+            num_states=num_states,
+            memory_mode="sample",
+            batch_size=-1,
+            shuffle=True,
+        )
+        log.info("W%d: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
     else:
         dataset = DatasetH(handler=handler, segments=segs)
 
@@ -227,6 +269,35 @@ def train_window(
             batch_size=cfg_model.get("batch_size", 800),
             early_stop=cfg_model.get("early_stop", 20),
             GPU=cfg_model.get("GPU", 0),
+            seed=42,
+        )
+        model.fit(dataset)
+    elif model_type == "tra":
+        # TRAModel: Temporal Routing Adaptor (KDD 2021).
+        # GPU device is auto-detected via torch.cuda.is_available() at module level;
+        # no explicit GPU parameter in TRAModel constructor.
+        from qlib.contrib.model.pytorch_tra import TRAModel  # noqa: PLC0415
+
+        backbone_cfg: dict = dict(cfg_model.get("backbone", {}))
+        # routing_cfg is already validated and fetched in the MTSDatasetH block above;
+        # reuse it here so num_states is guaranteed consistent between dataset and model.
+        log.info(
+            "W%d: TRAModel backbone=%s routing=%s transport=%s pretrain=%s n_epochs=%d",
+            window_id,
+            backbone_cfg,
+            routing_cfg,
+            cfg_model.get("transport_method", "router"),
+            cfg_model.get("pretrain", True),
+            cfg_model.get("n_epochs", 200),
+        )
+        model = TRAModel(
+            model_config=backbone_cfg,
+            tra_config=routing_cfg,
+            transport_method=cfg_model.get("transport_method", "router"),
+            pretrain=cfg_model.get("pretrain", True),
+            n_epochs=cfg_model.get("n_epochs", 200),
+            early_stop=cfg_model.get("early_stop", 30),
+            lr=cfg_model.get("lr", 1e-3),
             seed=42,
         )
         model.fit(dataset)
@@ -253,10 +324,10 @@ def train_window(
         model = LGBModel(**lgb_kwargs)
         model.fit(dataset, num_boost_round=num_boost_round)
 
-    # Persist model (ALSTM uses torch.save; LGB uses pickle).
+    # Persist model.  TRA and ALSTM use torch.save; LGB uses pickle.
     models_dir = exp_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-    if model_type == "alstm":
+    if model_type in ("alstm", "tra"):
         import torch  # noqa: PLC0415
 
         model_path = models_dir / f"w{window_id}.pt"
@@ -266,14 +337,34 @@ def train_window(
         model.to_pickle(path=str(model_path))
     log.info("W%d: model saved -> %s", window_id, model_path)
 
-    # Predict on test set; returns MultiIndex Series (datetime, instrument).
-    pred = model.predict(dataset, segment="test")
+    # -----------------------------------------------------------------------
+    # Predict on test set and extract labels.
+    # TRAModel.predict() returns a DataFrame with columns:
+    #   score       -- routing-weighted prediction (the signal we want)
+    #   label       -- target return (from learn_procs; CSZScoreNorm applied)
+    #   score_0..N  -- per-state raw predictions
+    # Extract 'score' Series for downstream use; labels from 'label' column
+    # are rank-IC-safe since rank correlation is scale-invariant.
+    # Other models return a MultiIndex Series directly.
+    # -----------------------------------------------------------------------
+    if model_type == "tra":
+        pred_df = model.predict(dataset, segment="test")
+        pred = pred_df["score"]
+        tra_label = pred_df["label"]
+    else:
+        pred = model.predict(dataset, segment="test")
+        tra_label = None
 
-    # Apply price filter (modifies pred in-place logically; returns new Series).
+    # Apply price filter (returns new Series with same MultiIndex).
     pred = apply_price_filter(pred, window["test_start"], window["test_end"], universe)
 
-    # Extract test labels: first column of the label DataFrame (typically "LABEL0").
-    label = dataset.prepare("test", col_set="label").iloc[:, 0]
+    # Extract test labels.
+    if model_type == "tra":
+        # Align TRA label to the (possibly reduced) filtered pred index.
+        label = tra_label.reindex(pred.index)
+    else:
+        # First column of the label DataFrame (typically "LABEL0").
+        label = dataset.prepare("test", col_set="label").iloc[:, 0]
 
     log.info(
         "W%d: %d predictions after price filter, %d labels",
