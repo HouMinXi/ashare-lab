@@ -191,16 +191,17 @@ def train_window(
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
         ]
-        infer_procs = [
-            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-            {"class": "Fillna"},
-        ]
+        # infer_processors is intentionally omitted for neural models:
+        #   TRA:   MTSDatasetH always uses _learn data (source FIXME: cannot switch to _infer).
+        #   ALSTM: qlib 0.9.7 bug -- passing infer_processors triggers TypeError
+        #          (LocalDatasetProvider.dataset() gets inst_processors twice).
+        #   Feature normalization for test is applied via learn_procs since there is
+        #   no separate _infer branch; nan_to_num in MTSDatasetH fills residual NaN.
     else:
         learn_procs = [
             {"class": "DropnaLabel"},
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
         ]
-        infer_procs = []
 
     # HandlerLP wraps around DatasetH/TSDatasetH/MTSDatasetH; warmup provides lookback history.
     handler = HandlerClass(
@@ -210,7 +211,6 @@ def train_window(
         fit_start_time=window["train_start"],
         fit_end_time=window["train_end"],
         learn_processors=learn_procs,
-        **({"infer_processors": infer_procs} if infer_procs else {}),
     )
 
     segs = {
