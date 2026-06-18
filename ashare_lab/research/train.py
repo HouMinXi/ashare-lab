@@ -371,8 +371,25 @@ def train_window(
         # Align TRA label to the (possibly reduced) filtered pred index.
         label = tra_label.reindex(pred.index)
     else:
-        # First column of the label DataFrame (typically "LABEL0").
-        label = dataset.prepare("test", col_set="label").iloc[:, 0]
+        # DatasetH (LGB) prepare() returns a DataFrame with .iloc.
+        # TSDatasetH (ALSTM) prepare() returns TSDataSampler -- no .iloc.
+        label_data = dataset.prepare("test", col_set="label")
+        if hasattr(label_data, "iloc"):
+            # LGB / DatasetH: standard pandas access.
+            label = label_data.iloc[:, 0]
+        else:
+            # ALSTM / TSDatasetH: TSDataSampler has no pandas interface.
+            # Fetch raw labels from the underlying handler; Spearman rank-IC
+            # is scale-invariant so raw (unprocessed) labels give identical
+            # IC to z-score normalised learn-set labels.
+            from qlib.data.dataset.handler import DataHandlerLP  # noqa: PLC0415
+
+            raw = handler.fetch(col_set="label", data_key=DataHandlerLP.DK_R)
+            # Handler MultiIndex order may be (instrument, datetime);
+            # pred uses (datetime, instrument) -- swap if needed.
+            if raw.index.names[0] != "datetime":
+                raw = raw.swaplevel().sort_index()
+            label = raw.loc[segs["test"][0] : segs["test"][1]].iloc[:, 0]
 
     log.info(
         "W%d: %d predictions after price filter, %d labels",

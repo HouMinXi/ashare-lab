@@ -174,30 +174,38 @@ def _write_verdict_atomic(verdict_dict: dict, out_path: Path) -> None:
 
 
 def finalize_artifacts(models_dir: Path) -> Path:
-    """Copy the highest-numbered main walk-forward pkl to MODELS_DIR/latest.pkl.
+    """Copy the highest-numbered main walk-forward model to MODELS_DIR/latest.{ext}.
 
-    Globs for w*.pkl in models_dir, filters with re.fullmatch(r"w\\d+\\.pkl"),
-    sorts by the integer after "w", and copies the highest to MODELS_DIR/latest.pkl
-    via shutil.copy2 (preserves mtime; does NOT delete source -- write_feature_importance
-    reads these pkls in step 2).
+    Handles both LGB (.pkl) and neural-network (.pt) model formats.  Tries .pkl
+    first; falls back to .pt for ALSTM / TRA experiments.  Sorts by the integer
+    suffix (not lexicographic) so w10 > w9.  Uses shutil.copy2 (preserves mtime;
+    does NOT delete source -- write_feature_importance reads these files in step 2).
 
     Args:
-        models_dir: Directory containing per-window model files (w1.pkl, w2.pkl, ...).
+        models_dir: Directory containing per-window model files (w1.pkl or w1.pt).
 
     Returns:
-        Path to MODELS_DIR/latest.pkl.
+        Path to the copied latest model file (MODELS_DIR/latest.pkl or .pt).
 
     Raises:
-        FileNotFoundError: if no matching w*.pkl files found in models_dir.
+        FileNotFoundError: if no matching w*.pkl or w*.pt files found in models_dir.
     """
-    candidates = [
-        p
-        for p in models_dir.glob("w*.pkl")
-        if re.fullmatch(r"w\d+\.pkl", p.name)
-    ]
+    # Try .pkl (LGB) first; fall back to .pt (ALSTM / TRA neural models).
+    candidates: list = []
+    ext: str = ""
+    for _ext, _pattern in [(".pkl", r"w\d+\.pkl"), (".pt", r"w\d+\.pt")]:
+        candidates = [
+            p
+            for p in models_dir.glob(f"w*{_ext}")
+            if re.fullmatch(_pattern, p.name)
+        ]
+        if candidates:
+            ext = _ext
+            break
+
     if not candidates:
         raise FileNotFoundError(
-            f"finalize_artifacts: no w*.pkl files found in {models_dir}"
+            f"finalize_artifacts: no w*.pkl or w*.pt files found in {models_dir}"
         )
 
     # Sort by the integer suffix (not lexicographic) so w10 > w9.
@@ -205,7 +213,7 @@ def finalize_artifacts(models_dir: Path) -> Path:
     latest_src = candidates[-1]
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODELS_DIR / "latest.pkl"
+    dest = MODELS_DIR / f"latest{ext}"
     shutil.copy2(latest_src, dest)
     log.info(
         "finalize_artifacts: copied %s -> %s", latest_src.name, dest
