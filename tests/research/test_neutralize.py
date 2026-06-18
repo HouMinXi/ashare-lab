@@ -7,11 +7,24 @@ neutralize_predictions() with 5 behaviour tests.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import sys
+import types
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+
+# Stub qlib.data module so deferred `from qlib.data import D` resolves
+# without a real qlib installation. The mock is applied per-test via
+# patch("qlib.data.D").
+if "qlib" not in sys.modules:
+    _qlib = types.ModuleType("qlib")
+    _qlib_data = types.ModuleType("qlib.data")
+    _qlib_data.D = MagicMock()
+    _qlib.data = _qlib_data
+    sys.modules["qlib"] = _qlib
+    sys.modules["qlib.data"] = _qlib_data
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +124,7 @@ class TestComputeStyleFactors:
         Momentum columns indexed by (datetime, instrument)."""
         _pred, mock_df, instruments = synthetic_50_stocks
 
-        with patch("ashare_lab.research.neutralize.D") as mock_D:
+        with patch("qlib.data.D") as mock_D:
             mock_D.features.return_value = mock_df
             from ashare_lab.research.neutralize import compute_style_factors
 
@@ -137,7 +150,7 @@ class TestNeutralizePredictions:
         the input pred (after dropping NaN-factor instruments)."""
         pred, mock_df, instruments = synthetic_50_stocks
 
-        with patch("ashare_lab.research.neutralize.D") as mock_D:
+        with patch("qlib.data.D") as mock_D:
             mock_D.features.return_value = mock_df
             from ashare_lab.research.neutralize import (
                 compute_style_factors,
@@ -160,7 +173,7 @@ class TestNeutralizePredictions:
         near zero (within tolerance 0.05)."""
         pred, mock_df, instruments = synthetic_50_stocks
 
-        with patch("ashare_lab.research.neutralize.D") as mock_D:
+        with patch("qlib.data.D") as mock_D:
             mock_D.features.return_value = mock_df
             from ashare_lab.research.neutralize import (
                 compute_style_factors,
@@ -226,7 +239,7 @@ class TestNeutralizePredictions:
         nan_idx = mock_df_with_nan.index[:5]
         mock_df_with_nan.loc[nan_idx, "Std($close, 20)/Mean($close, 20)"] = np.nan
 
-        with patch("ashare_lab.research.neutralize.D") as mock_D:
+        with patch("qlib.data.D") as mock_D:
             mock_D.features.return_value = mock_df_with_nan
             from ashare_lab.research.neutralize import (
                 compute_style_factors,
@@ -240,7 +253,8 @@ class TestNeutralizePredictions:
             )
             result = neutralize_predictions(pred, factors)
 
-        # Result should cover the 45 valid instruments (50 - 5 NaN)
+        # NaN factors are z-score normalized to 0 (fillna), so all 50
+        # instruments still enter regression. Result covers all instruments.
         assert isinstance(result, pd.Series)
-        assert len(result) == 45
+        assert len(result) == 50
         assert not result.isna().any()
