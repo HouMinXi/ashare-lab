@@ -6,11 +6,23 @@ signal computation logic and filter behavior in isolation.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import sys
+import types
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+
+# Ensure qlib.data.D is mockable even when qlib is not installed.
+# Create a stub qlib.data module so deferred imports resolve to our mock.
+if "qlib" not in sys.modules:
+    _qlib = types.ModuleType("qlib")
+    _qlib_data = types.ModuleType("qlib.data")
+    _qlib_data.D = MagicMock()
+    _qlib.data = _qlib_data
+    sys.modules["qlib"] = _qlib
+    sys.modules["qlib.data"] = _qlib_data
 
 from ashare_lab.research.regime import (
     apply_regime_filter,
@@ -101,7 +113,7 @@ def default_thresholds():
 # ---------------------------------------------------------------------------
 
 class TestComputeRegimeSignals:
-    @patch("ashare_lab.research.regime.D")
+    @patch("qlib.data.D")
     def test_returns_dict_with_ma20_above_pct_key(self, mock_d, favorable_features):
         """compute_regime_signals returns dict containing 'ma20_above_pct'."""
         mock_d.features.return_value = favorable_features
@@ -115,7 +127,7 @@ class TestComputeRegimeSignals:
     # Test 2: ma20_above_pct is between 0.0 and 1.0
     # -----------------------------------------------------------------------
 
-    @patch("ashare_lab.research.regime.D")
+    @patch("qlib.data.D")
     def test_ma20_above_pct_bounded_0_to_1(self, mock_d, favorable_features):
         """ma20_above_pct must be in [0.0, 1.0]."""
         mock_d.features.return_value = favorable_features
@@ -123,7 +135,7 @@ class TestComputeRegimeSignals:
         pct = result["ma20_above_pct"]
         assert 0.0 <= pct <= 1.0, f"Expected 0..1, got {pct}"
 
-    @patch("ashare_lab.research.regime.D")
+    @patch("qlib.data.D")
     def test_ma20_above_pct_correct_value(self, mock_d, favorable_features):
         """80% above MA20 -> ma20_above_pct == 0.8."""
         mock_d.features.return_value = favorable_features
@@ -134,7 +146,7 @@ class TestComputeRegimeSignals:
     # Test 7: handles missing data gracefully (returns 0.5)
     # -----------------------------------------------------------------------
 
-    @patch("ashare_lab.research.regime.D")
+    @patch("qlib.data.D")
     def test_missing_data_returns_neutral(self, mock_d):
         """Empty D.features result -> ma20_above_pct == 0.5 (neutral)."""
         mock_d.features.return_value = pd.DataFrame()
@@ -190,7 +202,7 @@ class TestApplyRegimeFilter:
 # ---------------------------------------------------------------------------
 
 class TestCalibrateThresholds:
-    @patch("ashare_lab.research.regime.D")
+    @patch("qlib.data.D")
     def test_calibration_end_date_pre_2023(self, mock_d):
         """calibrate_thresholds default end_date is 2022-12-31."""
         # Build a time series of daily features for 2015-2022.
