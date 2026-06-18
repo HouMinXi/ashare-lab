@@ -10,21 +10,38 @@ walk_forward:
   min_windows: 5
   train_window_years: 3        # rolling window; null = expanding (original behavior)
 model:
-  type: lgbm                # QUICK FIX RUN: verify benchmark change impact
-  handler: alpha158         # alpha158 for LGB; alpha360 for ALSTM
-  # ALSTM hyperparameters (research-optimised for RTX 3080 + CSI1000)
-  d_feat: 360               # alpha360 full feature count
-  hidden_size: 128          # doubled from default 64: +5-10% IC, still <2GB VRAM
-  num_layers: 2
-  dropout: 0.1              # light regularisation (CSI1000 noisier than CSI300)
-  n_epochs: 200
+  type: tra                 # R10: TRA (Temporal Routing Adaptor, KDD 2021)
+  handler: alpha158         # Alpha360 triggers qlib 0.9.7 multiprocessing bug on Windows;
+                            # Alpha158 loads correctly (same as R9 LGB baseline)
+  step_len: 20              # Alpha158 natural lookback; shorter than Alpha360's 60
+
+  # TRA backbone: GRU with concat-attention
+  backbone:
+    input_size: 158         # must match Alpha158 feature count (was 360 for Alpha360)
+    hidden_size: 64         # paper default
+    num_layers: 2
+    rnn_arch: GRU
+    use_attn: true          # concat-attention as in Adv-ALSTM
+    dropout: 0.0
+
+  # TRA routing head: 3 market-regime patterns, LR+TPE routing signal
+  routing:
+    num_states: 3           # paper default; 3 regimes for CSI markets
+    hidden_size: 16         # router GRU hidden size
+    tau: 1.0                # gumbel-softmax temperature
+    src_info: LR_TPE        # Latent Repr + Transport Prediction Error (paper best)
+    rnn_arch: GRU
+    num_layers: 1
+    dropout: 0.0
+
+  # TRAModel training
+  transport_method: router  # full TRA with optimal transport routing
+  pretrain: true            # pretrain backbone first, then finetune TRA head
+  n_epochs: 200             # reduced from paper 500 for 6-window feasibility
+  early_stop: 30            # patience on valid IC
   lr: 0.001
-  batch_size: 8192          # 4x default; 20GB VRAM is not the bottleneck
-  early_stop: 20
-  GPU: 0                    # CUDA device index (RTX 3080)
-  step_len: 20              # matches Alpha360 20-day construction window
-  n_jobs: 0                 # MANDATORY on Windows: DataLoader spawn multiprocessing broken
-  # LGB fallback params (used when type=lgbm)
+
+  # LGB reference params (kept for documentation; not used when type=tra)
   learning_rate: 0.0421
   colsample_bytree: 0.8879
   subsample: 0.8789
@@ -35,10 +52,11 @@ model:
   num_boost_round: 500
   device: gpu
 strategy:
-  # CSI1000: IC high, try n_drop=3 to capture signal faster before decay
+  # R12: n_drop=1 to reduce turnover cost -- TRA IC=0.040 is strong but
+  # n_drop=3 burned W4 (+2.5% vs LGB's +19.9% on same signal strength 0.058)
   topk: 15
   main:
-    n_drop: 3
+    n_drop: 1
   control:
     n_drop: 5
 cost_model:
