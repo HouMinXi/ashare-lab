@@ -600,7 +600,7 @@ def run_csi300_reference(exp_dir: Path) -> tuple[Path, Path]:
     csi300_dir.mkdir(parents=True, exist_ok=True)
 
     # Run full walk-forward under csi300_dir (isolated; does not touch main models).
-    csi300_window_results = run_full_walk_forward(
+    csi300_window_results, csi300_failed = run_full_walk_forward(
         exp_dir=csi300_dir,
         n_drop=main_n_drop,
         universe=ref_universe,
@@ -614,6 +614,7 @@ def run_csi300_reference(exp_dir: Path) -> tuple[Path, Path]:
         track=main_track,
         universe=ref_universe,
         gate_config=gate_config,
+        failed_windows=csi300_failed,
     )
     # Prefix note for clarity.
     verdict_dict["note"] = f"REFERENCE TRACK ({ref_universe}): " + verdict_dict["note"]

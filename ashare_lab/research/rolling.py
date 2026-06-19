@@ -24,13 +24,17 @@ def run_full_walk_forward(
     n_drop: int,
     universe: str,
     pred_dir: Path | None = None,
-) -> list:
+) -> tuple[list[dict], list[int]]:
     """Run the full 6-window expanding walk-forward loop.
 
     For each window returned by get_all_windows(): trains an LGBModel,
     generates predictions, applies price filter, runs backtest, computes
-    RankIC and excess return metrics, and persists predictions. Errored
-    windows are skipped (not included in the returned list).
+    RankIC and excess return metrics, and persists predictions.
+
+    Per-window errors are caught and logged with full tracebacks (window
+    isolation). However, if zero windows complete or fewer than min_windows
+    succeed, the function raises RuntimeError to prevent silent empty
+    verdicts.
 
     All windows from get_all_windows() are evaluated regardless of
     is_complete (incomplete windows count in the denominator with no
@@ -45,11 +49,17 @@ def run_full_walk_forward(
             to exp_dir/predictions if None.
 
     Returns:
-        list of WindowResult dicts. Each dict has keys:
+        Tuple of (window_results, failed_windows).
+        window_results: list of WindowResult dicts, each with keys:
             window_id, mean_rank_ic, cumulative_excess_return,
             is_positive_excess, lot_skip_count, universe, n_drop,
             train_end, test_start, test_end, pred_path.
-        Errored windows are omitted (no None entries).
+        failed_windows: list of int window IDs that errored during
+            training/backtest. Empty list when all windows succeed.
+
+    Raises:
+        RuntimeError: When zero windows complete or fewer than min_windows
+            succeed. Prevents silent empty/partial verdicts.
     """
     cfg = load_config()
     min_windows: int = cfg["walk_forward"]["min_windows"]
@@ -77,6 +87,7 @@ def run_full_walk_forward(
         )
 
     window_results: list[dict] = []
+    failed_windows: list[int] = []
 
     for window in windows:
         window_id: int = window["window_id"]
@@ -89,7 +100,7 @@ def run_full_walk_forward(
 
         try:
             # Step 1: train, predict, price-filter.
-            model_path, pred, label = train_window(window, exp_dir, universe)
+            _model_path, pred, label = train_window(window, exp_dir, universe)
 
             # Step 2: per-date Spearman IC.
             rank_ic_series = daily_rank_ic(pred, label)
@@ -121,6 +132,7 @@ def run_full_walk_forward(
                 **metrics,
                 "universe": universe,
                 "n_drop": n_drop,
+                "is_complete": window["is_complete"],
                 "train_end": window["train_end"],
                 "test_start": window["test_start"],
                 "test_end": window["test_end"],
@@ -137,13 +149,31 @@ def run_full_walk_forward(
             )
 
         except Exception:
-            log.exception("W%d: error during training/backtest; skipping window", window_id)
+            log.exception("W%d: FAILED during training/backtest", window_id)
+            failed_windows.append(window_id)
 
     completed = len(window_results)
+
+    if failed_windows:
+        log.error(
+            "walk-forward: %d/%d windows FAILED: %s",
+            len(failed_windows),
+            total,
+            failed_windows,
+        )
+
+    if completed == 0 and total > 0:
+        raise RuntimeError(
+            f"walk-forward: 0/{total} windows completed, all failed. "
+            f"Failed windows: {failed_windows}. Cannot produce a verdict."
+        )
+
     if completed < min_windows:
-        log.warning(
-            "only %d windows completed",
-            completed,
+        raise RuntimeError(
+            f"walk-forward: only {completed}/{total} windows completed "
+            f"(min_windows={min_windows}). "
+            f"Failed windows: {failed_windows}. Refusing to produce a verdict "
+            f"on insufficient data."
         )
 
     log.info(
@@ -152,4 +182,4 @@ def run_full_walk_forward(
         total,
     )
 
-    return window_results
+    return window_results, failed_windows

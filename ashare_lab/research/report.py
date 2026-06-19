@@ -51,6 +51,7 @@ def run_verdict_phase(
     window_results: list[dict],
     exp_dir: Path,
     n_drop: int,
+    failed_windows: list[int] | None = None,
 ) -> dict:
     """Aggregate walk-forward results into a gate verdict and write outputs.
 
@@ -64,9 +65,11 @@ def run_verdict_phase(
         exp_dir: Experiment directory created by make_exp_dir (must exist).
         n_drop: n_drop parameter used for the current track (from config
             strategy.main.n_drop in the default pipeline).
+        failed_windows: List of window IDs that errored during
+            training/backtest (from run_full_walk_forward second return).
 
     Returns:
-        The verdict dict (all 11 D-25 fields). Only reached on PASS or
+        The verdict dict (all 12 fields). Only reached on PASS or
         BORDER_PASS -- FAIL calls sys.exit(1) before returning.
     """
     cfg = load_config()
@@ -76,12 +79,12 @@ def run_verdict_phase(
     topk: int = cfg["strategy"]["topk"]
     track: str = f"topk{topk}_ndrop{n_drop}"
 
-    # Build the 11-field verdict dict.
     verdict_dict = build_verdict(
         window_results=window_results,
         track=track,
         universe=universe,
         gate_config=gate_config,
+        failed_windows=failed_windows,
     )
 
     # Write verdict.json atomically.
@@ -154,6 +157,6 @@ def main() -> None:
     # Deferred import: run_full_walk_forward requires qlib runtime.
     from ashare_lab.research.rolling import run_full_walk_forward  # noqa: PLC0415
 
-    window_results: list[dict] = run_full_walk_forward(exp_dir, n_drop, universe)
+    window_results, failed_windows = run_full_walk_forward(exp_dir, n_drop, universe)
 
-    run_verdict_phase(window_results, exp_dir, n_drop)
+    run_verdict_phase(window_results, exp_dir, n_drop, failed_windows=failed_windows)

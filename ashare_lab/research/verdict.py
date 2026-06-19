@@ -17,15 +17,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy
 import pandas as pd
 
 log = logging.getLogger(__name__)
-
-# Use a non-interactive backend so plt works without a display.
-matplotlib.use("Agg")
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +56,12 @@ def compute_gate(
     Returns:
         "PASS", "FAIL", or "BORDER_PASS".
     """
+    _required = ("min_mean_rank_ic", "min_positive_excess_pct",
+                 "border_pass_ic_upper", "border_pass_excess_upper")
+    missing = [k for k in _required if k not in gate_config]
+    if missing:
+        raise KeyError(f"gate_config missing required keys: {missing}")
+
     min_ic: float = gate_config["min_mean_rank_ic"]
     min_pct: float = gate_config["min_positive_excess_pct"]
     border_ic: float = gate_config["border_pass_ic_upper"]
@@ -70,7 +71,11 @@ def compute_gate(
     if mean_ic is None or pd.isna(mean_ic):
         return "FAIL"
 
-    # Rule 2: boundary FAIL (IC must be strictly greater than min_ic; = FAILs).
+    # Rule 2: boundary FAIL.
+    # Asymmetry is intentional: IC at exactly the threshold FAILs (<=),
+    # while pos_pct at exactly the threshold PASSes (<). IC is continuous
+    # so equality is near-impossible; pos_pct is discrete (n_pos/n_windows)
+    # so equality at threshold is common and should pass.
     if mean_ic <= min_ic or pos_pct < min_pct:
         return "FAIL"
 
@@ -92,8 +97,9 @@ def build_verdict(
     track: str,
     universe: str,
     gate_config: dict,
+    failed_windows: list[int] | None = None,
 ) -> dict:
-    """Aggregate window results into the 11-field verdict dict (D-25 schema).
+    """Aggregate window results into the verdict dict (D-25 schema).
 
     Args:
         window_results: List of WindowResult dicts from run_full_walk_forward.
@@ -105,15 +111,21 @@ def build_verdict(
         universe: Qlib universe name, e.g. "csi500". Taken from caller param
             (not extracted from window_results) so empty-list is safe.
         gate_config: Dict with gate threshold keys (see compute_gate).
+        failed_windows: List of window IDs that errored during
+            training/backtest. Returned as the second element of
+            run_full_walk_forward(). Empty list or None when all succeed.
 
     Returns:
-        Dict with 11 fields:
+        Dict with 12 fields:
             gate, universe, track, mean_rank_ic, n_windows,
             n_positive_excess_windows, positive_excess_pct, window_details,
-            rejected_orders_lot_skip, slippage_sensitivity, note.
+            rejected_orders_lot_skip, slippage_sensitivity, failed_windows,
+            note.
+        failed_windows is always present (empty list when all succeed).
         slippage_sensitivity is None (backfilled by plan 02-04 supplementary).
     """
     n_windows: int = len(window_results)
+    n_pos: int = 0
 
     # pos_pct denominator = n_windows (all completed windows, including those
     # with None IC; None IC only affects the mean, not the positive flag).
@@ -136,8 +148,7 @@ def build_verdict(
 
     gate = compute_gate(mean_ic, pos_pct, gate_config)
 
-    # Reuse n_pos computed above (avoid identical second sum).
-    n_positive = n_pos if n_windows > 0 else 0
+    n_positive = n_pos
 
     # rejected_orders_lot_skip: sum of non-None lot_skip_count values.
     # None if ALL windows have lot_skip_count=None.
@@ -159,11 +170,16 @@ def build_verdict(
         for w in window_results
     ]
 
+    # Normalize failed_windows to a stable list (always present in output).
+    if failed_windows is None:
+        failed_windows = []
+
     # Human-readable note.
     ic_str = f"{mean_ic:.4f}" if mean_ic is not None else "None"
+    fail_note = f", failed_windows={failed_windows}" if failed_windows else ""
     note = (
         f"Gate {gate}: mean_rank_ic={ic_str}, "
-        f"positive_excess_pct={pos_pct:.0%}"
+        f"positive_excess_pct={pos_pct:.0%}{fail_note}"
     )
 
     return {
@@ -177,6 +193,7 @@ def build_verdict(
         "window_details": window_details,
         "rejected_orders_lot_skip": rejected_orders_lot_skip,
         "slippage_sensitivity": None,  # backfilled by 02-04
+        "failed_windows": failed_windows,
         "note": note,
     }
 
@@ -195,6 +212,8 @@ def _convert_numpy(obj: Any) -> Any:
     numpy>=2 requires explicit conversion for both integer and float types;
     silent coercion via standard json.dumps is no longer reliable.
     """
+    if isinstance(obj, numpy.bool_):
+        return bool(obj)
     if isinstance(obj, numpy.integer):
         return int(obj)
     if isinstance(obj, numpy.floating):
@@ -250,7 +269,7 @@ def write_verdict(verdict_dict: dict, exp_dir: Path) -> Path:
     writes on crash.
 
     Args:
-        verdict_dict: The 11-field dict returned by build_verdict.
+        verdict_dict: The verdict dict returned by build_verdict.
         exp_dir: Experiment output directory (must exist).
 
     Returns:
@@ -263,7 +282,7 @@ def write_verdict(verdict_dict: dict, exp_dir: Path) -> Path:
     fd, tmp_path = tempfile.mkstemp(dir=exp_dir, prefix=".verdict_tmp_", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, indent=2, default=str)
+            json.dump(serializable, f, indent=2)
         os.replace(tmp_path, out_path)
     except Exception:
         # Clean up tmp file if replace failed.
@@ -289,7 +308,7 @@ def write_ic_csv_png(
     """Write per-window IC data to CSV and a bar chart PNG.
 
     CSV columns: window_id, mean_rank_ic, cumulative_excess_return,
-    is_positive_excess (subset of WindowResult -- not all 11 fields).
+    is_positive_excess (subset of WindowResult).
 
     PNG: bar chart of mean_rank_ic per window, with a threshold line at
     gate_config["min_mean_rank_ic"]. Label derived from threshold value
@@ -304,6 +323,10 @@ def write_ic_csv_png(
     Returns:
         (csv_path, png_path) tuple.
     """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: E402
+
     csv_path = exp_dir / "ic_windows.csv"
     png_path = exp_dir / "ic_windows.png"
 
