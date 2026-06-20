@@ -353,10 +353,34 @@ def run_slippage_sensitivity(
     rel_drop_threshold: float = fragility_cfg["rel_drop_threshold"]
     abs_tol: float = fragility_cfg["abs_tol"]
 
-    # Step A: baseline row (no re-backtest).
+    # Step A: baseline row via re-backtest at baseline slippage.
+    # Uses the same _rebacktest_window path as the level rows so Row 0
+    # and all level rows are apples-to-apples. The prior implementation
+    # used stored main-run excess (asymmetric), which produced the
+    # counter-intuitive result of higher slippage yielding higher excess.
+    baseline_results: list[dict] = []
+    baseline_backtested_ids: set[int] = set()
+    for w in main_window_results:
+        result = _rebacktest_window(
+            window_result=w,
+            n_drop=w["n_drop"],
+            slippage_override=baseline_slippage,
+        )
+        if result is not None:
+            baseline_results.append(result)
+            baseline_backtested_ids.add(w["window_id"])
+
+    if not baseline_results:
+        log.warning(
+            "run_slippage_sensitivity: zero windows re-backtested at "
+            "baseline slippage=%.4f; cannot compute sensitivity",
+            baseline_slippage,
+        )
+        return out_path
+
     baseline_mean = float(
-        sum(w["cumulative_excess_return"] for w in main_window_results)
-        / len(main_window_results)
+        sum(r["cumulative_excess_return"] for r in baseline_results)
+        / len(baseline_results)
     )
 
     rows = [
@@ -406,23 +430,30 @@ def run_slippage_sensitivity(
     )
 
     if all_seen_ids and all_seen_ids != all_input_ids:
-        matched_windows = [
-            w for w in main_window_results if w["window_id"] in all_seen_ids
+        matched_baseline = [
+            r for r in baseline_results if r["window_id"] in all_seen_ids
         ]
-        recomputed_baseline = float(
-            sum(w["cumulative_excess_return"] for w in matched_windows)
-            / len(matched_windows)
-        )
-        log.warning(
-            "run_slippage_sensitivity: %d/%d windows present in every level; "
-            "updating baseline row (%.6f -> %.6f)",
-            len(all_seen_ids),
-            len(all_input_ids),
-            baseline_mean,
-            recomputed_baseline,
-        )
-        baseline_mean = recomputed_baseline
-        rows[0]["mean_cumulative_excess"] = baseline_mean
+        if not matched_baseline:
+            log.warning(
+                "run_slippage_sensitivity: intersection %s has no overlap "
+                "with baseline windows; keeping original baseline row",
+                all_seen_ids,
+            )
+        else:
+            recomputed_baseline = float(
+                sum(r["cumulative_excess_return"] for r in matched_baseline)
+                / len(matched_baseline)
+            )
+            log.warning(
+                "run_slippage_sensitivity: %d/%d windows present in every level; "
+                "updating baseline row (%.6f -> %.6f)",
+                len(all_seen_ids),
+                len(all_input_ids),
+                baseline_mean,
+                recomputed_baseline,
+            )
+            baseline_mean = recomputed_baseline
+            rows[0]["mean_cumulative_excess"] = baseline_mean
 
     # Build non-baseline rows.
     for entry in per_level_results:
@@ -450,13 +481,14 @@ def run_slippage_sensitivity(
         )
 
     # Compute fragility: compare each level against a baseline from the SAME
-    # windows that level successfully backtested. Using a different-sized
-    # baseline sample for each level's rel_drop gives consistent denominators.
+    # windows that level successfully backtested. Per-level matched baseline
+    # prevents cross-level window-population differences from confounding
+    # the rel_drop calculation.
     is_fragile = False
     for entry in per_level_results:
         level_results = entry["results"]
+        level_ids = entry["ids"]
         if not level_results:
-            # Zero matched windows: treat as maximally fragile.
             log.warning(
                 "run_slippage_sensitivity: level %s has zero matched windows; "
                 "flagging as fragile",
@@ -465,15 +497,29 @@ def run_slippage_sensitivity(
             is_fragile = True
             break
 
+        # Matched baseline: only windows THIS level backtested.
+        matched_baseline_for_level = [
+            r for r in baseline_results if r["window_id"] in level_ids
+        ]
+        if not matched_baseline_for_level:
+            log.warning(
+                "run_slippage_sensitivity: level %s baseline has zero "
+                "overlap with backtested windows; flagging as fragile",
+                entry["level"],
+            )
+            is_fragile = True
+            break
+
+        baseline_for_level = float(
+            sum(r["cumulative_excess_return"] for r in matched_baseline_for_level)
+            / len(matched_baseline_for_level)
+        )
         level_mean = float(
             sum(r["cumulative_excess_return"] for r in level_results)
             / len(level_results)
         )
-        # Compare against baseline_mean, which is exactly what CSV Row 0 shows
-        # (intersection-based or original if no windows were skipped). Using
-        # baseline_mean keeps the fragility decision visible from the CSV output.
-        denominator = max(abs(baseline_mean), abs_tol)
-        rel_drop = (baseline_mean - level_mean) / denominator
+        denominator = max(abs(baseline_for_level), abs_tol)
+        rel_drop = (baseline_for_level - level_mean) / denominator
         if rel_drop > rel_drop_threshold:
             is_fragile = True
             break
