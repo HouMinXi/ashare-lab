@@ -139,14 +139,14 @@ class TestBuildVerdict:
         return build_verdict(windows, track="topk15_ndrop1", universe="csi500", gate_config=gate_cfg)
 
     def test_schema_completeness(self):
-        """Verdict dict contains all 11 D-25 fields."""
+        """Verdict dict contains all 12 fields (11 original + failed_windows)."""
         windows = [_make_window(1, 0.03, 0.05, True, 2)]
         result = self._call(windows)
         expected_keys = {
             "gate", "universe", "track", "mean_rank_ic", "n_windows",
             "n_positive_excess_windows", "positive_excess_pct",
             "window_details", "rejected_orders_lot_skip",
-            "slippage_sensitivity", "note",
+            "slippage_sensitivity", "failed_windows", "note",
         }
         assert set(result.keys()) == expected_keys
 

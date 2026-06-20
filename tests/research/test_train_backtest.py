@@ -14,6 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 import pandas as pd
 
 
@@ -259,7 +261,7 @@ class TestRunFullWalkForward:
         return portfolio_df, bench_close
 
     def test_window_skip_on_exception(self, tmp_path):
-        """A window that raises is omitted from results; no None entries."""
+        """A window that raises is omitted from results and reported in failed list."""
         import ashare_lab.research.rolling as rolling_mod
 
         good_window = self._make_window(1)
@@ -283,20 +285,19 @@ class TestRunFullWalkForward:
             rolling_mod, "run_backtest", side_effect=mock_backtest
         ), mock.patch(
             "ashare_lab.research.rolling.load_config",
-            return_value={"walk_forward": {"min_windows": 5}},
+            return_value={"walk_forward": {"min_windows": 1}},
         ):
-            results = rolling_mod.run_full_walk_forward(
+            results, failed = rolling_mod.run_full_walk_forward(
                 exp_dir=tmp_path, n_drop=1, universe="csi500"
             )
 
         assert len(results) == 1
         assert results[0]["window_id"] == 1
         assert None not in results
+        assert failed == [2]
 
-    def test_post_loop_min_windows_warning(self, tmp_path, caplog):
-        """When completed windows < min_windows, a warning is logged post-loop."""
-        import logging
-
+    def test_post_loop_min_windows_raises(self, tmp_path):
+        """When completed windows < min_windows, RuntimeError is raised."""
         import ashare_lab.research.rolling as rolling_mod
 
         windows = [self._make_window(i) for i in range(1, 3)]  # only 2 windows
@@ -318,17 +319,10 @@ class TestRunFullWalkForward:
         ), mock.patch(
             "ashare_lab.research.rolling.load_config",
             return_value={"walk_forward": {"min_windows": 5}},
-        ), caplog.at_level(
-            logging.WARNING, logger="ashare_lab.research.rolling"
-        ):
-            results = rolling_mod.run_full_walk_forward(
+        ), pytest.raises(RuntimeError, match="only 2/2 windows completed"):
+            rolling_mod.run_full_walk_forward(
                 exp_dir=tmp_path, n_drop=1, universe="csi500"
             )
-
-        assert len(results) == 2
-        assert "only 2 windows completed" in caplog.text, (
-            f"Expected 'only 2 windows completed' warning; got: {caplog.text!r}"
-        )
 
     def test_pred_path_naming_convention(self, tmp_path):
         """Persisted predictions follow PredictionFile schema: pred_w{N}.parquet."""
@@ -354,7 +348,7 @@ class TestRunFullWalkForward:
             "ashare_lab.research.rolling.load_config",
             return_value={"walk_forward": {"min_windows": 1}},
         ):
-            results = rolling_mod.run_full_walk_forward(
+            results, _failed = rolling_mod.run_full_walk_forward(
                 exp_dir=tmp_path, n_drop=1, universe="csi500"
             )
 

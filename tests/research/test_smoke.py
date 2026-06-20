@@ -27,7 +27,8 @@ def test_step0_train_end() -> None:
     assert w["train_end"] == "2022-12-31"
     assert w["window_id"] == 1
     assert w["step"] == 0
-    assert w["train_start"] == "2018-01-01"
+    # With train_window_years=3, W1 train_start = base_train_end - 3yr.
+    assert w["train_start"] == "2019-12-31"
 
 
 # ---------------------------------------------------------------------------

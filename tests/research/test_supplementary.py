@@ -123,8 +123,8 @@ class TestSlippageSensitivityBaseline:
         assert len(baseline_rows) == 1, "exactly one baseline row"
         assert abs(baseline_rows.iloc[0]["impact_cost"] - expected_baseline_slippage) < 1e-9
         assert bool(baseline_rows.iloc[0]["is_baseline"]) is True
-        # Mean of 0.04 and 0.06 = 0.05
-        assert abs(baseline_rows.iloc[0]["mean_cumulative_excess"] - 0.05) < 1e-9
+        # Both windows re-backtested at baseline slippage; fake returns 0.03 each.
+        assert abs(baseline_rows.iloc[0]["mean_cumulative_excess"] - 0.03) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +158,11 @@ class TestSlippageSensitivityNonBaseline:
             out_path = run_slippage_sensitivity(windows, tmp_exp_dir)
 
         assert out_path.exists()
-        # _rebacktest_window called once per window per level.
-        assert len(call_log) == len(levels), "one re-backtest call per level"
-        assert set(call_log) == set(levels), "levels passed as slippage_override"
+        # _rebacktest_window called once for baseline + once per level.
+        baseline_slippage = cfg["cost_model"]["slippage"]
+        assert len(call_log) == 1 + len(levels), "one baseline + one per level"
+        assert call_log[0] == baseline_slippage, "first call is baseline"
+        assert set(call_log[1:]) == set(levels), "remaining calls are levels"
 
         df = pd.read_csv(out_path)
         non_baseline = df[~df["is_baseline"]]
@@ -178,14 +180,19 @@ class TestFragilityPositive:
         """is_fragile=True when excess drops > rel_drop_threshold vs baseline."""
         _write_verdict_json(tmp_exp_dir)
 
-        # baseline excess = 0.10; level excess = 0.04
+        from ashare_lab.config import load_config
+        cfg = load_config()
+        baseline_slippage = cfg["cost_model"]["slippage"]
+
+        # baseline re-backtest returns 0.10; level re-backtest returns 0.04
         # rel_drop = (0.10 - 0.04) / max(0.10, 0.0005) = 0.60 > 0.50 threshold
         windows = [
             _make_window_result(window_id=1, cumulative_excess_return=0.10, pred_path="/tmp/w1.parquet"),
         ]
 
         def fake_rebacktest(window_result, n_drop, slippage_override):
-            return {**window_result, "n_drop": n_drop, "cumulative_excess_return": 0.04}
+            excess = 0.10 if slippage_override == baseline_slippage else 0.04
+            return {**window_result, "n_drop": n_drop, "cumulative_excess_return": excess}
 
         with patch(
             "ashare_lab.research.supplementary._rebacktest_window",
@@ -396,7 +403,7 @@ class TestCsi300Reference:
         with (
             patch(
                 "ashare_lab.research.supplementary.run_full_walk_forward",
-                return_value=[fake_csi300_window],
+                return_value=([fake_csi300_window], []),
             ),
             patch(
                 "ashare_lab.research.supplementary._rebacktest_window",
