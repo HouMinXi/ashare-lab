@@ -6,11 +6,9 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
-
 # Secrets
 .env
 *.token
-
 # Data artifacts (qlib data lives in ~/.qlib, outside the repo)
 data/cache/
 *.tar.gz
@@ -20,9 +18,10 @@ models/*.bin
 *.sqlite
 *.sqlite3
 *.db
-
 # Editor / OS
 .idea/
 .vscode/
 *.swp
 .DS_Store
+models/*.pt
+experiments/
