@@ -99,7 +99,7 @@ def build_verdict(
     gate_config: dict,
     failed_windows: list[int] | None = None,
 ) -> dict:
-    """Aggregate window results into the verdict dict (D-25 schema).
+    """Aggregate window results into the verdict dict.
 
     Args:
         window_results: List of WindowResult dicts from run_full_walk_forward.
