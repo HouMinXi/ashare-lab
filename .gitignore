@@ -25,3 +25,11 @@ models/*.bin
 .DS_Store
 models/*.pt
 experiments/
+CLAUDE.md
+# Planning files (local-only, never push)
+.planning/
+# Ad-hoc run scripts and result artifacts
+run_*.py
+results/
+results_*/
+*.html
