@@ -261,8 +261,12 @@ def _serialize_verdict(verdict_dict: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def write_verdict(verdict_dict: dict, exp_dir: Path) -> Path:
-    """Serialize and atomically write verdict_dict to exp_dir/verdict.json.
+def write_verdict(
+    verdict_dict: dict,
+    exp_dir: Path,
+    name: str = "verdict",
+) -> Path:
+    """Serialize and atomically write verdict_dict to exp_dir/{name}.json.
 
     Applies all three serialization transforms via _serialize_verdict, then
     writes atomically using a temporary file + os.replace to avoid partial
@@ -271,12 +275,17 @@ def write_verdict(verdict_dict: dict, exp_dir: Path) -> Path:
     Args:
         verdict_dict: The verdict dict returned by build_verdict.
         exp_dir: Experiment output directory (must exist).
+        name: Base filename without extension. Defaults to "verdict"
+            (backward compatible). Use e.g. "verdict_regime" to write
+            verdict_regime.json for non-primary tracks.
 
     Returns:
-        Path to the written verdict.json file.
+        Path to the written {name}.json file.
     """
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"name must be a simple filename stem, got: {name!r}")
     serializable = _serialize_verdict(verdict_dict)
-    out_path = exp_dir / "verdict.json"
+    out_path = exp_dir / f"{name}.json"
 
     # Atomic write: write to tmp file in same directory, then replace.
     fd, tmp_path = tempfile.mkstemp(dir=exp_dir, prefix=".verdict_tmp_", suffix=".json")

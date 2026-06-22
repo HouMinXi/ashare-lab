@@ -5,7 +5,7 @@ universe:
   exclude_close_above_cny: 300
 walk_forward:
   train_start: "2018-01-01"    # absolute earliest allowed train start (safety floor)
-  base_train_end: "2022-12-31"
+  base_train_end: "2020-12-31"
   step_months: 6
   min_windows: 5
   train_window_years: 3        # rolling window; null = expanding (original behavior)

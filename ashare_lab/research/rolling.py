@@ -3,12 +3,19 @@
 Provides run_full_walk_forward(), which loops over all windows returned by
 get_all_windows(), trains/backtests each, and returns a list of WindowResult
 dicts for the gate verdict in plan 02-03.
+
+The optional signal_transform hook allows callers to modify predictions
+(e.g. blend TRA with neutralized-TRA) before IC computation and backtest,
+keeping a single audited pipeline path for all signal variants.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
+
+import pandas as pd
 
 from ashare_lab.config import load_config
 from ashare_lab.research.backtest import run_backtest
@@ -24,12 +31,14 @@ def run_full_walk_forward(
     n_drop: int,
     universe: str,
     pred_dir: Path | None = None,
+    signal_transform: Callable[[pd.Series, dict], pd.Series] | None = None,
 ) -> tuple[list[dict], list[int]]:
-    """Run the full 6-window expanding walk-forward loop.
+    """Run the walk-forward loop over all windows.
 
-    For each window returned by get_all_windows(): trains an LGBModel,
-    generates predictions, applies price filter, runs backtest, computes
-    RankIC and excess return metrics, and persists predictions.
+    For each window returned by get_all_windows(): trains a model,
+    generates predictions, optionally applies signal_transform, runs
+    backtest, computes RankIC and excess return metrics, and persists
+    predictions.
 
     Per-window errors are caught and logged with full tracebacks (window
     isolation). However, if zero windows complete or fewer than min_windows
@@ -47,6 +56,11 @@ def run_full_walk_forward(
         universe: Qlib universe string, e.g. "csi500" or "csi300".
         pred_dir: Directory for persisted prediction parquet files. Defaults
             to exp_dir/predictions if None.
+        signal_transform: Optional callable (pred, window) -> pred that
+            transforms raw predictions before IC/backtest. When None,
+            behavior is byte-identical to the untransformed pipeline.
+            Exceptions are caught per-window: raw pred is kept, the window
+            ID is recorded in transform_failures, and a warning is logged.
 
     Returns:
         Tuple of (window_results, failed_windows).
@@ -88,6 +102,7 @@ def run_full_walk_forward(
 
     window_results: list[dict] = []
     failed_windows: list[int] = []
+    transform_failures: list[int] = []
 
     for window in windows:
         window_id: int = window["window_id"]
@@ -102,7 +117,23 @@ def run_full_walk_forward(
             # Step 1: train, predict, price-filter.
             _model_path, pred, label = train_window(window, exp_dir, universe)
 
-            # Step 2: per-date Spearman IC.
+            # Step 1b: optional signal transform (e.g. blend TRA + nTRA).
+            # Defensive copy: if the transform mutates pred in-place
+            # before raising, the fallback must use the unmutated original.
+            if signal_transform is not None:
+                original_pred = pred.copy()
+                try:
+                    pred = signal_transform(pred, window)
+                except Exception as exc:
+                    pred = original_pred
+                    log.warning(
+                        "W%d signal_transform failed, using raw pred: %s",
+                        window_id,
+                        exc,
+                    )
+                    transform_failures.append(window_id)
+
+            # Step 2: per-date Spearman IC (on transformed pred when applicable).
             rank_ic_series = daily_rank_ic(pred, label)
 
             # Step 3: backtest with configured cost model.
@@ -174,6 +205,13 @@ def run_full_walk_forward(
             f"(min_windows={min_windows}). "
             f"Failed windows: {failed_windows}. Refusing to produce a verdict "
             f"on insufficient data."
+        )
+
+    if transform_failures:
+        log.warning(
+            "walk-forward: signal_transform failed on %d windows: %s",
+            len(transform_failures),
+            transform_failures,
         )
 
     log.info(

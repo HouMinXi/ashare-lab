@@ -1,7 +1,7 @@
 """Unit tests for ashare_lab.research.smoke_test.
 
 Six tests exercise window date arithmetic without qlib runtime:
-1. Step 0 train_end is 2022-12-31
+1. Step 0 train_end is 2020-12-31 (base_train_end from config)
 2. Step 0 test span >= 170 calendar days
 3. Step 5 test_end is clamped to latest_trading_day
 4. is_complete is True for a full window (step 0)
@@ -24,11 +24,12 @@ from ashare_lab.research.smoke_test import get_all_windows, get_window
 def test_step0_train_end() -> None:
     """W1 (step=0) train_end must equal base_train_end from config."""
     w = get_window(0)
-    assert w["train_end"] == "2022-12-31"
+    assert w["train_end"] == "2020-12-31"
     assert w["window_id"] == 1
     assert w["step"] == 0
-    # With train_window_years=3, W1 train_start = base_train_end - 3yr.
-    assert w["train_start"] == "2019-12-31"
+    # With train_window_years=3, W1 train_start = base_train_end - 3yr,
+    # but floored by safety floor (2018-01-01).
+    assert w["train_start"] == "2018-01-01"
 
 
 # ---------------------------------------------------------------------------
@@ -81,18 +82,18 @@ def test_is_complete_false_for_short_window() -> None:
     """is_complete must be False when test_end is clamped to a near date.
 
     We mock latest_trading_day to a date only 30 days after test_start
-    for step 5, ensuring test span < 170 days.
+    for step 9, ensuring test span < 170 days.
     """
     from ashare_lab.research import smoke_test as st  # noqa: PLC0415
 
-    # W6 (step=5) test_start is 2026-01-01 (unclamped test_end 2026-06-30).
+    # W10 (step=9) test_start is 2026-01-01 (unclamped test_end 2026-06-30).
     # Mock latest_trading_day to return 2026-03-01 (59 calendar days after
     # test_start, well below the 170-day threshold).
     fake_latest = dt.date(2026, 3, 1)
     with mock.patch.object(st, "latest_trading_day", return_value=fake_latest):
         # Use st.get_window so the patched latest_trading_day is resolved
         # via the smoke_test module namespace (not the test's own binding).
-        w = st.get_window(5)
+        w = st.get_window(9)
 
     test_start = dt.date.fromisoformat(w["test_start"])
     test_end = dt.date.fromisoformat(w["test_end"])
