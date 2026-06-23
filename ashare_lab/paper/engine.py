@@ -279,7 +279,7 @@ def settle_day(
                     target_qty=remainder_qty,
                     price=None,
                     status="carry",
-                    carry_day=carry_day,
+                    carry_day=0,  # fresh window: partial fill proves liquidity
                     created_run_date=trade_date,
                 )
                 result.carries_to_bump.append(
@@ -455,7 +455,7 @@ def settle_day(
                     target_qty=remainder_qty,
                     price=None,
                     status="carry",
-                    carry_day=carry_day,
+                    carry_day=0,  # fresh window: partial fill proves liquidity
                     created_run_date=trade_date,
                 )
                 result.carries_to_bump.append(

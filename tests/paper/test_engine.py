@@ -603,6 +603,32 @@ class TestSettleDayCapZeroCarry:
         assert len(result.carries_to_bump) == 1
         assert len(result.carries_suspended) == 0
 
+    def test_low_liquidity_sell_carries_to_bump(self, tmp_path):
+        """Cap=0 sell path: low-liquidity sell -> carries_to_bump, not suspended."""
+        conn = _setup_db(tmp_path)
+        from ashare_lab.paper.ledger import insert_order as lio
+        oid = lio(
+            conn, "2024-01-02", "W", "sell", 100, None, "pending", 0,
+            "2024-01-02",
+        )
+        orders = [
+            {"id": oid, "symbol": "W", "side": "sell",
+             "target_qty": 100, "carry_day": 0},
+        ]
+        prices = _make_prices("W", 10.0, volume=100)
+        positions = {
+            "W": {"qty": 100, "avg_cost": 9.0, "market_value": 1000.0,
+                   "buy_date": "2024-01-01", "holding_high": 10.0, "factor": 1.0}
+        }
+        result = settle_day(
+            conn, "2024-01-02", orders, prices, positions, 100_000.0,
+            {"W"}, {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+        assert len(result.carries_to_bump) == 1
+        assert result.carries_to_bump[0]["side"] == "sell"
+        assert len(result.carries_suspended) == 0
+
 
 class TestSettleDayHoldingHighUpdate:
     """Holding high updated even for positions with no buy today."""
