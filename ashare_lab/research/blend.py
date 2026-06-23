@@ -60,8 +60,11 @@ def blend_tra_ntra(
 
     Raises:
         Any exception from compute_style_factors or neutralize_predictions
-        propagates to the caller (Contract 1's try/except catches it and
-        falls back to raw pred with a warning).
+        propagates to the caller. The prediction producer (predict.py)
+        intentionally does NOT fall back to raw TRA on blend failure;
+        the file contract requires score to be the locked 60/40 blend,
+        so a propagated exception prevents writing a contract-violating
+        artifact.
     """
     if pred.empty:
         result = pred.copy()
