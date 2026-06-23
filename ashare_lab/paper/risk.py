@@ -1,0 +1,352 @@
+"""7-dimension risk control framework for the paper trading engine.
+
+Dimensions:
+1. Max drawdown circuit breaker (D-35)
+2. Daily loss limit (D-36)
+3. Position concentration cap (D-37)
+4. Market regime filter (D-38)
+5. Trailing stop with cooldown (D-39)
+6. CSRC industry concentration (D-40)
+7. Soft drawdown topk reduction (D-45)
+
+Each dimension is a pure check function.  run_all_risk_checks aggregates
+them into a single frozen RiskCheckResult.  All thresholds are read from
+the config dict -- no hardcoded defaults in function signatures.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+from dataclasses import dataclass
+
+from ashare_lab.data.calendar import next_trading_day
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "RiskCheckResult",
+    "check_drawdown_breaker",
+    "check_daily_loss",
+    "check_concentration",
+    "check_market_regime",
+    "check_trailing_stop",
+    "manage_trailing_cooldown",
+    "check_industry_concentration",
+    "check_soft_drawdown",
+    "run_all_risk_checks",
+]
+
+
+# ---------------------------------------------------------------------------
+# Result dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RiskCheckResult:
+    """Aggregated outcome of all risk checks for one trading day.
+
+    Attributes:
+        buying_halted: True if any hard-halt dimension fired.
+        forced_sells: symbol -> qty to sell (concentration excess or
+            trailing stop full-position exit).
+        blocked_industries: CSRC industries over the cap.
+        blocked_rebuys: symbols still in trailing-stop cooldown.
+        topk_override: reduced topk when soft drawdown active, else None.
+        cooldown_entries: symbol -> {cooldown_until, holding_high} for
+            symbols that triggered trailing stop this run.  Pipeline
+            iterates this to call set_cooldown().
+    """
+
+    buying_halted: bool
+    forced_sells: dict[str, int]
+    blocked_industries: set[str]
+    blocked_rebuys: set[str]
+    topk_override: int | None
+    cooldown_entries: dict[str, dict]
+
+
+# ---------------------------------------------------------------------------
+# Individual check functions
+# ---------------------------------------------------------------------------
+
+
+def check_drawdown_breaker(
+    peak_nav: float, current_nav: float, threshold: float,
+) -> bool:
+    """Hard circuit breaker: halt all buying if drawdown exceeds threshold.
+
+    Selling is still allowed (D-35).
+    """
+    if peak_nav <= 0:
+        return False
+    drawdown = (peak_nav - current_nav) / peak_nav
+    return drawdown > threshold
+
+
+def check_daily_loss(
+    yesterday_nav: float, today_nav: float, threshold: float,
+) -> bool:
+    """Halt buying for the day if single-day loss exceeds threshold (D-36).
+
+    Returns False when yesterday_nav <= 0 (Day 1 guard).
+    """
+    if yesterday_nav <= 0:
+        return False
+    daily_loss = (yesterday_nav - today_nav) / yesterday_nav
+    return daily_loss > threshold
+
+
+def check_concentration(
+    position_value: float, total_nav: float, cap: float,
+) -> tuple[bool, float]:
+    """Check whether a single position exceeds the NAV cap (D-37).
+
+    Returns (is_over, excess_value).  excess_value tells the engine
+    how much to sell down.
+    """
+    if total_nav <= 0:
+        return (False, 0.0)
+    pct = position_value / total_nav
+    if pct > cap:
+        return (True, position_value - cap * total_nav)
+    return (False, 0.0)
+
+
+def check_market_regime(
+    csi1000_closes: list[float],
+    decline_threshold: float,
+    lookback_days: int,
+) -> bool:
+    """Halt buying if trailing N-day market decline exceeds threshold (D-38).
+
+    Requires at least lookback_days + 1 data points.  Slices to the
+    window so a longer series does not silently measure a wider span.
+    No forced liquidation -- only blocks buying.
+    """
+    if len(csi1000_closes) < lookback_days + 1:
+        return False
+    window = csi1000_closes[-(lookback_days + 1):]
+    cumulative_return = (window[-1] / window[0]) - 1
+    return cumulative_return < -decline_threshold
+
+
+def check_trailing_stop(
+    holding_high: float, current_price: float, stop_pct: float,
+) -> bool:
+    """Trigger full-position sell if decline from holding-period high
+    exceeds stop_pct (D-39).
+    """
+    if holding_high <= 0:
+        return False
+    decline = (holding_high - current_price) / holding_high
+    return decline > stop_pct
+
+
+def manage_trailing_cooldown(
+    cooldown_dict: dict[str, dict], trade_date: str,
+) -> dict[str, dict]:
+    """Remove expired cooldown entries, retain active ones.
+
+    Expiry uses strict less-than: cooldown_until < trade_date means
+    the cooldown has fully elapsed.  Entries where
+    cooldown_until >= trade_date are still active (the Nth cooldown
+    day is inside the window).
+
+    Returns a new dict with expired entries removed.
+    """
+    return {
+        symbol: entry
+        for symbol, entry in cooldown_dict.items()
+        if entry["cooldown_until"] >= trade_date
+    }
+
+
+def check_industry_concentration(
+    industry_positions: dict[str, float], total_nav: float, cap: float,
+) -> set[str]:
+    """Return set of CSRC industries where exposure exceeds cap (D-40)."""
+    if total_nav <= 0:
+        return set()
+    return {
+        industry
+        for industry, value in industry_positions.items()
+        if value / total_nav > cap
+    }
+
+
+def check_soft_drawdown(
+    peak_nav: float,
+    current_nav: float,
+    is_currently_reduced: bool,
+    soft_threshold: float,
+    recovery_pct: float,
+    default_topk: int,
+    reduced_topk: int,
+) -> int | None:
+    """Reduce topk when soft drawdown active; restore on recovery (D-45).
+
+    Uses is_currently_reduced to prevent oscillation: entry logic only
+    fires when NOT already reduced, exit logic only fires when reduced.
+    Returns reduced_topk to reduce, None to restore/keep default.
+    """
+    if peak_nav <= 0:
+        return None
+
+    if is_currently_reduced:
+        # Exit logic: restore when NAV recovers to recovery_pct of peak
+        if current_nav >= peak_nav * recovery_pct:
+            return None
+        return reduced_topk
+    else:
+        # Entry logic: reduce when drawdown exceeds soft threshold
+        drawdown = (peak_nav - current_nav) / peak_nav
+        if drawdown > soft_threshold:
+            return reduced_topk
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Aggregator
+# ---------------------------------------------------------------------------
+
+
+def run_all_risk_checks(
+    nav_history: list[dict],
+    yesterday_nav: float,
+    current_positions: dict[str, dict],
+    current_prices: dict[str, dict],
+    csi1000_closes: list[float],
+    industry_map: dict[str, str],
+    cooldown_dict: dict[str, dict],
+    cash: float,
+    is_soft_reduced: bool,
+    config: dict,
+    trade_date: str,
+) -> RiskCheckResult:
+    """Aggregate all 7 risk dimensions into a single result.
+
+    All thresholds are read from *config* (paper.risk section).
+    *yesterday_nav* is passed explicitly by the pipeline to avoid
+    mis-deriving it after record_nav has already written today's row.
+    *trade_date* is required to compute cooldown_until dates.
+    """
+    # -- Compute total/current NAV --
+    total_nav = (
+        sum(pos["market_value"] for pos in current_positions.values())
+        + cash
+    )
+    current_nav = total_nav
+
+    # -- Peak NAV from history (or current if no history) --
+    if nav_history:
+        peak_nav = max(row["total_nav"] for row in nav_history)
+    else:
+        peak_nav = current_nav
+
+    # Ensure peak is at least current (first day edge case)
+    if current_nav > peak_nav:
+        peak_nav = current_nav
+
+    # -- 1. Drawdown hard halt --
+    drawdown_halted = check_drawdown_breaker(
+        peak_nav, current_nav, config["drawdown_hard"],
+    )
+
+    # -- 2. Daily loss halt --
+    daily_loss_halted = check_daily_loss(
+        yesterday_nav, current_nav, config["daily_loss"],
+    )
+
+    # -- 3. Concentration check + forced sells --
+    forced_sells: dict[str, int] = {}
+    for symbol, pos in current_positions.items():
+        is_over, excess_cny = check_concentration(
+            pos["market_value"], total_nav, config["concentration"],
+        )
+        if is_over:
+            close_price = (
+                current_prices.get(symbol, {}).get("close", pos["avg_cost"])
+            )
+            excess_qty = max(1, int(excess_cny / close_price))
+            forced_sells[symbol] = min(excess_qty, pos["qty"])
+
+    # -- 4. Market regime filter --
+    regime_halted = check_market_regime(
+        csi1000_closes,
+        config["market_regime_decline"],
+        config["market_regime_days"],
+    )
+
+    # -- 5. Trailing stop + cooldown entries --
+    cooldown_entries: dict[str, dict] = {}
+    for symbol, pos in current_positions.items():
+        holding_high = pos.get("holding_high")
+        if holding_high is None:
+            continue
+        close = current_prices.get(symbol, {}).get("close")
+        if close is None:
+            logger.warning(
+                "Trailing stop: no close price for %s on %s (delisted?)",
+                symbol,
+                trade_date,
+            )
+            continue
+        if check_trailing_stop(
+            holding_high, close, config["trailing_stop"],
+        ):
+            # Full-position exit: assignment supersedes any partial
+            # concentration sell for the same symbol (F-D)
+            forced_sells[symbol] = pos["qty"]
+            # Compute cooldown_until: next_trading_day applied N times
+            cooldown_until_date = dt.date.fromisoformat(trade_date)
+            for _ in range(config["trailing_cooldown_days"]):
+                cooldown_until_date = next_trading_day(cooldown_until_date)
+            cooldown_entries[symbol] = {
+                "cooldown_until": cooldown_until_date.isoformat(),
+                "holding_high": holding_high,
+            }
+
+    # -- 6. Industry concentration --
+    industry_positions_by_csrc: dict[str, float] = {}
+    for s, pos in current_positions.items():
+        ind = industry_map.get(s)
+        if ind:
+            industry_positions_by_csrc[ind] = (
+                industry_positions_by_csrc.get(ind, 0.0)
+                + pos["market_value"]
+            )
+    blocked_industries = check_industry_concentration(
+        industry_positions_by_csrc, total_nav, config["industry_cap"],
+    )
+
+    # -- 7. Soft drawdown topk reduction --
+    topk_override = check_soft_drawdown(
+        peak_nav,
+        current_nav,
+        is_soft_reduced,
+        config["soft_drawdown"],
+        config["soft_drawdown_recovery"],
+        config["default_topk"],
+        config["reduced_topk"],
+    )
+
+    # -- blocked_rebuys from cooldown_dict (>= for full N-day) --
+    blocked_rebuys = {
+        s
+        for s, cd in cooldown_dict.items()
+        if cd["cooldown_until"] >= trade_date
+    }
+
+    # -- Merge halt flags --
+    buying_halted = drawdown_halted or daily_loss_halted or regime_halted
+
+    return RiskCheckResult(
+        buying_halted=buying_halted,
+        forced_sells=forced_sells,
+        blocked_industries=blocked_industries,
+        blocked_rebuys=blocked_rebuys,
+        topk_override=topk_override,
+        cooldown_entries=cooldown_entries,
+    )
