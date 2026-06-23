@@ -25,6 +25,7 @@ models/*.bin
 .DS_Store
 models/*.pt
 experiments/
+predictions/
 CLAUDE.md
 # Planning files (local-only, never push)
 .planning/

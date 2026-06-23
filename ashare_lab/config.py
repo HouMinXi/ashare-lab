@@ -15,6 +15,8 @@ CONFIG_PATH: Path = PROJECT_ROOT / "configs" / "baseline.yaml"
 
 MODELS_DIR: Path = PROJECT_ROOT / "models"
 
+PREDICTIONS_DIR: Path = PROJECT_ROOT / "predictions"
+
 
 @lru_cache(maxsize=1)
 def load_config() -> dict:
