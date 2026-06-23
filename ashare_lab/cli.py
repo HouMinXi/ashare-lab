@@ -66,6 +66,68 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 2 if failed else 0
 
 
+def cmd_paper_settle(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        return run_daily(
+            trade_date=getattr(args, "date", None),
+            force=getattr(args, "force", False),
+            steps={"settle"},
+        )
+    except Exception as exc:
+        log.error("paper settle failed: %s", exc)
+        return 2
+
+
+def cmd_paper_signal(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        return run_daily(
+            trade_date=getattr(args, "date", None),
+            force=False,
+            steps={"signal"},
+        )
+    except Exception as exc:
+        log.error("paper signal failed: %s", exc)
+        return 2
+
+
+def cmd_paper_run_all(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        return run_daily(
+            trade_date=getattr(args, "date", None),
+            force=getattr(args, "force", False),
+        )
+    except Exception as exc:
+        log.error("paper run-all failed: %s", exc)
+        return 2
+
+
+def cmd_paper_backfill(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.pipeline import run_backfill  # noqa: PLC0415
+        return run_backfill(
+            args.from_date,
+            args.to_date,
+            force=getattr(args, "force", False),
+        )
+    except Exception as exc:
+        log.error("paper backfill failed: %s", exc)
+        return 2
+
+
+def cmd_paper_status(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.pipeline import get_status  # noqa: PLC0415
+        status = get_status()
+        print(json.dumps(status, indent=2))
+        return 0
+    except Exception as exc:
+        log.error("paper status failed: %s", exc)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ashare-lab", description="A-share data pipeline")
     sub = parser.add_subparsers(dest="command")
@@ -78,10 +140,46 @@ def main() -> int:
     p_backfill.add_argument("from_date", help="start date YYYY-MM-DD (inclusive)")
     p_backfill.add_argument("to_date", help="end date YYYY-MM-DD (inclusive)")
 
+    # Paper engine subcommands
+    p_paper = sub.add_parser("paper", help="paper trading engine")
+    paper_sub = p_paper.add_subparsers(dest="paper_command")
+
+    p_settle = paper_sub.add_parser("settle", help="run settle phase only")
+    p_settle.add_argument("--date", help="trade date YYYY-MM-DD")
+    p_settle.add_argument("--force", action="store_true", help="force re-run")
+
+    p_signal = paper_sub.add_parser("signal", help="run signal generation only")
+    p_signal.add_argument("--date", help="trade date YYYY-MM-DD")
+
+    p_run_all = paper_sub.add_parser("run-all", help="full daily pipeline")
+    p_run_all.add_argument("--date", help="trade date YYYY-MM-DD")
+    p_run_all.add_argument("--force", action="store_true", help="force re-run")
+
+    p_pbackfill = paper_sub.add_parser("backfill", help="replay missed days")
+    p_pbackfill.add_argument("from_date", help="start date YYYY-MM-DD")
+    p_pbackfill.add_argument("to_date", help="end date YYYY-MM-DD")
+    p_pbackfill.add_argument("--force", action="store_true", help="force teardown and replay")
+
+    paper_sub.add_parser("status", help="show current ledger state")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         return 1
+
+    if args.command == "paper":
+        pc = getattr(args, "paper_command", None)
+        if not pc:
+            p_paper.print_help()
+            return 1
+        paper_commands = {
+            "settle": cmd_paper_settle,
+            "signal": cmd_paper_signal,
+            "run-all": cmd_paper_run_all,
+            "backfill": cmd_paper_backfill,
+            "status": cmd_paper_status,
+        }
+        return paper_commands[pc](args)
 
     commands = {
         "bootstrap": cmd_bootstrap,
