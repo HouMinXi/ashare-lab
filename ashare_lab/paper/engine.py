@@ -566,11 +566,7 @@ def settle_day(
         # ---------------------------------------------------------------
         # Step 8: record NAV
         # ---------------------------------------------------------------
-        market_value = sum(
-            p["qty"] * prices.get(s, {}).get("close", p["avg_cost"])
-            for s, p in current_positions.items()
-            if p["qty"] > 0
-        )
+        market_value = result.post_trade_nav - cash
         record_nav(
             conn,
             trade_date,
