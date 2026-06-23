@@ -26,6 +26,11 @@ ashare-baseline = "ashare_lab.research.report:main"
 [tool.setuptools.packages.find]
 include = ["ashare_lab*"]
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires qlib runtime with real price data",
+]
+
 [dependency-groups]
 dev = [
     "pytest",
