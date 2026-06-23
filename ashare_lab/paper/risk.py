@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from dataclasses import dataclass
 
 from ashare_lab.data.calendar import next_trading_day
@@ -269,7 +270,7 @@ def run_all_risk_checks(
             close_price = (
                 current_prices.get(symbol, {}).get("close", pos["avg_cost"])
             )
-            excess_qty = max(1, int(excess_cny / close_price))
+            excess_qty = max(1, math.ceil(excess_cny / close_price))
             forced_sells[symbol] = min(excess_qty, pos["qty"])
 
     # -- 4. Market regime filter --
@@ -301,6 +302,9 @@ def run_all_risk_checks(
             forced_sells[symbol] = pos["qty"]
             # Compute cooldown_until: next_trading_day applied N times
             cooldown_until_date = dt.date.fromisoformat(trade_date)
+            assert config["trailing_cooldown_days"] >= 1, (
+                "trailing_cooldown_days must be >= 1"
+            )
             for _ in range(config["trailing_cooldown_days"]):
                 cooldown_until_date = next_trading_day(cooldown_until_date)
             cooldown_entries[symbol] = {
