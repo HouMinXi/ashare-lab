@@ -305,12 +305,15 @@ class TestDataStaleSkip:
             ),
         ):
             from ashare_lab.paper.pipeline import run_daily
-            rc = run_daily("2025-06-20")
+            # Use today so the date falls within the 10-day staleness
+            # window and daily_refresh is actually invoked.
+            today = dt.date.today().isoformat()
+            rc = run_daily(today)
         assert rc == 1
 
         conn = get_connection(db_path)
         row = conn.execute(
-            "SELECT status FROM runs WHERE trade_date='2025-06-20'"
+            "SELECT status FROM runs WHERE trade_date=?", (today,)
         ).fetchone()
         conn.close()
         assert row is not None

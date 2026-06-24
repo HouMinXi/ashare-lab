@@ -265,21 +265,27 @@ def run_daily(
             return 2
         force_reset_day(conn, trade_date)
 
-    # -- Step 3: data update (skip for signal-only) --
+    # -- Step 3: data update (skip for signal-only and historical dates) --
+    # daily_refresh checks TODAY's feed freshness; for historical backfill
+    # dates the data was collected long ago and staleness is irrelevant.
+    # Only check when trade_date is within ~10 calendar days of today.
     if steps != {"signal"}:
-        try:
-            from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
-            stale = daily_refresh()
-        except Exception:
-            logger.error("data refresh failed", exc_info=True)
-            record_run(conn, trade_date, "error")
-            conn.commit()
-            return 2
-        if stale == 1:
-            record_run(conn, trade_date, "skipped_stale")
-            conn.commit()
-            logger.warning("Data stale for %s, skipping", trade_date)
-            return 1
+        td = dt.date.fromisoformat(trade_date)
+        recent_cutoff = dt.date.today() - dt.timedelta(days=10)
+        if td >= recent_cutoff:
+            try:
+                from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
+                stale = daily_refresh()
+            except Exception:
+                logger.error("data refresh failed", exc_info=True)
+                record_run(conn, trade_date, "error")
+                conn.commit()
+                return 2
+            if stale == 1:
+                record_run(conn, trade_date, "skipped_stale")
+                conn.commit()
+                logger.warning("Data stale for %s, skipping", trade_date)
+                return 1
 
     # -- Step 4: load state --
     current_positions = get_latest_positions(conn)
