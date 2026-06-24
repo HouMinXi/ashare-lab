@@ -698,16 +698,30 @@ class TestIntegrationSmoke:
     pinned dates.  Predictions are synthetic (no model needed).
     """
 
+    _qlib_ready = False
+
+    @classmethod
+    def _ensure_qlib(cls) -> None:
+        """Initialize qlib once per test class; skip if unavailable."""
+        if cls._qlib_ready:
+            return
+        try:
+            import qlib  # noqa: PLC0415
+            from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+            from qlib.config import REG_CN  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("qlib not installed")
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
+        cls._qlib_ready = True
+
     def test_5_day_replay(
         self,
         tmp_path: Path,
         synthetic_prediction_files: Path,
     ) -> None:
         """Replay 5 consecutive trading days with real qlib prices."""
-        try:
-            from qlib.data import D  # noqa: PLC0415
-        except ImportError:
-            pytest.skip("qlib not installed")
+        self._ensure_qlib()
+        from qlib.data import D  # noqa: PLC0415
 
         # Verify qlib has price data for the pinned range
         dates = [
@@ -765,10 +779,8 @@ class TestIntegrationSmoke:
         synthetic_prediction_files: Path,
     ) -> None:
         """After 5-day replay, re-running each date returns 0 (skip)."""
-        try:
-            from qlib.data import D  # noqa: PLC0415
-        except ImportError:
-            pytest.skip("qlib not installed")
+        self._ensure_qlib()
+        from qlib.data import D  # noqa: PLC0415
 
         try:
             test_data = D.features(
