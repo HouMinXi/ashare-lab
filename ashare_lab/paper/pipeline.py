@@ -11,6 +11,7 @@ by research/predict.py (Option 3 decouple).
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import json
 import logging
@@ -71,6 +72,93 @@ from ashare_lab.paper.signal import (
 logger = logging.getLogger(__name__)
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_BS_CACHE_DIR = PROJECT_ROOT / "data" / "baostock_cache"
+
+
+# -- baostock CSV cache helpers (cache-first, live-API fallback) --
+
+def _bs_code_to_universe(bs_code: str, symbols: set[str]) -> str | None:
+    """Map baostock 'sh.600006' to a matching universe symbol."""
+    num = bs_code.split(".")[-1] if "." in bs_code else bs_code[-6:]
+    for sym in symbols:
+        if sym.endswith(num):
+            return sym
+    return None
+
+
+def _load_st_cache(
+    trade_date: str, symbols: set[str],
+) -> set[str] | None:
+    """Load ST names from cache CSV. Returns None on cache miss."""
+    path = _BS_CACHE_DIR / "st_status.csv"
+    if not path.exists():
+        return None
+    st: set[str] = set()
+    found_date = False
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["date"] != trade_date:
+                continue
+            found_date = True
+            if row["is_st"] == "1":
+                sym = _bs_code_to_universe(row["code"], symbols)
+                if sym:
+                    st.add(sym)
+    return st if found_date else None
+
+
+def _load_benchmark_cache(trade_date: str) -> dict[str, float] | None:
+    """Load benchmark closes from cache CSV. Returns None on miss."""
+    path = _BS_CACHE_DIR / "benchmark.csv"
+    if not path.exists():
+        return None
+    result: dict[str, float] = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["date"] == trade_date:
+                try:
+                    result[row["index"]] = float(row["close"])
+                except (ValueError, TypeError):
+                    pass
+    return result if result else None
+
+
+def _load_regime_cache(trade_date: str) -> list[float] | None:
+    """Load CSI1000 regime closes from cache CSV. Returns None on miss."""
+    path = _BS_CACHE_DIR / "csi1000_regime.csv"
+    if not path.exists():
+        return None
+    closes: list[float] = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["query_date"] == trade_date:
+                try:
+                    closes.append(float(row["close"]))
+                except (ValueError, TypeError):
+                    pass
+    if not closes:
+        return None
+    return closes[-11:] if len(closes) >= 11 else closes
+
+
+def _load_industry_cache(
+    trade_date: str, symbols: set[str],
+) -> dict[str, str] | None:
+    """Load industry map from cache CSV. Returns None on miss."""
+    path = _BS_CACHE_DIR / "industry.csv"
+    if not path.exists():
+        return None
+    result: dict[str, str] = {}
+    found_date = False
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["date"] != trade_date:
+                continue
+            found_date = True
+            sym = _bs_code_to_universe(row["code"], symbols)
+            if sym and row["industry"]:
+                result[sym] = row["industry"]
+    return result if found_date else None
 
 
 # ------------------------------------------------------------------
@@ -148,11 +236,17 @@ def _fetch_ipo_calendar(listing_date: str) -> list[dict]:
 
 
 def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
-    """Fetch benchmark closes from baostock for CSI300 and CSI1000.
+    """Fetch benchmark closes: cache first, baostock fallback.
 
     Returns {"csi300": float, "csi1000": float}.
     On failure returns zeros with warning log.
     """
+    cached = _load_benchmark_cache(trade_date)
+    if cached is not None:
+        logger.debug("benchmark from cache for %s", trade_date)
+        return {"csi300": cached.get("csi300", 0.0),
+                "csi1000": cached.get("csi1000", 0.0)}
+
     try:
         import baostock as bs  # noqa: PLC0415
     except ImportError:
@@ -360,29 +454,34 @@ def run_daily(
         | ipo_listing_syms
     )
 
-    # 5c. ST names + prices via baostock + qlib
-    st_names: set[str] = set()
-    try:
-        import baostock as bs  # noqa: PLC0415
+    # 5c. ST names + prices via cache / baostock + qlib
+    st_cached = _load_st_cache(trade_date, fetch_symbols)
+    if st_cached is not None:
+        st_names = st_cached
+        logger.debug("ST names from cache for %s", trade_date)
+    else:
+        st_names: set[str] = set()
+        try:
+            import baostock as bs  # noqa: PLC0415
 
-        login_r = bs.login()
-        if login_r.error_code == "0":
-            for sym in fetch_symbols:
-                code = sym.lower()
-                if len(code) == 6:
-                    prefix = "sh" if code.startswith("6") else "sz"
-                    code = f"{prefix}.{code}"
-                elif not code.startswith(("sh.", "sz.")):
-                    prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                    code = f"{prefix}.{sym[-6:]}"
-                rs = bs.query_stock_basic(code=code, code_name="")
-                while rs.error_code == "0" and rs.next():
-                    row_data = rs.get_row_data()
-                    if len(row_data) > 1 and "ST" in str(row_data[1]).upper():
-                        st_names.add(sym)
-            bs.logout()
-    except ImportError:
-        logger.warning("baostock not installed, ST detection unavailable")
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                for sym in fetch_symbols:
+                    code = sym.lower()
+                    if len(code) == 6:
+                        prefix = "sh" if code.startswith("6") else "sz"
+                        code = f"{prefix}.{code}"
+                    elif not code.startswith(("sh.", "sz.")):
+                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                        code = f"{prefix}.{sym[-6:]}"
+                    rs = bs.query_stock_basic(code=code, code_name="")
+                    while rs.error_code == "0" and rs.next():
+                        row_data = rs.get_row_data()
+                        if len(row_data) > 1 and "ST" in str(row_data[1]).upper():
+                            st_names.add(sym)
+                bs.logout()
+        except ImportError:
+            logger.warning("baostock not installed, ST detection unavailable")
 
     # Prices from qlib
     prices: dict[str, dict] = {}
@@ -414,58 +513,70 @@ def run_daily(
     # 5d. benchmark closes
     benchmarks = _fetch_benchmark_closes(trade_date)
 
-    # 5e. CSI1000 11-day closes for regime check
-    csi1000_closes_11d: list[float] = []
-    start_60d = (
-        dt.date.fromisoformat(trade_date) - dt.timedelta(days=60)
-    ).isoformat()
-    try:
-        import baostock as bs  # noqa: PLC0415
+    # 5e. CSI1000 11-day closes for regime check (cache / baostock)
+    regime_cached = _load_regime_cache(trade_date)
+    if regime_cached is not None:
+        csi1000_closes_11d = regime_cached
+        logger.debug("CSI1000 regime from cache for %s", trade_date)
+    else:
+        csi1000_closes_11d: list[float] = []
+        start_60d = (
+            dt.date.fromisoformat(trade_date) - dt.timedelta(days=60)
+        ).isoformat()
+        try:
+            import baostock as bs  # noqa: PLC0415
 
-        login_r = bs.login()
-        if login_r.error_code == "0":
-            rs = bs.query_history_k_data_plus(
-                "sh.000852",
-                "close",
-                start_date=start_60d,
-                end_date=trade_date,
-                frequency="d",
-            )
-            closes: list[float] = []
-            while rs.error_code == "0" and rs.next():
-                row_data = rs.get_row_data()
-                try:
-                    closes.append(float(row_data[0]))
-                except (IndexError, ValueError, TypeError):
-                    pass
-            csi1000_closes_11d = closes[-11:] if len(closes) >= 11 else closes
-            bs.logout()
-    except ImportError:
-        pass
-
-    # 5f. industry_map via baostock
-    industry_map: dict[str, str] = {}
-    try:
-        import baostock as bs  # noqa: PLC0415
-
-        login_r = bs.login()
-        if login_r.error_code == "0":
-            for sym in fetch_symbols:
-                code = sym.lower()
-                if len(code) == 6:
-                    prefix = "sh" if code.startswith("6") else "sz"
-                    code = f"{prefix}.{code}"
-                elif not code.startswith(("sh.", "sz.")):
-                    prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                    code = f"{prefix}.{sym[-6:]}"
-                rs = bs.query_stock_industry(code=code, date=trade_date)
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                rs = bs.query_history_k_data_plus(
+                    "sh.000852",
+                    "close",
+                    start_date=start_60d,
+                    end_date=trade_date,
+                    frequency="d",
+                )
+                closes: list[float] = []
                 while rs.error_code == "0" and rs.next():
                     row_data = rs.get_row_data()
-                    if len(row_data) > 3 and row_data[3]:
-                        industry_map[sym] = row_data[3]
-            bs.logout()
-    except ImportError:
-        pass
+                    try:
+                        closes.append(float(row_data[0]))
+                    except (IndexError, ValueError, TypeError):
+                        pass
+                csi1000_closes_11d = (
+                    closes[-11:] if len(closes) >= 11 else closes
+                )
+                bs.logout()
+        except ImportError:
+            pass
+
+    # 5f. industry_map via cache / baostock
+    ind_cached = _load_industry_cache(trade_date, fetch_symbols)
+    if ind_cached is not None:
+        industry_map = ind_cached
+        logger.debug("industry_map from cache for %s", trade_date)
+    else:
+        industry_map: dict[str, str] = {}
+        try:
+            import baostock as bs  # noqa: PLC0415
+
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                for sym in fetch_symbols:
+                    code = sym.lower()
+                    if len(code) == 6:
+                        prefix = "sh" if code.startswith("6") else "sz"
+                        code = f"{prefix}.{code}"
+                    elif not code.startswith(("sh.", "sz.")):
+                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                        code = f"{prefix}.{sym[-6:]}"
+                    rs = bs.query_stock_industry(code=code, date=trade_date)
+                    while rs.error_code == "0" and rs.next():
+                        row_data = rs.get_row_data()
+                        if len(row_data) > 3 and row_data[3]:
+                            industry_map[sym] = row_data[3]
+                bs.logout()
+        except ImportError:
+            pass
 
     # 5g. market_data for filter_candidates
     market_data: dict[str, dict] = {}
