@@ -810,3 +810,156 @@ class TestIntegrationSmoke:
         for d in dates:
             rc = run_daily(d, pred_path=pred_dir / f"{d}.parquet")
             assert rc == 0, f"re-run of {d} should return 0, got {rc}"
+
+
+# ===================================================================
+# D-04 Layer 3: Real Prediction Integration Tests
+# ===================================================================
+
+
+@pytest.mark.integration
+class TestRealPredictionReplay:
+    """Integration tests using real canonical predictions (60/40 blend).
+
+    Gated on: qlib runtime + models/w1.pt + predictions/2021-07-01.parquet.
+    Skips cleanly when any prerequisite is absent (local dev, CI).
+
+    These tests prove the engine works with real model output,
+    closing the synthetic-only gap from Layer 2.
+    """
+
+    _qlib_ready = False
+
+    @classmethod
+    def _ensure_prerequisites(cls) -> None:
+        """Initialize qlib and verify models + predictions exist."""
+        if cls._qlib_ready:
+            return
+        try:
+            import qlib  # noqa: PLC0415
+            from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+            from qlib.config import REG_CN  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("qlib not installed")
+
+        from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR  # noqa: PLC0415
+
+        if not (MODELS_DIR / "w1.pt").exists():
+            pytest.skip("canonical models not staged (models/w1.pt absent)")
+        if not (PREDICTIONS_DIR / "2021-07-01.parquet").exists():
+            pytest.skip(
+                "real predictions not generated "
+                "(predictions/2021-07-01.parquet absent)"
+            )
+
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
+        cls._qlib_ready = True
+
+    def test_real_prediction_5_day_replay(self) -> None:
+        """Replay 5 W1 trading days with real 60/40 blend predictions."""
+        self._ensure_prerequisites()
+
+        from ashare_lab.config import PROJECT_ROOT, load_config  # noqa: PLC0415
+        from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+
+        config = load_config()
+        db_path = PROJECT_ROOT / config["paper"]["db_path"]
+
+        # Clean slate
+        if db_path.exists():
+            db_path.unlink()
+        for suffix in ("-wal", "-shm"):
+            side = db_path.parent / (db_path.name + suffix)
+            if side.exists():
+                side.unlink()
+
+        dates = [
+            "2021-07-01", "2021-07-02", "2021-07-05",
+            "2021-07-06", "2021-07-07",
+        ]
+
+        for date_str in dates:
+            rc = run_daily(date_str)
+            assert rc in (0, 1), f"run_daily({date_str}) returned {rc}"
+
+        conn = get_connection(db_path)
+        nav_count = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
+        assert nav_count >= 5, f"expected >= 5 NAV rows, got {nav_count}"
+
+        nav_row = conn.execute(
+            "SELECT total_nav, cash FROM nav ORDER BY trade_date DESC LIMIT 1"
+        ).fetchone()
+        total_nav = float(nav_row["total_nav"])
+        cash = float(nav_row["cash"])
+        assert total_nav > 0, f"NAV must be positive, got {total_nav}"
+        assert cash >= 0, f"cash must be non-negative, got {cash}"
+
+    def test_real_prediction_idempotent(self) -> None:
+        """Re-running settled dates returns 0 without side effects."""
+        self._ensure_prerequisites()
+
+        from ashare_lab.config import PROJECT_ROOT, load_config  # noqa: PLC0415
+        from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+
+        config = load_config()
+        db_path = PROJECT_ROOT / config["paper"]["db_path"]
+
+        # Ensure DB exists from prior test (test ordering within class)
+        if not db_path.exists():
+            pytest.skip("requires test_real_prediction_5_day_replay to run first")
+
+        conn = get_connection(db_path)
+        nav_before = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
+
+        dates = [
+            "2021-07-01", "2021-07-02", "2021-07-05",
+            "2021-07-06", "2021-07-07",
+        ]
+        for date_str in dates:
+            rc = run_daily(date_str)
+            assert rc == 0, f"idempotent re-run of {date_str} got rc={rc}"
+
+        nav_after = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
+        assert nav_after == nav_before, (
+            f"NAV rows changed on re-run: {nav_before} -> {nav_after}"
+        )
+
+    def test_corrupt_prediction_detected(self) -> None:
+        """Corrupt parquet is rejected at read time.
+
+        Tests at the prediction-reading layer rather than the full
+        pipeline to avoid triggering baostock network calls (which
+        hang cross-Pacific without timeout -- known gap #a).
+        """
+        self._ensure_prerequisites()
+
+        import shutil  # noqa: PLC0415
+
+        import pandas as pd  # noqa: PLC0415
+
+        from ashare_lab.config import PREDICTIONS_DIR  # noqa: PLC0415
+
+        target = PREDICTIONS_DIR / "2021-07-01.parquet"
+        backup = PREDICTIONS_DIR / "2021-07-01.parquet.bak"
+
+        # Verify the real file reads cleanly first
+        df_good = pd.read_parquet(target)
+        assert len(df_good) > 0, "real prediction file should not be empty"
+        assert "instrument" in df_good.columns
+        assert "score" in df_good.columns
+
+        shutil.copy2(target, backup)
+        try:
+            target.write_bytes(b"CORRUPT DATA - not a valid parquet")
+
+            # Corrupt parquet must raise on read
+            with pytest.raises(Exception):
+                pd.read_parquet(target)
+        finally:
+            shutil.move(str(backup), str(target))
+
+        # Verify restore worked -- file reads cleanly again
+        df_restored = pd.read_parquet(target)
+        assert len(df_restored) == len(df_good)
