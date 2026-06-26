@@ -895,6 +895,29 @@ class TestRealPredictionReplay:
         assert total_nav > 0, f"NAV must be positive, got {total_nav}"
         assert cash >= 0, f"cash must be non-negative, got {cash}"
 
+        # Verify trading actually occurred (not just ingestion + no-crash).
+        order_count = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status='filled'"
+        ).fetchone()[0]
+        assert order_count > 0, (
+            "no filled orders -- engine ran but did not trade"
+        )
+
+        pos_count = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM positions"
+        ).fetchone()[0]
+        assert pos_count > 0, (
+            "no positions -- engine did not build a portfolio"
+        )
+
+        assert cash < 300_000, (
+            f"cash={cash} == initial capital -- no capital deployed"
+        )
+
+        assert total_nav != cash, (
+            f"total_nav==cash ({total_nav}) -- holdings value is zero"
+        )
+
     def test_real_prediction_idempotent(self) -> None:
         """Re-running settled dates returns 0 without side effects."""
         self._ensure_prerequisites()

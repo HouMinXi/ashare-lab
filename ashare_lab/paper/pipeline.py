@@ -89,26 +89,40 @@ def _bs_code_to_universe(bs_code: str, symbols: set[str]) -> str | None:
 def _load_st_cache(
     trade_date: str, symbols: set[str],
 ) -> set[str] | None:
-    """Load ST names from cache CSV. Returns None on cache miss."""
+    """Load ST names from cache CSV.
+
+    Tries exact date match first; falls back to the latest available
+    date (ST status is stable across dates, and an approximate answer
+    beats hanging on a cross-Pacific baostock query).
+    """
     path = _BS_CACHE_DIR / "st_status.csv"
     if not path.exists():
         return None
-    st: set[str] = set()
-    found_date = False
+    rows_by_date: dict[str, list] = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
-            if row["date"] != trade_date:
-                continue
-            found_date = True
-            if row["is_st"] == "1":
-                sym = _bs_code_to_universe(row["code"], symbols)
-                if sym:
-                    st.add(sym)
-    return st if found_date else None
+            rows_by_date.setdefault(row["date"], []).append(row)
+    use_date = trade_date if trade_date in rows_by_date else None
+    if use_date is None and rows_by_date:
+        use_date = max(rows_by_date.keys())
+    if use_date is None:
+        return None
+    st: set[str] = set()
+    for row in rows_by_date[use_date]:
+        if row["is_st"] == "1":
+            sym = _bs_code_to_universe(row["code"], symbols)
+            if sym:
+                st.add(sym)
+    return st
 
 
 def _load_benchmark_cache(trade_date: str) -> dict[str, float] | None:
-    """Load benchmark closes from cache CSV. Returns None on miss."""
+    """Load benchmark closes from cache CSV.
+
+    Benchmark prices are date-sensitive (absolute levels differ across
+    years), so only exact date match is valid.  Returns None on miss;
+    the pipeline gracefully handles missing benchmarks.
+    """
     path = _BS_CACHE_DIR / "benchmark.csv"
     if not path.exists():
         return None
@@ -124,7 +138,13 @@ def _load_benchmark_cache(trade_date: str) -> dict[str, float] | None:
 
 
 def _load_regime_cache(trade_date: str) -> list[float] | None:
-    """Load CSI1000 regime closes from cache CSV. Returns None on miss."""
+    """Load CSI1000 regime closes from cache CSV.
+
+    Regime data is date-sensitive (price levels differ across years),
+    so only exact date match is valid.  Returns None on miss, which
+    makes check_market_regime return False (insufficient data) rather
+    than halting buying on stale prices from a different year.
+    """
     path = _BS_CACHE_DIR / "csi1000_regime.csv"
     if not path.exists():
         return None
@@ -144,21 +164,29 @@ def _load_regime_cache(trade_date: str) -> list[float] | None:
 def _load_industry_cache(
     trade_date: str, symbols: set[str],
 ) -> dict[str, str] | None:
-    """Load industry map from cache CSV. Returns None on miss."""
+    """Load industry map from cache CSV.
+
+    Falls back to latest available date (industry classification is
+    stable across years).
+    """
     path = _BS_CACHE_DIR / "industry.csv"
     if not path.exists():
         return None
-    result: dict[str, str] = {}
-    found_date = False
+    rows_by_date: dict[str, list] = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
-            if row["date"] != trade_date:
-                continue
-            found_date = True
-            sym = _bs_code_to_universe(row["code"], symbols)
-            if sym and row["industry"]:
-                result[sym] = row["industry"]
-    return result if found_date else None
+            rows_by_date.setdefault(row["date"], []).append(row)
+    use_date = trade_date if trade_date in rows_by_date else None
+    if use_date is None and rows_by_date:
+        use_date = max(rows_by_date.keys())
+    if use_date is None:
+        return None
+    result: dict[str, str] = {}
+    for row in rows_by_date[use_date]:
+        sym = _bs_code_to_universe(row["code"], symbols)
+        if sym and row["industry"]:
+            result[sym] = row["industry"]
+    return result
 
 
 # ------------------------------------------------------------------
@@ -494,8 +522,8 @@ def run_daily(
         )
         if raw is not None and not raw.empty:
             for idx, row_s in raw.iterrows():
-                # idx is (datetime, instrument)
-                inst = idx[1] if isinstance(idx, tuple) else str(idx)
+                # idx is (instrument, datetime) in qlib MultiIndex
+                inst = idx[0] if isinstance(idx, tuple) else str(idx)
                 sym = str(inst)[-6:] if len(str(inst)) > 6 else str(inst)
                 # Normalize to match universe symbol format
                 for fs in fetch_symbols:
@@ -612,15 +640,19 @@ def run_daily(
         try:
             turnover_df = D.features(
                 instruments=[sym],
-                fields=["$volume", "$close"],
+                fields=["$volume", "$close", "$factor"],
                 start_time=(
                     dt.date.fromisoformat(trade_date) - dt.timedelta(days=40)
                 ).isoformat(),
                 end_time=trade_date,
             )
             if turnover_df is not None and not turnover_df.empty:
+                # qlib $close is forward-adjusted; divide by $factor
+                # to recover actual CNY price for turnover calculation.
+                factor = turnover_df["$factor"].replace(0, 1)
+                unadj_close = turnover_df["$close"] / factor
                 turnover_vals = (
-                    turnover_df["$volume"] * turnover_df["$close"]
+                    turnover_df["$volume"] * unadj_close
                 ).tail(20)
                 if len(turnover_vals) > 0:
                     avg_turnover_20d = float(turnover_vals.mean())
