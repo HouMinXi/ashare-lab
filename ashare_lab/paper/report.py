@@ -478,7 +478,7 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
         if resp.status != 200:
             resp_body = await resp.text()
             raise RuntimeError(f"iLink error {resp.status}: {resp_body[:200]}")
-        return await resp.json()
+        return await resp.json(content_type=None)
 
 
 def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bool:
