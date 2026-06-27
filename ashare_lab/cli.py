@@ -128,6 +128,37 @@ def cmd_paper_status(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_paper_report(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.report import generate_and_send_report  # noqa: PLC0415
+        from ashare_lab.paper.ledger import get_connection
+        from ashare_lab.config import load_config, PROJECT_ROOT
+        config = load_config()
+        db_path = PROJECT_ROOT / config["paper"]["db_path"]
+        conn = get_connection(db_path)
+        
+        trade_date = getattr(args, "date", None)
+        if trade_date is None:
+            latest_settled = conn.execute(
+                "SELECT MAX(trade_date) FROM runs WHERE status='settled'"
+            ).fetchone()[0]
+            if not latest_settled:
+                print("No settled runs found")
+                return 1
+            trade_date = latest_settled
+
+        rc = generate_and_send_report(
+            trade_date, conn, config,
+            dry_run=getattr(args, "dry_run", False),
+            force_detailed=getattr(args, "detailed", False)
+        )
+        conn.commit()
+        return rc
+    except Exception as exc:
+        log.error("paper report failed: %s", exc)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ashare-lab", description="A-share data pipeline")
     sub = parser.add_subparsers(dest="command")
@@ -162,6 +193,11 @@ def main() -> int:
 
     paper_sub.add_parser("status", help="show current ledger state")
 
+    p_report = paper_sub.add_parser("report", help="generate and send daily report")
+    p_report.add_argument("--date", help="trade date YYYY-MM-DD (default: latest settled)")
+    p_report.add_argument("--detailed", action="store_true", help="force detailed mode")
+    p_report.add_argument("--dry-run", action="store_true", help="generate only, skip delivery")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -178,6 +214,7 @@ def main() -> int:
             "run-all": cmd_paper_run_all,
             "backfill": cmd_paper_backfill,
             "status": cmd_paper_status,
+            "report": cmd_paper_report,
         }
         return paper_commands[pc](args)
 

@@ -1,4 +1,4 @@
-"""SQLite 9-table ledger for the paper trading engine.
+"""SQLite 10-table ledger for the paper trading engine.
 
 Schema: runs, orders, trades, positions, nav, signals,
 cooldowns, paper_state, order_settle_log.
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Schema DDL -- 9 tables
+# Schema DDL -- 10 tables
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """\
@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS order_settle_log (
     prev_price      REAL,
     PRIMARY KEY (run_date, order_id)
 );
+
+CREATE TABLE IF NOT EXISTS reports (
+    trade_date      TEXT PRIMARY KEY,
+    mode            TEXT NOT NULL,
+    report_text     TEXT NOT NULL,
+    delivered_via   TEXT,
+    delivery_status TEXT,
+    created_at      TEXT NOT NULL
+);
 """
 
 _INITIAL_STATE_SQL = """\
@@ -134,13 +143,45 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create all 9 tables (idempotent) and seed initial state."""
+    """Create all 10 tables (idempotent) and seed initial state."""
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
         "INSERT OR IGNORE INTO paper_state (key, value) "
         "VALUES ('is_soft_reduced', 'false')"
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Report helpers
+# ---------------------------------------------------------------------------
+
+def insert_report(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    mode: str,
+    report_text: str,
+    delivered_via: str | None,
+    delivery_status: str,
+) -> None:
+    """Insert or replace a report row.
+    
+    *created_at* is computed internally (UTC ISO-8601).
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO reports "
+        "(trade_date, mode, report_text, delivered_via, delivery_status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (trade_date, mode, report_text, delivered_via, delivery_status, created_at),
+    )
+
+
+def get_report(conn: sqlite3.Connection, trade_date: str) -> sqlite3.Row | None:
+    """Return the report row for *trade_date*."""
+    return conn.execute(
+        "SELECT * FROM reports WHERE trade_date = ?", (trade_date,)
+    ).fetchone()
 
 
 # ---------------------------------------------------------------------------

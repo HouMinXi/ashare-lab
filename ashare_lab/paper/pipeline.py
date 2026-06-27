@@ -116,6 +116,20 @@ def _load_st_cache(
     return st
 
 
+def _load_stock_names_cache(symbols: set[str]) -> dict[str, str] | None:
+    """Load stock names from cache CSV."""
+    path = _BS_CACHE_DIR / "stock_names.csv"
+    if not path.exists():
+        return None
+    result: dict[str, str] = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            sym = _bs_code_to_universe(row["code"], symbols)
+            if sym:
+                result[sym] = row["code_name"]
+    return result
+
+
 def _load_benchmark_cache(trade_date: str) -> dict[str, float] | None:
     """Load benchmark closes from cache CSV.
 
@@ -1106,6 +1120,19 @@ def run_daily(
     )
     record_run(conn, trade_date, "settled")
     conn.commit()
+
+    # -- Step 13: WeChat report delivery (non-blocking) --
+    if steps is None or "report" in (steps or set()):
+        try:
+            from ashare_lab.paper.report import generate_and_send_report
+            # generate_and_send_report opens a transaction, handles its own commits
+            report_rc = generate_and_send_report(trade_date, conn, config)
+            if report_rc != 0:
+                logger.warning("Report delivery failed for %s (rc=%d)", trade_date, report_rc)
+        except Exception as exc:
+            logger.warning("Report step failed for %s: %s", trade_date, exc)
+        finally:
+            conn.commit()  # safety commit for report status persistence
 
     logger.info("Pipeline completed for %s", trade_date)
     return 0
