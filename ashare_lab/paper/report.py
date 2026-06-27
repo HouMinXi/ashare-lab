@@ -11,7 +11,6 @@ import struct
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import sqlite3
 
 from ashare_lab.paper.ledger import insert_report
@@ -166,8 +165,8 @@ def gather_report_data(
             "qty": int(r["target_qty"]),
         })
         
-    # Forced sell count
-    forced_sells = conn.execute(
+    # Sell order count (all sells, not just forced)
+    sell_order_count = conn.execute(
         "SELECT COUNT(*) FROM orders WHERE created_run_date = ? AND side = 'sell'",
         (trade_date,)
     ).fetchone()[0]
@@ -221,7 +220,7 @@ def gather_report_data(
         risk_status={
             "buying_halted": buying_halted,
             "is_soft_reduced": is_soft_reduced,
-            "forced_sell_count": forced_sells,
+            "sell_order_count": sell_order_count,
             "cooldown_count": cooldown_count,
             "drawdown_halted": drawdown_halted,
             "regime_halted": regime_halted,
@@ -236,7 +235,7 @@ def determine_report_mode(report_data: ReportData, triggers_config: dict) -> str
     if report_data.trade_count >= triggers_config["min_trade_count"]:
         return "detailed"
     rs = report_data.risk_status
-    if rs["buying_halted"] or rs["is_soft_reduced"] or rs["forced_sell_count"] > 0:
+    if rs["buying_halted"] or rs["is_soft_reduced"] or rs["sell_order_count"] > 0:
         return "detailed"
     return "simple"
 
@@ -393,20 +392,23 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
     paras = text.split("\n\n")
     current = []
     curr_len = 0
+    buf_sep = "\n\n"
     
     for p in paras:
         plen = len(p)
         if curr_len + plen + 2 > max_length and current:
-            chunks.append("\n\n".join(current))
+            chunks.append(buf_sep.join(current))
             current = []
             curr_len = 0
+            buf_sep = "\n\n"
             
         if plen > max_length:
+            buf_sep = "\n"
             lines = p.split("\n")
             for line in lines:
                 llen = len(line)
                 if curr_len + llen + 1 > max_length and current:
-                    chunks.append("\n\n".join(current) if '\n\n' in "\n\n".join(current) else "\n".join(current))
+                    chunks.append(buf_sep.join(current))
                     current = []
                     curr_len = 0
                 if llen > max_length:
@@ -416,12 +418,17 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
                 else:
                     current.append(line)
                     curr_len += llen + 1
+            if current:
+                chunks.append(buf_sep.join(current))
+                current = []
+                curr_len = 0
+            buf_sep = "\n\n"
         else:
             current.append(p)
             curr_len += plen + 2
             
     if current:
-        chunks.append("\n\n".join(current))
+        chunks.append(buf_sep.join(current))
         
     return chunks
 
@@ -540,28 +547,28 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     ilink_timeout = rcfg.get("ilink_timeout", 15)
     
     chunks = split_report_text(report_text, max_len)
+    sent_upto = 0
 
-    async def _send_chunks(start_idx: int = 0) -> int:
+    async def _send_chunks() -> None:
+        nonlocal sent_upto
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            for i in range(start_idx, len(chunks)):
+            for i in range(sent_upto, len(chunks)):
                 await send_text_ilink(session, wx_token, wx_chat_id, chunks[i], ilink_timeout)
+                sent_upto = i + 1
                 if i < len(chunks) - 1:
                     await asyncio.sleep(delay)
-                start_idx = i + 1
-        return start_idx
 
     try:
-        asyncio.run(_send_chunks(0))
+        asyncio.run(_send_chunks())
         insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
         conn.commit()
         return "sent"
     except Exception as e:
-        logger.warning("iLink first attempt failed: %s", e)
+        logger.warning("iLink first attempt failed (sent %d/%d): %s", sent_upto, len(chunks), e)
         time.sleep(5)
         try:
-            # We don't track partial success reliably here for retry, just retry full
-            asyncio.run(_send_chunks(0))
+            asyncio.run(_send_chunks())
             insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
             conn.commit()
             return "sent"
@@ -581,6 +588,8 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
                 return "sent"
         except Exception as e:
             logger.warning("%s fallback failed: %s", fb_name, e)
+    else:
+        logger.warning("unknown fallback_service '%s', skipping fallback", fb_name)
 
     insert_report(conn, trade_date, mode, report_text, None, "failed")
     conn.commit()
@@ -590,7 +599,7 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
 def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False, force_detailed: bool = False) -> int:
     nav_check = conn.execute("SELECT 1 FROM nav WHERE trade_date=?", (trade_date,)).fetchone()
     if not nav_check:
-        print(f"No data for {trade_date}")
+        logger.warning("No data for %s", trade_date)
         return 1
 
     syms_rows = conn.execute(

@@ -12,7 +12,7 @@ from ashare_lab.paper.report import (
 )
 
 # -------------------------------------------------------------------
-# Plan 01: Data aggregation and mode determination
+# Data aggregation and mode determination
 # -------------------------------------------------------------------
 
 def test_gather_report_data_nav_fields(populated_db, paper_config):
@@ -62,7 +62,7 @@ def test_gather_report_data_risk_status(populated_db, paper_config):
     # Regime is halted because we inserted declining closes.
     assert rs["regime_halted"] is True
     assert rs["is_soft_reduced"] is False
-    assert rs["forced_sell_count"] == 1
+    assert rs["sell_order_count"] == 1
     assert rs["cooldown_count"] == 1
 
 def test_gather_report_data_no_trade_day(db_conn, paper_config):
@@ -96,7 +96,7 @@ def test_stock_names_resolve_cache(populated_db, paper_config):
 
 
 # -------------------------------------------------------------------
-# Plan 02: Templates and LLM
+# Templates and LLM
 # -------------------------------------------------------------------
 
 @pytest.fixture
@@ -140,7 +140,7 @@ def dummy_report_data():
         risk_status={
             "buying_halted": False,
             "is_soft_reduced": False,
-            "forced_sell_count": 0,
+            "sell_order_count": 0,
             "cooldown_count": 0,
             "drawdown_halted": False,
             "regime_halted": False,
@@ -256,7 +256,7 @@ def test_get_secret(mock_run):
 
 
 # -------------------------------------------------------------------
-# Plan 03: Delivery
+# Delivery
 # -------------------------------------------------------------------
 
 def test_split_report_text_short():
@@ -275,6 +275,14 @@ def test_split_report_text_never_exceeds():
     text = "x" * 5000
     res = split_report_text(text, 4000)
     assert all(len(c) <= 4000 for c in res)
+
+def test_split_oversized_paragraph_preserves_next_paragraph_boundary():
+    text = "AA" + "\n\n" + "aaaa\nbbbb\ncccc\ndddd\neeee" + "\n\n" + "ffff"
+    chunks = split_report_text(text, 20)
+    assert all(len(c) <= 20 for c in chunks)
+    # paragraph "ffff" must not be glued to the oversized para tail by "\n"
+    assert not any("eeee\nffff" in c for c in chunks), \
+        f"paragraph boundary collapsed: {chunks!r}"
 
 @pytest.mark.asyncio
 @patch("aiohttp.ClientSession.post")
@@ -374,6 +382,35 @@ def test_deliver_report_splits(mock_sleep, mock_ilink, mock_sec, db_conn):
     deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, {"paper":{"report":{"ilink_max_message_length":4000}}})
     assert mock_ilink.call_count == 2
     mock_sleep.assert_called()
+
+@patch("ashare_lab.paper.report._get_secret")
+@patch("ashare_lab.paper.report.send_text_ilink")
+@patch("asyncio.sleep")
+@patch("time.sleep")
+def test_deliver_report_retry_resumes_from_sent(mock_tsleep, mock_asleep, mock_ilink, mock_sec, db_conn):
+    """F2: retry must resume from last successfully sent chunk, not re-send from 0."""
+    mock_sec.return_value = "token"
+    call_count = [0]
+    sent_chunk_indices = []
+
+    async def ilink_side_effect(session, token, chat_id, text, timeout=15):
+        call_count[0] += 1
+        # Fail on the 3rd call (chunk 2 of first attempt)
+        if call_count[0] == 3:
+            raise Exception("transient network error")
+        sent_chunk_indices.append(text)
+
+    mock_ilink.side_effect = ilink_side_effect
+
+    # 3 chunks: force small max_length so "x"*5000 splits into 3
+    cfg = {"paper": {"report": {"ilink_max_message_length": 2000}}}
+    result = deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, cfg)
+    assert result == "sent"
+    # Total calls: 2 (first attempt chunks 0,1) + 1 fail (chunk 2) + 1 retry (chunk 2 only) = 4
+    assert mock_ilink.call_count == 4, f"expected 4 calls (2 ok + 1 fail + 1 retry), got {mock_ilink.call_count}"
+    # Verify no duplicate: each chunk text should appear exactly once in sent_chunk_indices
+    # Chunks 0 and 1 were sent once in first attempt, chunk 2 failed then succeeded on retry
+    assert len(sent_chunk_indices) == 3, f"expected 3 successful sends, got {len(sent_chunk_indices)}"
 
 
 # Integration
