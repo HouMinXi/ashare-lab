@@ -495,6 +495,29 @@ def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bo
         return False
 
 
+def send_serverchan(key: str, title: str, content: str, timeout: int = 15) -> bool:
+    try:
+        import requests
+        resp = requests.post(
+            f"https://sctapi.ftqq.com/{key}.send",
+            data={"text": title, "desp": content},
+            timeout=timeout
+        )
+        return resp.json().get("code") == 0
+    except Exception as e:
+        logger.warning("serverchan send failed: %s", e)
+        return False
+
+
+# Registry of fallback push services. Each entry: (pass_key, func_name).
+# deliver_report resolves func_name via globals() at call time so that
+# unittest.mock.patch on the module-level name takes effect.
+_FALLBACK_PUSH = {
+    "pushplus": ("ashare/pushplus-token", "send_pushplus"),
+    "serverchan": ("ashare/serverchan-key", "send_serverchan"),
+}
+
+
 def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict) -> str:
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
@@ -545,14 +568,19 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
         except Exception as e2:
             logger.warning("iLink second attempt failed: %s", e2)
 
-    try:
-        pp_token = _get_secret("ashare/pushplus-token")
-        if send_pushplus(pp_token, f"A股日报 {trade_date}", report_text, rcfg.get("pushplus_timeout", 15)):
-            insert_report(conn, trade_date, mode, report_text, "pushplus", "sent")
-            conn.commit()
-            return "sent"
-    except Exception as e:
-        logger.warning("pushplus fallback failed: %s", e)
+    fb_name = rcfg.get("fallback_service", "serverchan")
+    fb_entry = _FALLBACK_PUSH.get(fb_name)
+    if fb_entry:
+        pass_key, fn_name = fb_entry
+        send_fn = globals()[fn_name]
+        try:
+            fb_token = _get_secret(pass_key)
+            if send_fn(fb_token, f"A股日报 {trade_date}", report_text, rcfg.get("fallback_timeout", 15)):
+                insert_report(conn, trade_date, mode, report_text, fb_name, "sent")
+                conn.commit()
+                return "sent"
+        except Exception as e:
+            logger.warning("%s fallback failed: %s", fb_name, e)
 
     insert_report(conn, trade_date, mode, report_text, None, "failed")
     conn.commit()

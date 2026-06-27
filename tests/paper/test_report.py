@@ -6,7 +6,8 @@ import pytest
 from ashare_lab.paper.report import (
     ReportData, gather_report_data, determine_report_mode,
     format_simple_report, format_detailed_report, call_deepseek_summary,
-    split_report_text, send_text_ilink, send_pushplus, deliver_report,
+    split_report_text, send_text_ilink, send_pushplus, send_serverchan,
+    deliver_report,
     generate_and_send_report, _get_secret
 )
 
@@ -280,7 +281,7 @@ def test_split_report_text_never_exceeds():
 async def test_send_text_ilink_headers_payload(mock_post):
     class MockResp:
         status = 200
-        async def json(self): return {}
+        async def json(self, **kwargs): return {}
         async def __aenter__(self): return self
         async def __aexit__(self, exc_type, exc, tb): pass
     mock_post.return_value = MockResp()
@@ -324,27 +325,37 @@ def test_deliver_report_ilink_retry(mock_sleep, mock_ilink, mock_sec, db_conn):
     r = db_conn.execute("SELECT * FROM reports").fetchone()
     assert r["delivered_via"] == "ilink"
 
-@patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_text_ilink")
-@patch("ashare_lab.paper.report.send_pushplus")
-@patch("time.sleep")
-def test_deliver_report_fallback(mock_sleep, mock_pp, mock_ilink, mock_sec, db_conn):
-    mock_sec.return_value = "token"
-    mock_ilink.side_effect = Exception("err")
-    mock_pp.return_value = True
-    assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
-    assert r["delivered_via"] == "pushplus"
+@patch("requests.post")
+def test_send_serverchan(mock_post):
+    mock_post.return_value.json.return_value = {"code": 0}
+    assert send_serverchan("SCTxxx", "title", "content") is True
+    args = mock_post.call_args
+    assert "sctapi.ftqq.com/SCTxxx.send" in args[0][0]
+    assert args[1]["data"]["text"] == "title"
 
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_text_ilink")
-@patch("ashare_lab.paper.report.send_pushplus")
+@patch("ashare_lab.paper.report.send_serverchan")
 @patch("time.sleep")
-def test_deliver_report_all_fail(mock_sleep, mock_pp, mock_ilink, mock_sec, db_conn):
+def test_deliver_report_fallback(mock_sleep, mock_sc, mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
     mock_ilink.side_effect = Exception("err")
-    mock_pp.return_value = False
-    assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "failed"
+    mock_sc.return_value = True
+    cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    assert r["delivered_via"] == "serverchan"
+
+@patch("ashare_lab.paper.report._get_secret")
+@patch("ashare_lab.paper.report.send_text_ilink")
+@patch("ashare_lab.paper.report.send_serverchan")
+@patch("time.sleep")
+def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_ilink, mock_sec, db_conn):
+    mock_sec.return_value = "token"
+    mock_ilink.side_effect = Exception("err")
+    mock_sc.return_value = False
+    cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "failed"
     r = db_conn.execute("SELECT * FROM reports").fetchone()
     assert r["delivery_status"] == "failed"
 
