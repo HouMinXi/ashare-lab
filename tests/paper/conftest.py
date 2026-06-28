@@ -196,3 +196,31 @@ def populated_db(db_conn: sqlite3.Connection, paper_config: dict) -> sqlite3.Con
 
     db_conn.commit()
     return db_conn
+
+
+# -- Sentiment fixtures ----------------------------------------------------
+
+@pytest.fixture()
+def sentiment_config() -> dict:
+    """Flat sentiment sub-config matching baseline.yaml paper.sentiment."""
+    return {
+        "enabled": True,
+        "stock_threshold": -2,
+        "industry_threshold": -2,
+        "global_threshold": -3,
+        "news_count": 10,
+        "rate_limit_base": 0.0,
+        "rate_limit_jitter": 0.0,
+        "deepseek_model": "deepseek-v4-flash",
+        "deepseek_timeout": 5,
+    }
+
+
+@pytest.fixture()
+def sentiment_db() -> sqlite3.Connection:
+    """In-memory SQLite with ledger schema for sentiment cache tests."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    yield conn
+    conn.close()
