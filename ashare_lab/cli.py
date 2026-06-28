@@ -196,13 +196,12 @@ def cmd_paper_sentiment(args: argparse.Namespace) -> int:
         all_syms = set(buy_syms)
         industry_map = _load_industry_cache(trade_date, all_syms) or {}
 
-        if getattr(args, "dry_run", False):
-            conn.execute("BEGIN")
-
         result = run_sentiment_veto(
             buy_syms, trade_date, industry_map, conn, config,
         )
 
+        # dry-run: rollback cache writes and event logs;
+        # normal: commit so writes persist
         if getattr(args, "dry_run", False):
             conn.rollback()
         else:

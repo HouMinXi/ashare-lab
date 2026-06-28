@@ -445,6 +445,8 @@ def score_news(
     industry_scores: dict[str, float] = {}
 
     # -- per-stock layer --
+    # cache key uses sym as-is (with SZ/SH prefix from pipeline);
+    # fetch_stock_news normalizes to 6-digit code for the API call
     for sym in buy_syms:
         cached = _check_cache(conn, trade_date, "stock", sym)
         if cached is not None:
@@ -587,7 +589,7 @@ def run_sentiment_veto(
     """
     try:
         stock_names = stock_names or {}
-        sent_cfg = config["paper"]["sentiment"]
+        sent_cfg = config.get("paper", {}).get("sentiment", {})
 
         if not sent_cfg.get("enabled", False):
             return _EMPTY_RESULT
