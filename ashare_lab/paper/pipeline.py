@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT, load_config
@@ -905,6 +906,31 @@ def run_daily(
             if industry_map.get(s) not in risk_result.blocked_industries
             and s not in risk_result.blocked_rebuys
         ]
+
+        # 10e3. sentiment veto (fail-open: errors skip veto, not block buys)
+        if config.get("paper", {}).get("sentiment", {}).get("enabled", False):
+            try:
+                from ashare_lab.paper.sentiment import run_sentiment_veto
+                veto_result = run_sentiment_veto(
+                    buy_syms, trade_date, industry_map, conn, config,
+                )
+                buy_syms = [
+                    s for s in buy_syms
+                    if s not in veto_result.vetoed_stocks
+                ]
+                if veto_result.global_halted:
+                    risk_result = replace(risk_result, buying_halted=True)
+                logger.info(
+                    "sentiment veto: %d stocks vetoed, %d industries, global=%s",
+                    len(veto_result.vetoed_stocks),
+                    len(veto_result.vetoed_industries),
+                    "halted" if veto_result.global_halted else "ok",
+                )
+            except Exception:
+                logger.warning(
+                    "Sentiment veto failed, continuing without veto",
+                    exc_info=True,
+                )
 
         # 10f. T+1 sell guard
         sell_syms = [
