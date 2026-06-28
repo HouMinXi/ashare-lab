@@ -229,7 +229,9 @@ def gather_report_data(
     )
 
 
-def determine_report_mode(report_data: ReportData, triggers_config: dict) -> str:
+def determine_report_mode(report_data: ReportData, triggers_config: dict, sentiment_veto_hit: bool = False) -> str:
+    if sentiment_veto_hit:
+        return "detailed"
     if report_data.daily_return_pct <= -triggers_config["daily_loss_pct"] * 100.0:
         return "detailed"
     if report_data.trade_count >= triggers_config["min_trade_count"]:
@@ -277,7 +279,7 @@ def format_simple_report(report_data: ReportData) -> str:
     return "\n\n".join(sections)
 
 
-def format_detailed_report(report_data: ReportData, llm_summary: str | None) -> str:
+def format_detailed_report(report_data: ReportData, llm_summary: str | None, sentiment_section: str | None = None) -> str:
     sections = []
     
     if llm_summary is not None:
@@ -323,8 +325,31 @@ def format_detailed_report(report_data: ReportData, llm_summary: str | None) -> 
         f"soft reduction: {'yes' if rs['is_soft_reduced'] else 'no'} | cooldowns: {rs['cooldown_count']}"
     )
     sections.append(s6)
-    
+
+    if sentiment_section is not None:
+        sections.append(sentiment_section)
+
     return "\n\n".join(sections)
+
+
+def _format_sentiment_section(conn: sqlite3.Connection, trade_date: str, config: dict) -> str | None:
+    """Build D7 sentiment section from veto events logged during pipeline run."""
+    try:
+        rows = conn.execute(
+            "SELECT layer, target, score, detail FROM sentiment_events "
+            "WHERE event_type='veto' AND trade_date=? ORDER BY layer, target",
+            (trade_date,),
+        ).fetchall()
+    except Exception:
+        return None
+
+    if not rows:
+        return "sentiment: all clear"
+
+    lines = ["sentiment vetoes:"]
+    for r in rows:
+        lines.append(f"  {r[1]} | {r[0]} | score {r[2]}")
+    return "\n".join(lines)
 
 
 def _get_secret(key: str) -> str:
@@ -616,7 +641,24 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
 
     report_data = gather_report_data(conn, trade_date, stock_names, industry_map, config)
 
-    mode = "detailed" if force_detailed else determine_report_mode(report_data, config["paper"]["report"]["detailed_triggers"])
+    # sentiment section for D7 (fail-open: old DBs may lack sentiment tables)
+    sentiment_veto_hit = False
+    sentiment_text = None
+    try:
+        veto_count = conn.execute(
+            "SELECT COUNT(*) FROM sentiment_events "
+            "WHERE event_type='veto' AND trade_date=?",
+            (trade_date,),
+        ).fetchone()[0]
+        sentiment_veto_hit = veto_count > 0
+        sentiment_text = _format_sentiment_section(conn, trade_date, config)
+    except Exception:
+        pass
+
+    mode = "detailed" if force_detailed else determine_report_mode(
+        report_data, config["paper"]["report"]["detailed_triggers"],
+        sentiment_veto_hit=sentiment_veto_hit,
+    )
 
     if mode == "simple":
         report_text = format_simple_report(report_data)
@@ -624,7 +666,7 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
         llm_summary = call_deepseek_summary(report_data, config)
         if llm_summary is None:
             logger.warning("deepseek summary unavailable for %s, detailed report will omit D1 section", trade_date)
-        report_text = format_detailed_report(report_data, llm_summary)
+        report_text = format_detailed_report(report_data, llm_summary, sentiment_section=sentiment_text)
 
     if dry_run:
         insert_report(conn, trade_date, mode, report_text, None, "dry_run")

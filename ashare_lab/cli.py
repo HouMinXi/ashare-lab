@@ -159,6 +159,68 @@ def cmd_paper_report(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_paper_sentiment(args: argparse.Namespace) -> int:
+    try:
+        from ashare_lab.paper.sentiment import run_sentiment_veto  # noqa: PLC0415
+        from ashare_lab.paper.ledger import get_connection, init_schema
+        from ashare_lab.paper.pipeline import _load_industry_cache
+        from ashare_lab.config import load_config, PROJECT_ROOT
+
+        config = load_config()
+        db_path = PROJECT_ROOT / config["paper"]["db_path"]
+        conn = get_connection(db_path)
+        init_schema(conn)
+
+        trade_date = getattr(args, "date", None)
+        if trade_date is None:
+            latest_settled = conn.execute(
+                "SELECT MAX(trade_date) FROM runs WHERE status='settled'"
+            ).fetchone()[0]
+            if not latest_settled:
+                print("No settled runs found")
+                return 1
+            trade_date = latest_settled
+
+        symbols = getattr(args, "symbol", None)
+        if symbols:
+            buy_syms = list(symbols)
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM orders "
+                "WHERE side='buy' AND status IN ('pending','carry') "
+                "AND created_run_date=?",
+                (trade_date,),
+            ).fetchall()
+            buy_syms = [r[0] for r in rows]
+
+        all_syms = set(buy_syms)
+        industry_map = _load_industry_cache(trade_date, all_syms) or {}
+
+        if getattr(args, "dry_run", False):
+            conn.execute("BEGIN")
+
+        result = run_sentiment_veto(
+            buy_syms, trade_date, industry_map, conn, config,
+        )
+
+        if getattr(args, "dry_run", False):
+            conn.rollback()
+        else:
+            conn.commit()
+
+        print(f"trade_date: {trade_date}")
+        print(f"buy_syms checked: {len(buy_syms)}")
+        print(f"vetoed stocks: {result.vetoed_stocks}")
+        print(f"vetoed industries: {result.vetoed_industries}")
+        print(f"global halted: {result.global_halted}")
+        if result.global_score is not None:
+            print(f"global score: {result.global_score}")
+        return 0
+    except Exception as exc:
+        log.error("paper sentiment failed: %s", exc)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="ashare-lab", description="A-share data pipeline")
     sub = parser.add_subparsers(dest="command")
@@ -198,6 +260,11 @@ def main() -> int:
     p_report.add_argument("--detailed", action="store_true", help="force detailed mode")
     p_report.add_argument("--dry-run", action="store_true", help="generate only, skip delivery")
 
+    p_sentiment = paper_sub.add_parser("sentiment", help="run sentiment veto check")
+    p_sentiment.add_argument("--date", help="trade date YYYY-MM-DD (default: latest settled)")
+    p_sentiment.add_argument("--symbol", action="append", help="stock code to check (repeatable)")
+    p_sentiment.add_argument("--dry-run", action="store_true", help="score only, rollback DB writes")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -215,6 +282,7 @@ def main() -> int:
             "backfill": cmd_paper_backfill,
             "status": cmd_paper_status,
             "report": cmd_paper_report,
+            "sentiment": cmd_paper_sentiment,
         }
         return paper_commands[pc](args)
 
