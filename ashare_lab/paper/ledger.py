@@ -1,7 +1,8 @@
-"""SQLite 10-table ledger for the paper trading engine.
+"""SQLite 12-table ledger for the paper trading engine.
 
 Schema: runs, orders, trades, positions, nav, signals,
-cooldowns, paper_state, order_settle_log.
+cooldowns, paper_state, order_settle_log, reports,
+sentiment_scores, sentiment_events.
 
 All queries use parameterised placeholders (?).  WAL mode and
 foreign keys are enabled on every connection.
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Schema DDL -- 10 tables
+# Schema DDL -- 12 tables
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """\
@@ -117,6 +118,27 @@ CREATE TABLE IF NOT EXISTS reports (
     delivery_status TEXT,
     created_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sentiment_scores (
+    trade_date TEXT    NOT NULL,
+    layer      TEXT    NOT NULL,
+    target     TEXT    NOT NULL,
+    score      REAL    NOT NULL,
+    news_count INTEGER NOT NULL DEFAULT 0,
+    scored_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trade_date, layer, target)
+);
+
+CREATE TABLE IF NOT EXISTS sentiment_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date  TEXT    NOT NULL,
+    event_type  TEXT    NOT NULL,
+    layer       TEXT    NOT NULL,
+    target      TEXT    NOT NULL,
+    score       REAL,
+    detail      TEXT,
+    created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 _INITIAL_STATE_SQL = """\
@@ -143,7 +165,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create all 10 tables (idempotent) and seed initial state."""
+    """Create all 12 tables (idempotent) and seed initial state."""
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
         "INSERT OR IGNORE INTO paper_state (key, value) "
@@ -255,6 +277,16 @@ def force_reset_day(conn: sqlite3.Connection, trade_date: str) -> None:
             conn.execute(
                 f"DELETE FROM {tbl} WHERE trade_date = ?", (trade_date,)
             )
+
+        # 6 -- delete sentiment data (avoids duplicate veto events on re-run)
+        conn.execute(
+            "DELETE FROM sentiment_scores WHERE trade_date = ?",
+            (trade_date,),
+        )
+        conn.execute(
+            "DELETE FROM sentiment_events WHERE trade_date = ?",
+            (trade_date,),
+        )
 
 
 # ---------------------------------------------------------------------------

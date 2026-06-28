@@ -109,6 +109,16 @@ paper:
     soft_drawdown_recovery: 0.95
     default_topk: 15
     reduced_topk: 7
+  sentiment:
+    enabled: true
+    stock_threshold: -2
+    industry_threshold: -2
+    global_threshold: -3
+    news_count: 10
+    rate_limit_base: 1.0
+    rate_limit_jitter: 0.5
+    deepseek_model: "deepseek-v4-flash"
+    deepseek_timeout: 30
   report:
     deepseek_model: "deepseek-v4-flash"
     deepseek_timeout: 30
