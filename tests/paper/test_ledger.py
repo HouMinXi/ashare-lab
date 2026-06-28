@@ -54,13 +54,13 @@ def conn(db_path: Path) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 class TestSchema:
-    def test_nine_tables_created(self, conn: sqlite3.Connection) -> None:
+    def test_all_tables_created(self, conn: sqlite3.Connection) -> None:
         # Exclude sqlite_sequence (auto-created for AUTOINCREMENT)
         row = conn.execute(
             "SELECT count(*) AS cnt FROM sqlite_master "
             "WHERE type='table' AND name != 'sqlite_sequence'"
         ).fetchone()
-        assert row["cnt"] == 9
+        assert row["cnt"] == 12
 
     def test_idempotent_schema(self, conn: sqlite3.Connection) -> None:
         # calling init_schema a second time must not raise
@@ -69,7 +69,7 @@ class TestSchema:
             "SELECT count(*) AS cnt FROM sqlite_master "
             "WHERE type='table' AND name != 'sqlite_sequence'"
         ).fetchone()
-        assert row["cnt"] == 9
+        assert row["cnt"] == 12
 
     def test_wal_mode(self, conn: sqlite3.Connection) -> None:
         row = conn.execute("PRAGMA journal_mode").fetchone()
