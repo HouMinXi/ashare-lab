@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at      TEXT NOT NULL
 );
 
+-- scored_at/created_at use SQLite CURRENT_TIMESTAMP (YYYY-MM-DD HH:MM:SS UTC);
+-- these columns are for cache expiry and debugging, not cross-table joins
 CREATE TABLE IF NOT EXISTS sentiment_scores (
     trade_date TEXT    NOT NULL,
     layer      TEXT    NOT NULL,
