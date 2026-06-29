@@ -554,6 +554,48 @@ class TestCooldownGuard:
         assert len(buy_calls) == 0
 
 
+class TestPipelineRunRecorded:
+    """Step 14: run_daily records a row in pipeline_runs."""
+
+    def test_success_run_recorded(
+        self, db_path: Path, base_config: dict
+    ) -> None:
+        with _pipeline_patches(db_path, base_config):
+            from ashare_lab.paper.pipeline import run_daily
+            rc = run_daily("2025-06-20")
+        assert rc == 0
+
+        conn = get_connection(db_path)
+        row = conn.execute(
+            "SELECT status, duration_s, predictions_date "
+            "FROM pipeline_runs WHERE trade_date = ?",
+            ("2025-06-20",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["status"] == "success"
+        assert row["duration_s"] > 0
+        assert row["predictions_date"] is not None
+
+    def test_stale_env_records_stale(
+        self, db_path: Path, base_config: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ASHARE_USE_STALE", "1")
+        with _pipeline_patches(db_path, base_config):
+            from ashare_lab.paper.pipeline import run_daily
+            rc = run_daily("2025-06-20")
+        assert rc == 0
+
+        conn = get_connection(db_path)
+        row = conn.execute(
+            "SELECT status FROM pipeline_runs WHERE trade_date = ?",
+            ("2025-06-20",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["status"] == "stale"
+
+
 class TestResolvePredictionFile:
     """_resolve_prediction_file returns Path or None."""
 
