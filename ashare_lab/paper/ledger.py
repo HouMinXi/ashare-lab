@@ -1,8 +1,9 @@
-"""SQLite 12-table ledger for the paper trading engine.
+"""SQLite 14-table ledger for the paper trading engine.
 
 Schema: runs, orders, trades, positions, nav, signals,
 cooldowns, paper_state, order_settle_log, reports,
-sentiment_scores, sentiment_events.
+sentiment_scores, sentiment_events, pipeline_runs,
+graduation_status.
 
 All queries use parameterised placeholders (?).  WAL mode and
 foreign keys are enabled on every connection.
@@ -16,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Schema DDL -- 12 tables
+# Schema DDL -- 14 tables
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """\
@@ -141,6 +142,22 @@ CREATE TABLE IF NOT EXISTS sentiment_events (
     detail      TEXT,
     created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    trade_date       TEXT PRIMARY KEY,
+    status           TEXT NOT NULL
+                     CHECK(status IN ('success','error','stale')),
+    duration_s       REAL NOT NULL,
+    error_msg        TEXT,
+    predictions_date TEXT,
+    created_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graduation_status (
+    id            INTEGER PRIMARY KEY CHECK(id = 1),
+    graduated_at  TEXT,
+    notified_at   TEXT
+);
 """
 
 _INITIAL_STATE_SQL = """\
@@ -167,7 +184,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create all 12 tables (idempotent) and seed initial state."""
+    """Create all 14 tables (idempotent) and seed initial state."""
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
         "INSERT OR IGNORE INTO paper_state (key, value) "
@@ -198,6 +215,27 @@ def insert_report(
         "(trade_date, mode, report_text, delivered_via, delivery_status, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (trade_date, mode, report_text, delivered_via, delivery_status, created_at),
+    )
+
+
+def insert_pipeline_run(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    status: str,
+    duration_s: float,
+    error_msg: str | None,
+    predictions_date: str | None,
+) -> None:
+    """Insert or replace a pipeline run record.
+
+    *created_at* is computed internally (UTC ISO-8601).
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO pipeline_runs "
+        "(trade_date, status, duration_s, error_msg, predictions_date, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (trade_date, status, duration_s, error_msg, predictions_date, created_at),
     )
 
 
