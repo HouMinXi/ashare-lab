@@ -10,7 +10,7 @@ STDERR_LOG="/tmp/ashare-data-update-stderr.log"
 SECONDS_START=$SECONDS
 
 mkdir -p "$HOME/.cache"
-cd "$REPO"
+cd "$REPO" || exit 1
 rm -f "$STAMP"
 
 rc=1

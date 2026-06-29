@@ -23,13 +23,19 @@ TRADE_DATE=$(python3 -c "
 from ashare_lab.data.calendar import latest_trading_day
 import datetime as dt
 print(latest_trading_day(dt.date.today()))
-")
+") || { echo "ERROR: failed to resolve trade date"; exit 1; }
 
 IS_TRADING=$(python3 -c "
 from ashare_lab.data.calendar import is_trading_day
 import datetime as dt
 print(is_trading_day(dt.date.today()))
-")
+") || { echo "ERROR: failed to check trading day"; exit 1; }
+
+# Validate TRADE_DATE format (guard against Python stderr leaking into var)
+if ! [[ "$TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "ERROR: invalid TRADE_DATE '$TRADE_DATE'"
+    exit 1
+fi
 
 if [ "$IS_TRADING" != "True" ]; then
     echo "Not a trading day, skipping"
@@ -57,7 +63,7 @@ try_gpu_inference() {
 
     # Ping poll: 5s interval, 40 attempts = 200s max
     local ping_ok=0
-    for i in $(seq 1 40); do
+    for _i in $(seq 1 40); do
         if ping -c1 -W1 "$GPU_HOST" >/dev/null 2>&1; then
             ping_ok=1
             break

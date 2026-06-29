@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -62,7 +61,6 @@ from ashare_lab.paper.ledger import (
     update_order,
 )
 from ashare_lab.paper.risk import (
-    RiskCheckResult,
     manage_trailing_cooldown,
     run_all_risk_checks,
 )
@@ -378,6 +376,7 @@ def run_daily(
         return 2
 
     start_time = time.monotonic()
+    predictions_date_str = trade_date  # early default; overwritten when pred_path resolves
 
     # -- Step 1: init --
     config = load_config()
@@ -844,9 +843,6 @@ def run_daily(
     # 9f. persist new cooldown entries
     for symbol, entry in risk_result.cooldown_entries.items():
         set_cooldown(conn, symbol, entry["cooldown_until"], entry["holding_high"])
-
-    # Track which prediction file was used (for pipeline_runs recording)
-    predictions_date_str = trade_date  # fallback; overwritten when pred_path resolves
 
     # -- Step 10: signal generation (skip for settle-only) --
     if steps != {"settle"}:
