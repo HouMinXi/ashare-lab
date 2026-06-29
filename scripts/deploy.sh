@@ -29,7 +29,7 @@ fi
 # ---- Section 4: Data update (D-D04: forced every run) ----
 
 echo "==> Updating market data"
-python3 -m ashare_lab.cli update
+python3 -m ashare_lab.cli update || echo "WARNING: data update failed (non-fatal, timer handles daily updates)"
 
 # ---- Section 5: Verify prerequisites ----
 
