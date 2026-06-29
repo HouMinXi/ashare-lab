@@ -224,3 +224,16 @@ def predict_for_date(
     )
 
     return out
+
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    parser = argparse.ArgumentParser(description="Run TRA inference")
+    parser.add_argument("--date", required=True, help="trade date YYYY-MM-DD")
+    args = parser.parse_args()
+    predict_for_date(args.date)

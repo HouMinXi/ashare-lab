@@ -94,10 +94,13 @@ def cmd_paper_signal(args: argparse.Namespace) -> int:
 
 def cmd_paper_run_all(args: argparse.Namespace) -> int:
     try:
+        from pathlib import Path  # noqa: PLC0415
         from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        pred = getattr(args, "pred_path", None)
         return run_daily(
             trade_date=getattr(args, "date", None),
             force=getattr(args, "force", False),
+            pred_path=Path(pred) if pred else None,
         )
     except Exception as exc:
         log.error("paper run-all failed: %s", exc)
@@ -246,6 +249,7 @@ def main() -> int:
     p_run_all = paper_sub.add_parser("run-all", help="full daily pipeline")
     p_run_all.add_argument("--date", help="trade date YYYY-MM-DD")
     p_run_all.add_argument("--force", action="store_true", help="force re-run")
+    p_run_all.add_argument("--pred-path", type=str, help="path to prediction parquet (stale fallback)")
 
     p_pbackfill = paper_sub.add_parser("backfill", help="replay missed days")
     p_pbackfill.add_argument("from_date", help="start date YYYY-MM-DD")
