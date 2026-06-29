@@ -15,8 +15,10 @@ import csv
 import datetime as dt
 import json
 import logging
+import os
 import re
 import sqlite3
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -375,6 +377,8 @@ def run_daily(
         logger.error("Invalid date format: %s", trade_date)
         return 2
 
+    start_time = time.monotonic()
+
     # -- Step 1: init --
     config = load_config()
     paper_cfg = config["paper"]
@@ -413,9 +417,16 @@ def run_daily(
             try:
                 from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
                 stale = daily_refresh()
-            except Exception:
+            except Exception as exc:
                 logger.error("data refresh failed", exc_info=True)
                 record_run(conn, trade_date, "error")
+                try:
+                    from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+                    insert_pipeline_run(conn, trade_date, "error",
+                                       time.monotonic() - start_time,
+                                       str(exc), predictions_date_str)
+                except Exception:
+                    logger.warning("Failed to record pipeline_run", exc_info=True)
                 conn.commit()
                 return 2
             if stale == 1:
@@ -453,9 +464,16 @@ def run_daily(
     # -- Step 5: fetch prices and universe (deferred imports) --
     try:
         from qlib.data import D  # noqa: PLC0415
-    except ImportError:
+    except ImportError as exc:
         logger.error("qlib not available, cannot run pipeline")
         record_run(conn, trade_date, "error")
+        try:
+            from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+            insert_pipeline_run(conn, trade_date, "error",
+                               time.monotonic() - start_time,
+                               str(exc), predictions_date_str)
+        except Exception:
+            logger.warning("Failed to record pipeline_run", exc_info=True)
         conn.commit()
         return 2
 
@@ -827,6 +845,9 @@ def run_daily(
     for symbol, entry in risk_result.cooldown_entries.items():
         set_cooldown(conn, symbol, entry["cooldown_until"], entry["holding_high"])
 
+    # Track which prediction file was used (for pipeline_runs recording)
+    predictions_date_str = trade_date  # fallback; overwritten when pred_path resolves
+
     # -- Step 10: signal generation (skip for settle-only) --
     if steps != {"settle"}:
         # 10a. resolve prediction file
@@ -839,8 +860,21 @@ def run_daily(
                     pred_path,
                 )
                 record_run(conn, trade_date, "error")
+                try:
+                    from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+                    insert_pipeline_run(conn, trade_date, "error",
+                                       time.monotonic() - start_time,
+                                       "prediction file not found",
+                                       predictions_date_str)
+                except Exception:
+                    logger.warning("Failed to record pipeline_run", exc_info=True)
                 conn.commit()
                 return 2
+
+        # Extract predictions_date from filename (e.g. "2026-01-15.parquet")
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", pred_path.name)
+        if m:
+            predictions_date_str = m.group(1)
 
         try:
             signals_raw = generate_signals(
@@ -852,6 +886,13 @@ def run_daily(
                 "Signal generation failed for %s: %s", trade_date, e
             )
             record_run(conn, trade_date, "error")
+            try:
+                from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+                insert_pipeline_run(conn, trade_date, "error",
+                                   time.monotonic() - start_time,
+                                   str(e), predictions_date_str)
+            except Exception:
+                logger.warning("Failed to record pipeline_run", exc_info=True)
             conn.commit()
             return 2
 
@@ -1159,6 +1200,36 @@ def run_daily(
             logger.warning("Report step failed for %s: %s", trade_date, exc)
         finally:
             conn.commit()  # safety commit for report status persistence
+
+    # -- Step 14: Record pipeline run (non-blocking) --
+    use_stale = os.environ.get("ASHARE_USE_STALE") == "1"
+    try:
+        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+        duration_s = time.monotonic() - start_time
+        status = "stale" if use_stale else "success"
+        insert_pipeline_run(conn, trade_date, status, duration_s,
+                            None, predictions_date_str)
+    except Exception:
+        logger.warning("Failed to record pipeline_run", exc_info=True)
+    finally:
+        conn.commit()
+
+    # -- Step 15: Graduation check (non-blocking, skip when stale) --
+    if not use_stale:
+        try:
+            from ashare_lab.paper.graduation import (  # noqa: PLC0415
+                check_graduation,
+                notify_graduation,
+            )
+            passed, stats = check_graduation(conn)
+            logger.info(
+                "Graduation gate: passed=%s rate=%.1f%% days_remaining=%d",
+                passed, stats["rate"] * 100, stats["days_remaining"],
+            )
+            if passed and stats.get("should_notify"):
+                notify_graduation(conn, stats)
+        except Exception:
+            logger.warning("Graduation check failed", exc_info=True)
 
     logger.info("Pipeline completed for %s", trade_date)
     return 0
