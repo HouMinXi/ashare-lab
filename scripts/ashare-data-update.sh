@@ -15,7 +15,7 @@ rm -f "$STAMP"
 
 rc=1
 for attempt in 1 2; do
-    python3 -m ashare_lab.cli data update 2>"$STDERR_LOG"
+    python3 -m ashare_lab.cli update 2>"$STDERR_LOG"
     rc=$?
     if [ $rc -eq 0 ]; then
         date -Iseconds > "${STAMP}.tmp"
