@@ -473,6 +473,68 @@ class TestNonFiniteDrop:
             predict_for_date(trade_date)
 
 
+class TestProviderUri:
+    """provider_uri parameter threading to qlib.init."""
+
+    def test_default_provider_uri_used_when_none(
+        self, monkeypatch, tmp_path
+    ):
+        """When provider_uri is None, qlib.init gets DEFAULT_PROVIDER_URI."""
+        trade_date = "2021-12-01"
+        pred_df = _make_pred_df(trade_date)
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        # Force qlib.init to fire.
+        sys.modules["qlib.config"].C.registered = False
+
+        from ashare_lab.research.predict import predict_for_date
+
+        predict_for_date(trade_date)
+
+        qlib_init = sys.modules["qlib"].init
+        qlib_init.assert_called_once()
+        call_uri = qlib_init.call_args[1]["provider_uri"]
+        assert call_uri == str(tmp_path / "qlib_data")
+
+    def test_custom_provider_uri_passed_to_qlib_init(
+        self, monkeypatch, tmp_path
+    ):
+        """Explicit provider_uri is forwarded to qlib.init."""
+        trade_date = "2021-12-01"
+        pred_df = _make_pred_df(trade_date)
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        sys.modules["qlib.config"].C.registered = False
+
+        from ashare_lab.research.predict import predict_for_date
+
+        predict_for_date(
+            trade_date, provider_uri="H:/.qlib/qlib_data/cn_data"
+        )
+
+        qlib_init = sys.modules["qlib"].init
+        qlib_init.assert_called_once()
+        call_uri = qlib_init.call_args[1]["provider_uri"]
+        assert call_uri == "H:/.qlib/qlib_data/cn_data"
+
+    def test_provider_uri_skipped_when_already_registered(
+        self, monkeypatch, tmp_path
+    ):
+        """When qlib is already registered, qlib.init is not called."""
+        trade_date = "2021-12-01"
+        pred_df = _make_pred_df(trade_date)
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        # C.registered defaults to True in _install_fake_modules.
+        from ashare_lab.research.predict import predict_for_date
+
+        predict_for_date(
+            trade_date, provider_uri="H:/.qlib/qlib_data/cn_data"
+        )
+
+        sys.modules["qlib"].init.assert_not_called()
+
+
 class TestBlendExceptionPropagates:
     """Blend failure must propagate -- no raw-fallback file written."""
 
