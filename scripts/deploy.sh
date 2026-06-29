@@ -100,7 +100,7 @@ touch "$STAGING/ashare_lab/__init__.py"
 touch "$STAGING/ashare_lab/research/__init__.py"
 cp configs/baseline.yaml "$STAGING/configs/"
 
-scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"'C:/Users/admin/ashare-lab/'" \
+scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"'H:/ashare-lab/'" \
     || echo "  GPU SCP failed (non-fatal -- may be powered off)"
 rm -rf "$STAGING"
 

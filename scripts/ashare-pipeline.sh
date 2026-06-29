@@ -86,14 +86,14 @@ try_gpu_inference() {
 
     # Run predict.py on GPU
     if ! timeout $GPU_PREDICT_TIMEOUT ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
-        "cd C:/Users/admin/ashare-lab && python -m ashare_lab.research.predict --date $TRADE_DATE"; then
+        "cd H:/ashare-lab && python -m ashare_lab.research.predict --date $TRADE_DATE"; then
         echo "ERROR: GPU predict.py failed or timed out"
         return 1
     fi
 
     # SCP predictions back
     mkdir -p "$PREDICTIONS_DIR"
-    if ! scp "${GPU_USER}@${GPU_HOST}":"'C:/Users/admin/ashare-lab/predictions/${TRADE_DATE}.parquet'" "$PREDICTIONS_DIR/"; then
+    if ! scp "${GPU_USER}@${GPU_HOST}":"'H:/ashare-lab/predictions/${TRADE_DATE}.parquet'" "$PREDICTIONS_DIR/"; then
         echo "ERROR: SCP predictions failed"
         return 1
     fi
