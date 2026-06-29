@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 def predict_for_date(
     trade_date: str,
     model_path: Path | None = None,
+    provider_uri: str | None = None,
 ) -> Path:
     """Run TRA inference for one trade_date, blend, write prediction file.
 
@@ -39,6 +40,10 @@ def predict_for_date(
             case), the walk-forward window selects the correct model
             automatically; passing an explicit path defeats look-ahead
             protection on a backfill.
+        provider_uri: qlib data directory. When None, falls back to
+            DEFAULT_PROVIDER_URI (~/.qlib/qlib_data/cn_data). Pass
+            the GPU path (H:/.qlib/qlib_data/cn_data) when running
+            on the Windows training host.
 
     Returns:
         Path to the written parquet file.
@@ -106,8 +111,9 @@ def predict_for_date(
     )
 
     # -- 2. Init qlib (idempotent) ----------------------------------------
+    uri = provider_uri or str(DEFAULT_PROVIDER_URI)
     if not getattr(_QlibC, "registered", False):
-        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
+        qlib.init(provider_uri=uri, region=REG_CN)
 
     cfg = load_config()
     universe: str = cfg["universe"]["primary"]
@@ -235,5 +241,10 @@ if __name__ == "__main__":
     )
     parser = argparse.ArgumentParser(description="Run TRA inference")
     parser.add_argument("--date", required=True, help="trade date YYYY-MM-DD")
+    parser.add_argument(
+        "--provider-uri",
+        default=None,
+        help="qlib data directory (default: ~/.qlib/qlib_data/cn_data)",
+    )
     args = parser.parse_args()
-    predict_for_date(args.date)
+    predict_for_date(args.date, provider_uri=args.provider_uri)
