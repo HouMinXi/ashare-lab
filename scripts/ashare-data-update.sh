@@ -8,6 +8,29 @@ REPO="$HOME/code/ashare-lab"
 STAMP="$HOME/.cache/ashare-data-update.stamp"
 STDERR_LOG="/tmp/ashare-data-update-stderr.log"
 SECONDS_START=$SECONDS
+GPU_HOST="192.168.100.11"
+GPU_USER="admin"
+QLIB_DIR="$HOME/.qlib/qlib_data"
+
+sync_gpu_data() {
+    local tarball="/tmp/cn_data_sync.tar.gz"
+    trap 'rm -f "$tarball"' RETURN
+
+    if ! tar czf "$tarball" -C "$QLIB_DIR" cn_data; then
+        echo "sync_gpu_data: tar failed"
+        return 1
+    fi
+    if ! scp "$tarball" "${GPU_USER}@${GPU_HOST}:H:/.qlib/qlib_data/"; then
+        echo "sync_gpu_data: scp failed"
+        return 1
+    fi
+    if ! ssh "${GPU_USER}@${GPU_HOST}" "cd /d H:/.qlib/qlib_data && tar xzf cn_data_sync.tar.gz && del cn_data_sync.tar.gz"; then
+        echo "sync_gpu_data: ssh extract failed"
+        return 1
+    fi
+}
+
+if [ "${ASHARE_DATA_UPDATE_TESTING:-}" != "1" ]; then
 
 mkdir -p "$HOME/.cache"
 cd "$REPO" || exit 1
@@ -28,8 +51,14 @@ for attempt in 1 2; do
     fi
 done
 
+if [ $rc -eq 0 ]; then
+    sync_gpu_data || echo "WARNING: GPU data sync failed, GPU keeps stale data"
+fi
+
 if [ $rc -ne 0 ]; then
     python3 "$REPO/scripts/alert.py" "$rc" "data_update" "$((SECONDS - SECONDS_START))" "$STDERR_LOG" || true
 fi
 
 exit $rc
+
+fi
