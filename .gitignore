@@ -27,6 +27,8 @@ models/*.pt
 experiments/
 predictions/
 CLAUDE.md
+# Claude Code local state (worktrees, settings)
+.claude/
 # Planning files (local-only, never push)
 .planning/
 # Ad-hoc run scripts and result artifacts
