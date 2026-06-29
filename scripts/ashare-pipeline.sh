@@ -86,7 +86,7 @@ try_gpu_inference() {
 
     # Run predict.py on GPU
     if ! timeout $GPU_PREDICT_TIMEOUT ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
-        "cd C:/Users/admin/ashare-lab && .venv/Scripts/python.exe -m ashare_lab.research.predict --date $TRADE_DATE"; then
+        "cd C:/Users/admin/ashare-lab && python -m ashare_lab.research.predict --date $TRADE_DATE"; then
         echo "ERROR: GPU predict.py failed or timed out"
         return 1
     fi
