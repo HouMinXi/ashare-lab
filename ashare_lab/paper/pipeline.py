@@ -357,8 +357,771 @@ def _resolve_prediction_file(date_str: str) -> Path | None:
 
 
 # ------------------------------------------------------------------
-# Main pipeline
+# Main pipeline -- context object + step helpers
 # ------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+import sqlite3 as _sqlite3
+
+
+@dataclass
+class DailyRunContext:
+    """Mutable state threaded through run_daily step helpers.
+
+    Each field is set by the step that produces it and consumed by later
+    steps.  Using a single context object avoids a long argument list
+    while keeping all state explicit and traceable.
+    """
+    # Inputs resolved in step 0/1
+    trade_date: str
+    force: bool
+    steps: set[str] | None
+    pred_path: "Path | None"
+    start_time: float
+    predictions_date_str: str
+
+    # Step 1 outputs
+    config: dict = field(default_factory=dict)
+    paper_cfg: dict = field(default_factory=dict)
+    risk_cfg: dict = field(default_factory=dict)
+    db_path: "Path | None" = None
+    conn: "object | None" = None
+
+    # Step 4 outputs
+    current_positions: dict = field(default_factory=dict)
+    cash: float = 0.0
+    cooldown_state: dict = field(default_factory=dict)
+    is_soft_reduced: bool = False
+
+    # Step 5 outputs
+    universe_symbols: list = field(default_factory=list)
+    ipo_won: list = field(default_factory=list)
+    ipo_listing_syms: set = field(default_factory=set)
+    fetch_symbols: set = field(default_factory=set)
+    st_names: set = field(default_factory=set)
+    prices: dict = field(default_factory=dict)
+    benchmarks: dict = field(default_factory=dict)
+    csi1000_closes_11d: list = field(default_factory=list)
+    industry_map: dict = field(default_factory=dict)
+    market_data: dict = field(default_factory=dict)
+
+    # Step 8 output
+    settle_result: "object | None" = None
+
+    # Step 9 outputs
+    total_nav: float = 0.0
+    risk_result: "object | None" = None
+
+    # Step 10 output
+    signals_raw: dict = field(default_factory=dict)
+
+    # Step 11 output
+    ipo_cash_changed: bool = False
+
+
+def _step1_init(ctx: DailyRunContext) -> None:
+    """Load config and open DB connection."""
+    ctx.config = load_config()
+    ctx.paper_cfg = ctx.config["paper"]
+    ctx.risk_cfg = ctx.paper_cfg["risk"]
+    ctx.db_path = PROJECT_ROOT / ctx.paper_cfg["db_path"]
+    ctx.conn = get_connection(ctx.db_path)
+    init_schema(ctx.conn)
+
+
+def _step2_idempotency(ctx: DailyRunContext) -> int:
+    """Return 0 to continue, 0 to skip (already settled), 2 on force conflict."""
+    if not ctx.force and is_day_settled(ctx.conn, ctx.trade_date):
+        logger.info("Already settled: %s", ctx.trade_date)
+        return 0  # sentinel: caller returns 0
+    if ctx.force:
+        latest_settled = ctx.conn.execute(
+            "SELECT MAX(trade_date) FROM runs WHERE status='settled'"
+        ).fetchone()[0]
+        if latest_settled is not None and ctx.trade_date < latest_settled:
+            logger.error(
+                "force-reset of %s leaves settled days > it stale; "
+                "run `paper backfill %s %s --force` to replay the "
+                "coupled range",
+                ctx.trade_date, ctx.trade_date, latest_settled,
+            )
+            return 2
+        force_reset_day(ctx.conn, ctx.trade_date)
+    return -1  # sentinel: continue
+
+
+def _step3_data_update(ctx: DailyRunContext) -> int:
+    """Refresh qlib data feed; return 1 if stale, 2 on error, -1 to continue."""
+    if ctx.steps == {"signal"}:
+        return -1
+    td = dt.date.fromisoformat(ctx.trade_date)
+    recent_cutoff = dt.date.today() - dt.timedelta(days=10)
+    if td < recent_cutoff:
+        return -1
+    try:
+        from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
+        stale = daily_refresh()
+    except Exception as exc:
+        logger.error("data refresh failed", exc_info=True)
+        record_run(ctx.conn, ctx.trade_date, "error")
+        _try_record_pipeline_run(ctx, "error", str(exc))
+        ctx.conn.commit()
+        return 2
+    if stale == 1:
+        record_run(ctx.conn, ctx.trade_date, "skipped_stale")
+        ctx.conn.commit()
+        logger.warning("Data stale for %s, skipping", ctx.trade_date)
+        return 1
+    return -1
+
+
+def _step4_load_state(ctx: DailyRunContext) -> None:
+    """Load positions, cash, cooldowns, soft-reduce flag from DB."""
+    ctx.current_positions = get_latest_positions(ctx.conn)
+    ctx.cash = get_latest_cash(ctx.conn, ctx.paper_cfg["initial_cash"])
+    ctx.cooldown_state = get_cooldowns(ctx.conn)
+    ctx.cooldown_state = manage_trailing_cooldown(ctx.cooldown_state, ctx.trade_date)
+    delete_expired_cooldowns(ctx.conn, ctx.trade_date)
+    ctx.cooldown_state = {
+        s: cd for s, cd in ctx.cooldown_state.items()
+        if cd["cooldown_until"] >= ctx.trade_date
+    }
+    row = ctx.conn.execute(
+        "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
+    ).fetchone()
+    if row is not None:
+        ctx.is_soft_reduced = row["value"] == "true"
+    else:
+        ctx.is_soft_reduced = False
+        ctx.conn.execute(
+            "INSERT INTO paper_state (key, value) VALUES ('is_soft_reduced', 'false')"
+        )
+        ctx.conn.commit()
+
+
+def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
+    """Fetch universe, prices, benchmarks, industry map.  Return 2 on qlib import failure."""
+    try:
+        from qlib.data import D  # noqa: PLC0415
+    except ImportError as exc:
+        logger.error("qlib not available, cannot run pipeline")
+        record_run(ctx.conn, ctx.trade_date, "error")
+        _try_record_pipeline_run(ctx, "error", str(exc))
+        ctx.conn.commit()
+        return 2
+
+    # 5a. universe
+    ctx.universe_symbols = D.list_instruments(
+        D.instruments("csi1000"),
+        start_time=ctx.trade_date,
+        end_time=ctx.trade_date,
+        as_list=True,
+    )
+
+    # 5b. IPO calendar
+    next_td = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+    ipo_calendar = _fetch_ipo_calendar(next_td)
+    ctx.ipo_won = [
+        row for row in ipo_calendar
+        if check_ipo_subscription(row["ceiling_lots"], row["win_rate"])[0]
+    ]
+    ctx.ipo_listing_syms = {
+        row["symbol"] for row in ctx.ipo_won
+        if row["listing_date"] == ctx.trade_date
+    }
+
+    order_syms = {
+        r[0] for r in ctx.conn.execute(
+            "SELECT DISTINCT symbol FROM orders WHERE status IN ('pending','carry')"
+        )
+    }
+    ctx.fetch_symbols = (
+        set(ctx.universe_symbols)
+        | set(ctx.current_positions.keys())
+        | order_syms
+        | ctx.ipo_listing_syms
+    )
+
+    # 5c. ST names
+    st_cached = _load_st_cache(ctx.trade_date, ctx.fetch_symbols)
+    if st_cached is not None:
+        ctx.st_names = st_cached
+        logger.debug("ST names from cache for %s", ctx.trade_date)
+    else:
+        ctx.st_names = set()
+        try:
+            import baostock as bs  # noqa: PLC0415
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                for sym in ctx.fetch_symbols:
+                    code = sym.lower()
+                    if len(code) == 6:
+                        prefix = "sh" if code.startswith("6") else "sz"
+                        code = f"{prefix}.{code}"
+                    elif not code.startswith(("sh.", "sz.")):
+                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                        code = f"{prefix}.{sym[-6:]}"
+                    rs = bs.query_stock_basic(code=code, code_name="")
+                    while rs.error_code == "0" and rs.next():
+                        row_data = rs.get_row_data()
+                        if len(row_data) > 1 and "ST" in str(row_data[1]).upper():
+                            ctx.st_names.add(sym)
+                bs.logout()
+        except ImportError:
+            logger.warning("baostock not installed, ST detection unavailable")
+
+    # Prices from qlib
+    ctx.prices = {}
+    if ctx.fetch_symbols:
+        raw = D.features(
+            instruments=list(ctx.fetch_symbols),
+            fields=["$close", "$change", "$volume", "$factor"],
+            start_time=ctx.trade_date,
+            end_time=ctx.trade_date,
+        )
+        if raw is not None and not raw.empty:
+            for idx, row_s in raw.iterrows():
+                inst = idx[0] if isinstance(idx, tuple) else str(idx)
+                sym = str(inst)[-6:] if len(str(inst)) > 6 else str(inst)
+                for fs in ctx.fetch_symbols:
+                    if fs.endswith(sym):
+                        sym = fs
+                        break
+                ctx.prices[sym] = {
+                    "close": float(row_s.get("$close", 0)),
+                    "change": float(row_s.get("$change", 0)),
+                    "volume": float(row_s.get("$volume", 0)),
+                    "factor": float(row_s.get("$factor", 1.0)),
+                    "threshold": get_limit_threshold(sym, ctx.st_names),
+                }
+
+    # 5d. benchmarks
+    ctx.benchmarks = _fetch_benchmark_closes(ctx.trade_date)
+
+    # 5e. CSI1000 11-day closes for regime check
+    regime_cached = _load_regime_cache(ctx.trade_date)
+    if regime_cached is not None:
+        ctx.csi1000_closes_11d = regime_cached
+        logger.debug("CSI1000 regime from cache for %s", ctx.trade_date)
+    else:
+        ctx.csi1000_closes_11d = []
+        start_60d = (dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=60)).isoformat()
+        try:
+            import baostock as bs  # noqa: PLC0415
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                rs = bs.query_history_k_data_plus(
+                    "sh.000852", "close",
+                    start_date=start_60d, end_date=ctx.trade_date, frequency="d",
+                )
+                closes: list[float] = []
+                while rs.error_code == "0" and rs.next():
+                    row_data = rs.get_row_data()
+                    try:
+                        closes.append(float(row_data[0]))
+                    except (IndexError, ValueError, TypeError):
+                        pass
+                ctx.csi1000_closes_11d = closes[-11:] if len(closes) >= 11 else closes
+                bs.logout()
+        except ImportError:
+            pass
+
+    # 5f. industry map
+    ind_cached = _load_industry_cache(ctx.trade_date, ctx.fetch_symbols)
+    if ind_cached is not None:
+        ctx.industry_map = ind_cached
+        logger.debug("industry_map from cache for %s", ctx.trade_date)
+    else:
+        ctx.industry_map = {}
+        try:
+            import baostock as bs  # noqa: PLC0415
+            login_r = bs.login()
+            if login_r.error_code == "0":
+                for sym in ctx.fetch_symbols:
+                    code = sym.lower()
+                    if len(code) == 6:
+                        prefix = "sh" if code.startswith("6") else "sz"
+                        code = f"{prefix}.{code}"
+                    elif not code.startswith(("sh.", "sz.")):
+                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                        code = f"{prefix}.{sym[-6:]}"
+                    rs = bs.query_stock_industry(code=code, date=ctx.trade_date)
+                    while rs.error_code == "0" and rs.next():
+                        row_data = rs.get_row_data()
+                        if len(row_data) > 3 and row_data[3]:
+                            ctx.industry_map[sym] = row_data[3]
+                bs.logout()
+        except ImportError:
+            pass
+
+    # 5g. market_data for filter_candidates
+    ctx.market_data = {}
+    for sym in ctx.fetch_symbols:
+        p = ctx.prices.get(sym)
+        if p is None:
+            continue
+        listing_days = 999
+        try:
+            first_bar_df = D.features(
+                instruments=[sym], fields=["$close"],
+                start_time="2005-01-01", end_time=ctx.trade_date,
+            )
+            if first_bar_df is not None and not first_bar_df.empty:
+                first_date = first_bar_df.index[0]
+                if isinstance(first_date, tuple):
+                    first_date = first_date[0]
+                first_bar_date = first_date.date() if hasattr(first_date, "date") else first_date
+                listing_days = len(
+                    trading_days_between(first_bar_date, dt.date.fromisoformat(ctx.trade_date))
+                )
+        except Exception:
+            pass
+        avg_turnover_20d = 0.0
+        try:
+            turnover_df = D.features(
+                instruments=[sym],
+                fields=["$volume", "$close", "$factor"],
+                start_time=(dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=40)).isoformat(),
+                end_time=ctx.trade_date,
+            )
+            if turnover_df is not None and not turnover_df.empty:
+                # qlib $close is forward-adjusted; divide by $factor to recover actual CNY price
+                factor = turnover_df["$factor"].replace(0, 1)
+                unadj_close = turnover_df["$close"] / factor
+                turnover_vals = (turnover_df["$volume"] * unadj_close).tail(20)
+                if len(turnover_vals) > 0:
+                    avg_turnover_20d = float(turnover_vals.mean())
+        except Exception:
+            pass
+        ctx.market_data[sym] = {
+            "close": p["close"],
+            "listing_days": listing_days,
+            "avg_turnover_20d": avg_turnover_20d,
+        }
+
+    return -1  # continue
+
+
+def _step6_adjustfactor(ctx: DailyRunContext) -> None:
+    """Audit adjustfactor changes and update positions in-memory."""
+    previous_factors = {s: pos["factor"] for s, pos in ctx.current_positions.items()}
+    current_factors = {
+        s: ctx.prices[s]["factor"]
+        for s in ctx.current_positions if s in ctx.prices
+    }
+    ctx.current_positions, adj_records = check_and_apply_adjustfactor(
+        ctx.current_positions, previous_factors, current_factors
+    )
+    if adj_records:
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"adjust_{ctx.trade_date}.jsonl"
+        with log_path.open("a") as f:
+            for rec in adj_records:
+                f.write(json.dumps(rec) + "\n")
+        logger.warning(
+            "Adjustfactor changes detected for %d symbols on %s",
+            len(adj_records), ctx.trade_date,
+        )
+
+
+def _step7_csi1000_exits(ctx: DailyRunContext) -> None:
+    """Insert sell orders for positions that have left the CSI1000 universe."""
+    universe_set = set(ctx.universe_symbols)
+    csi1000_exits = {s for s in ctx.current_positions if s not in universe_set}
+    next_td_date = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+    for s in csi1000_exits:
+        existing = ctx.conn.execute(
+            "SELECT id FROM orders WHERE symbol=? AND side='sell' "
+            "AND status IN ('pending','carry') AND trade_date <= ?",
+            (s, ctx.trade_date),
+        ).fetchone()
+        if existing is None:
+            qty = ctx.current_positions[s]["qty"]
+            insert_order(ctx.conn, next_td_date, s, "sell", qty, None, "pending", 0, ctx.trade_date)
+
+
+def _step8_settle(ctx: DailyRunContext) -> None:
+    """Settle pending orders; skip for signal-only runs."""
+    if ctx.steps == {"signal"}:
+        return
+    active_cooldowns = {
+        s for s, cd in ctx.cooldown_state.items()
+        if cd["cooldown_until"] >= ctx.trade_date
+    }
+    prev_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+    topk_rows = ctx.conn.execute(
+        "SELECT symbol FROM signals WHERE trade_date = ?", (prev_date,)
+    ).fetchall()
+    if not topk_rows:
+        topk_rows = ctx.conn.execute(
+            "SELECT symbol FROM signals WHERE trade_date = "
+            "(SELECT MAX(trade_date) FROM signals WHERE trade_date <= ?)",
+            (prev_date,),
+        ).fetchall()
+    topk_symbols = {r["symbol"] for r in topk_rows}
+
+    pending_orders = [
+        dict(r) for r in ctx.conn.execute(
+            "SELECT id, symbol, side, target_qty, carry_day FROM orders "
+            "WHERE status IN ('pending','carry') AND trade_date <= ?",
+            (ctx.trade_date,),
+        ).fetchall()
+    ]
+    all_orders = list(pending_orders)
+
+    # carry cooldown cancel (two-pass)
+    orders_to_cancel = [
+        o for o in all_orders
+        if o["side"] == "buy" and o["carry_day"] > 0 and o["symbol"] in active_cooldowns
+    ]
+    cancel_ids: set[int] = set()
+    for o in orders_to_cancel:
+        log_settle_change(ctx.conn, ctx.trade_date, o["id"])
+        update_order(ctx.conn, o["id"], status="cancelled")
+        cancel_ids.add(o["id"])
+    all_orders = [o for o in all_orders if o["id"] not in cancel_ids]
+
+    ctx.settle_result = settle_day(
+        ctx.conn, ctx.trade_date, all_orders, ctx.prices,
+        ctx.current_positions, ctx.cash, topk_symbols, ctx.benchmarks, ctx.paper_cfg,
+    )
+    bump_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_to_bump])
+    ctx.current_positions = get_latest_positions(ctx.conn)
+    ctx.cash = ctx.settle_result.cash
+
+
+def _step9_risk_checks(ctx: DailyRunContext) -> None:
+    """Compute NAV and run all risk checks; persist cooldown entries."""
+    ctx.total_nav = compute_nav(ctx.current_positions, ctx.prices, ctx.cash)
+    nav_rows = ctx.conn.execute(
+        "SELECT trade_date, total_nav FROM nav ORDER BY trade_date ASC"
+    ).fetchall()
+    nav_history = [dict(r) for r in nav_rows]
+    yesterday_nav = float(nav_history[-2]["total_nav"]) if len(nav_history) >= 2 else ctx.total_nav
+
+    ctx.risk_result = run_all_risk_checks(
+        nav_history, yesterday_nav, ctx.current_positions, ctx.prices,
+        ctx.csi1000_closes_11d, ctx.industry_map, ctx.cooldown_state, ctx.cash,
+        ctx.is_soft_reduced, ctx.risk_cfg, ctx.trade_date,
+    )
+    ctx.is_soft_reduced = ctx.risk_result.topk_override is not None
+    ctx.conn.execute(
+        "INSERT OR REPLACE INTO paper_state VALUES ('is_soft_reduced', ?)",
+        ("true" if ctx.is_soft_reduced else "false",),
+    )
+    for symbol, entry in ctx.risk_result.cooldown_entries.items():
+        set_cooldown(ctx.conn, symbol, entry["cooldown_until"], entry["holding_high"])
+
+
+def _step10_signal_generation(ctx: DailyRunContext) -> int:
+    """Generate signals, filter candidates, insert buy/sell orders.  Return 2 on error."""
+    if ctx.steps == {"settle"}:
+        return -1
+
+    # Resolve prediction file
+    if ctx.pred_path is None:
+        ctx.pred_path = PREDICTIONS_DIR / f"{ctx.trade_date}.parquet"
+        if not ctx.pred_path.exists():
+            logger.error(
+                "Prediction file not found: %s (run the producer or sync predictions/)",
+                ctx.pred_path,
+            )
+            record_run(ctx.conn, ctx.trade_date, "error")
+            _try_record_pipeline_run(ctx, "error", "prediction file not found")
+            ctx.conn.commit()
+            return 2
+
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", ctx.pred_path.name)
+    if m:
+        ctx.predictions_date_str = m.group(1)
+
+    try:
+        ctx.signals_raw = generate_signals(
+            ctx.trade_date, conn=ctx.conn, pred_path=ctx.pred_path,
+            topk=ctx.paper_cfg["topk"],
+        )
+    except (FileNotFoundError, ValueError) as e:
+        logger.error("Signal generation failed for %s: %s", ctx.trade_date, e)
+        record_run(ctx.conn, ctx.trade_date, "error")
+        _try_record_pipeline_run(ctx, "error", str(e))
+        ctx.conn.commit()
+        return 2
+
+    # Provenance log
+    meta_path = PREDICTIONS_DIR / f"{ctx.trade_date}.meta.json"
+    if meta_path.exists():
+        try:
+            with meta_path.open() as f:
+                meta = json.load(f)
+            logger.info(
+                "Prediction provenance: model=%s window=%s",
+                meta.get("model"), meta.get("window_id"),
+            )
+        except Exception:
+            pass
+
+    candidate_syms = [s for s in ctx.signals_raw if s in ctx.market_data]
+    filtered_syms = filter_candidates(
+        candidate_syms, ctx.market_data,
+        ctx.paper_cfg["listing_min_days"],
+        ctx.paper_cfg["liquidity_min_turnover"],
+        ctx.config.get("universe", {}).get("exclude_close_above_cny", 300.0),
+    )
+    filtered_signals = {s: ctx.signals_raw[s] for s in filtered_syms}
+
+    effective_topk = ctx.risk_result.topk_override or ctx.paper_cfg["topk"]
+
+    ipo_held = {
+        s for s in ctx.current_positions
+        if ctx.market_data.get(s, {}).get("listing_days", 999)
+        < ctx.paper_cfg.get("listing_min_days", 60)
+    }
+    held_set = set(ctx.current_positions.keys()) - ipo_held
+    topk_for_dropout = max(0, effective_topk - len(ipo_held))
+    sell_syms, buy_syms = topk_dropout_orders(
+        filtered_signals, held_set, topk_for_dropout, ctx.paper_cfg.get("n_drop", 1),
+    )
+
+    buy_syms = [
+        s for s in buy_syms
+        if ctx.industry_map.get(s) not in ctx.risk_result.blocked_industries
+        and s not in ctx.risk_result.blocked_rebuys
+    ]
+
+    if ctx.config.get("paper", {}).get("sentiment", {}).get("enabled", False):
+        try:
+            from ashare_lab.paper.sentiment import run_sentiment_veto
+            veto_result = run_sentiment_veto(
+                buy_syms, ctx.trade_date, ctx.industry_map, ctx.conn, ctx.config,
+            )
+            buy_syms = [s for s in buy_syms if s not in veto_result.vetoed_stocks]
+            if veto_result.global_halted:
+                ctx.risk_result = replace(ctx.risk_result, buying_halted=True)
+            logger.info(
+                "sentiment veto: %d stocks vetoed, %d industries, global=%s",
+                len(veto_result.vetoed_stocks), len(veto_result.vetoed_industries),
+                "halted" if veto_result.global_halted else "ok",
+            )
+        except Exception:
+            logger.warning("Sentiment veto failed, continuing without veto", exc_info=True)
+
+    # T+1 sell guard
+    sell_syms = [
+        s for s in sell_syms
+        if ctx.current_positions.get(s, {}).get("buy_date") != ctx.trade_date
+    ]
+
+    if ctx.risk_result.buying_halted:
+        buy_syms = []
+
+    if effective_topk <= 0:
+        target_value = 0.0
+        buy_syms = []
+    else:
+        target_value = (ctx.total_nav * ctx.config["cost_model"]["risk_degree"]) / effective_topk
+
+    forced_sells = ctx.risk_result.forced_sells
+    sell_set = set(sell_syms) | set(forced_sells.keys())
+    desired_sell_qty: dict[str, int] = {}
+    for s in sell_set:
+        if s in sell_syms:
+            desired_sell_qty[s] = ctx.current_positions.get(s, {}).get("qty", 0)
+        else:
+            desired_sell_qty[s] = forced_sells[s]
+
+    next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+    for s in sell_set:
+        already = ctx.conn.execute(
+            "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
+            "WHERE symbol=? AND side='sell' AND status IN ('pending','carry')",
+            (s,),
+        ).fetchone()[0]
+        to_insert = desired_sell_qty[s] - already
+        if to_insert > 0:
+            insert_order(ctx.conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
+
+    for s in buy_syms:
+        close_price = ctx.prices.get(s, {}).get("close")
+        if (
+            not close_price
+            or close_price <= 0
+            or (isinstance(close_price, float) and close_price != close_price)
+        ):
+            logger.warning("Skip buy %s: invalid close price %s", s, close_price)
+            continue
+        target_qty = round_lots(target_value / close_price, "buy")
+        if target_qty <= 0:
+            continue
+        insert_order(ctx.conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
+
+    return -1
+
+
+def _step11_ipo_processing(ctx: DailyRunContext) -> None:
+    """Process IPO listings and re-evaluate held IPO positions."""
+    ctx.ipo_cash_changed = False
+    next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+
+    for ipo_row in ctx.ipo_won:
+        if ipo_row["listing_date"] != ctx.trade_date:
+            continue
+        symbol = ipo_row["symbol"]
+        won, shares = check_ipo_subscription(ipo_row["ceiling_lots"], ipo_row["win_rate"])
+        if not won:
+            continue
+        new_pos = {
+            "qty": shares,
+            "avg_cost": ipo_row["issue_price"],
+            "market_value": shares * ctx.prices.get(symbol, {}).get("close", ipo_row["issue_price"]),
+            "buy_date": ipo_row["listing_date"],
+            "holding_high": ctx.prices.get(symbol, {}).get("close", ipo_row["issue_price"]),
+            "factor": ctx.prices.get(symbol, {}).get("factor", 1.0),
+        }
+        ctx.current_positions[symbol] = new_pos
+        ctx.cash -= shares * ipo_row["issue_price"]
+        ctx.ipo_cash_changed = True
+        snapshot_positions(ctx.conn, ctx.trade_date, ctx.current_positions)
+        if symbol not in ctx.prices:
+            continue
+        sell_date = determine_ipo_sell_date(
+            symbol, ipo_row["listing_date"],
+            [(ipo_row["listing_date"], ctx.prices[symbol]["change"])],
+        )
+        if sell_date is None:
+            continue
+        order_date = sell_date if sell_date > ctx.trade_date else next_td_str
+        already = ctx.conn.execute(
+            "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
+            "WHERE symbol=? AND side='sell' AND status IN ('pending','carry')",
+            (symbol,),
+        ).fetchone()[0]
+        to_insert = shares - already
+        if to_insert > 0:
+            insert_order(ctx.conn, order_date, symbol, "sell", to_insert, None, "pending", 0, ctx.trade_date)
+
+    # Held IPO re-evaluation
+    for sym, pos in list(ctx.current_positions.items()):
+        if ctx.market_data.get(sym, {}).get("listing_days", 999) >= ctx.paper_cfg.get("listing_min_days", 60):
+            continue
+        if pos.get("buy_date", "") == ctx.trade_date:
+            continue
+        try:
+            from qlib.data import D as D_ipo  # noqa: PLC0415
+            chg_df = D_ipo.features(
+                instruments=[sym], fields=["$change"],
+                start_time=pos["buy_date"], end_time=ctx.trade_date,
+            )
+            if chg_df is not None and not chg_df.empty:
+                daily_changes = [
+                    (str(d.date()) if hasattr(d, "date") else str(d), float(c))
+                    for d, c in zip(
+                        chg_df.index.get_level_values(0)
+                        if isinstance(chg_df.index, type(chg_df.index))
+                        else chg_df.index,
+                        chg_df["$change"],
+                    )
+                ]
+            else:
+                continue
+        except Exception:
+            continue
+        sell_date = determine_ipo_sell_date(sym, pos["buy_date"], daily_changes)
+        if sell_date is None or sell_date > ctx.trade_date:
+            continue
+        order_date = next_td_str
+        already = ctx.conn.execute(
+            "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
+            "WHERE symbol=? AND side='sell' AND status IN ('pending','carry')",
+            (sym,),
+        ).fetchone()[0]
+        to_insert = pos["qty"] - already
+        if to_insert > 0:
+            insert_order(ctx.conn, order_date, sym, "sell", to_insert, None, "pending", 0, ctx.trade_date)
+        snapshot_positions(ctx.conn, ctx.trade_date, ctx.current_positions)
+
+    # 11d. persist post-IPO nav if cash changed
+    if ctx.ipo_cash_changed and ctx.settle_result is not None:
+        market_value = sum(
+            pos["qty"] * ctx.prices.get(s, {}).get("close", pos["avg_cost"])
+            for s, pos in ctx.current_positions.items()
+            if pos["qty"] > 0
+        )
+        new_total_nav = market_value + ctx.cash
+        record_nav(
+            ctx.conn, ctx.trade_date, ctx.cash, market_value, new_total_nav,
+            ctx.settle_result.pre_trade_nav, ctx.settle_result.post_trade_nav,
+            ctx.benchmarks["csi300"], ctx.benchmarks["csi1000"],
+        )
+
+
+def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
+    """Commit, hot-backup, cleanup old backups, record settled run."""
+    ctx.conn.commit()
+    backup_path = PROJECT_ROOT / "backups" / f"paper_{ctx.trade_date}.db"
+    hot_backup(ctx.db_path, backup_path)
+    cleanup_old_backups(PROJECT_ROOT / "backups", ctx.paper_cfg["backup_retention_days"])
+    record_run(ctx.conn, ctx.trade_date, "settled")
+    ctx.conn.commit()
+
+
+def _step13_report(ctx: DailyRunContext) -> None:
+    """Deliver WeChat report (non-blocking)."""
+    if ctx.steps is not None and "report" not in ctx.steps:
+        return
+    try:
+        from ashare_lab.paper.report import generate_and_send_report
+        report_rc = generate_and_send_report(ctx.trade_date, ctx.conn, ctx.config)
+        if report_rc != 0:
+            logger.warning("Report delivery failed for %s (rc=%d)", ctx.trade_date, report_rc)
+    except Exception as exc:
+        logger.warning("Report step failed for %s: %s", ctx.trade_date, exc)
+    finally:
+        ctx.conn.commit()
+
+
+def _step14_record_pipeline_run(ctx: DailyRunContext) -> None:
+    """Record pipeline run metadata (non-blocking)."""
+    use_stale = os.environ.get("ASHARE_USE_STALE") == "1"
+    try:
+        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+        duration_s = time.monotonic() - ctx.start_time
+        status = "stale" if use_stale else "success"
+        insert_pipeline_run(ctx.conn, ctx.trade_date, status, duration_s, None, ctx.predictions_date_str)
+    except Exception:
+        logger.warning("Failed to record pipeline_run", exc_info=True)
+    finally:
+        ctx.conn.commit()
+
+
+def _step15_graduation(ctx: DailyRunContext) -> None:
+    """Check graduation gate (non-blocking, skip when stale)."""
+    if os.environ.get("ASHARE_USE_STALE") == "1":
+        return
+    try:
+        from ashare_lab.paper.graduation import check_graduation, notify_graduation  # noqa: PLC0415
+        passed, stats = check_graduation(ctx.conn)
+        logger.info(
+            "Graduation gate: passed=%s rate=%.1f%% days_remaining=%d",
+            passed, stats["rate"] * 100, stats["days_remaining"],
+        )
+        if passed and stats.get("should_notify"):
+            notify_graduation(ctx.conn, stats)
+    except Exception:
+        logger.warning("Graduation check failed", exc_info=True)
+
+
+def _try_record_pipeline_run(ctx: DailyRunContext, status: str, error_msg: str) -> None:
+    """Best-effort pipeline run record on error paths."""
+    try:
+        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
+        insert_pipeline_run(
+            ctx.conn, ctx.trade_date, status,
+            time.monotonic() - ctx.start_time,
+            error_msg, ctx.predictions_date_str,
+        )
+    except Exception:
+        logger.warning("Failed to record pipeline_run", exc_info=True)
 
 
 def run_daily(
@@ -386,867 +1149,58 @@ def run_daily(
     int
         0 = success, 1 = skipped (stale/idempotent), 2 = error.
     """
-    # -- Step 0: resolve and validate trade_date --
+    # Step 0: resolve and validate trade_date
     if trade_date is None:
         trade_date = latest_trading_day().isoformat()
     if not _DATE_RE.match(trade_date):
         logger.error("Invalid date format: %s", trade_date)
         return 2
 
-    start_time = time.monotonic()
-    predictions_date_str = trade_date  # early default; overwritten when pred_path resolves
+    ctx = DailyRunContext(
+        trade_date=trade_date,
+        force=force,
+        steps=steps,
+        pred_path=pred_path,
+        start_time=time.monotonic(),
+        predictions_date_str=trade_date,
+    )
 
-    # -- Step 1: init --
-    config = load_config()
-    paper_cfg = config["paper"]
-    risk_cfg = paper_cfg["risk"]
-    db_path = PROJECT_ROOT / paper_cfg["db_path"]
-    conn = get_connection(db_path)
-    init_schema(conn)
+    _step1_init(ctx)
 
-    # -- Step 2: idempotency (D-02) --
-    if not force and is_day_settled(conn, trade_date):
-        logger.info("Already settled: %s", trade_date)
+    rc = _step2_idempotency(ctx)
+    if rc == 0:   # already settled -- return early
         return 0
-
-    if force:
-        latest_settled = conn.execute(
-            "SELECT MAX(trade_date) FROM runs WHERE status='settled'"
-        ).fetchone()[0]
-        if latest_settled is not None and trade_date < latest_settled:
-            logger.error(
-                "force-reset of %s leaves settled days > it stale; "
-                "run `paper backfill %s %s --force` to replay the "
-                "coupled range",
-                trade_date, trade_date, latest_settled,
-            )
-            return 2
-        force_reset_day(conn, trade_date)
-
-    # -- Step 3: data update (skip for signal-only and historical dates) --
-    # daily_refresh checks TODAY's feed freshness; for historical backfill
-    # dates the data was collected long ago and staleness is irrelevant.
-    # Only check when trade_date is within ~10 calendar days of today.
-    if steps != {"signal"}:
-        td = dt.date.fromisoformat(trade_date)
-        recent_cutoff = dt.date.today() - dt.timedelta(days=10)
-        if td >= recent_cutoff:
-            try:
-                from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
-                stale = daily_refresh()
-            except Exception as exc:
-                logger.error("data refresh failed", exc_info=True)
-                record_run(conn, trade_date, "error")
-                try:
-                    from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-                    insert_pipeline_run(conn, trade_date, "error",
-                                       time.monotonic() - start_time,
-                                       str(exc), predictions_date_str)
-                except Exception:
-                    logger.warning("Failed to record pipeline_run", exc_info=True)
-                conn.commit()
-                return 2
-            if stale == 1:
-                record_run(conn, trade_date, "skipped_stale")
-                conn.commit()
-                logger.warning("Data stale for %s, skipping", trade_date)
-                return 1
-
-    # -- Step 4: load state --
-    current_positions = get_latest_positions(conn)
-    cash = get_latest_cash(conn, paper_cfg["initial_cash"])
-    cooldown_state = get_cooldowns(conn)
-    cooldown_state = manage_trailing_cooldown(cooldown_state, trade_date)
-    delete_expired_cooldowns(conn, trade_date)
-    # Explicit in-memory guard: keep only active cooldowns (R-21, >= )
-    cooldown_state = {
-        s: cd for s, cd in cooldown_state.items()
-        if cd["cooldown_until"] >= trade_date
-    }
-
-    # is_soft_reduced from paper_state
-    row = conn.execute(
-        "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
-    ).fetchone()
-    if row is not None:
-        is_soft_reduced = row["value"] == "true"
-    else:
-        is_soft_reduced = False
-        conn.execute(
-            "INSERT INTO paper_state (key, value) "
-            "VALUES ('is_soft_reduced', 'false')"
-        )
-        conn.commit()
-
-    # -- Step 5: fetch prices and universe (deferred imports) --
-    try:
-        from qlib.data import D  # noqa: PLC0415
-    except ImportError as exc:
-        logger.error("qlib not available, cannot run pipeline")
-        record_run(conn, trade_date, "error")
-        try:
-            from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-            insert_pipeline_run(conn, trade_date, "error",
-                               time.monotonic() - start_time,
-                               str(exc), predictions_date_str)
-        except Exception:
-            logger.warning("Failed to record pipeline_run", exc_info=True)
-        conn.commit()
+    if rc == 2:
         return 2
 
-    # 5a. universe (csi1000 from qlib)
-    universe_symbols = D.list_instruments(
-        D.instruments("csi1000"),
-        start_time=trade_date,
-        end_time=trade_date,
-        as_list=True,
-    )
+    rc = _step3_data_update(ctx)
+    if rc in (1, 2):
+        return rc
 
-    # 5b. IPO calendar -- single fetch and evaluate
-    next_td = next_trading_day(
-        dt.date.fromisoformat(trade_date)
-    ).isoformat()
-    ipo_calendar = _fetch_ipo_calendar(next_td)
-    ipo_won = [
-        row
-        for row in ipo_calendar
-        if check_ipo_subscription(row["ceiling_lots"], row["win_rate"])[0]
-    ]
-    ipo_listing_syms = {
-        row["symbol"]
-        for row in ipo_won
-        if row["listing_date"] == trade_date
-    }
+    _step4_load_state(ctx)
 
-    # order symbols needing price data
-    order_syms = {
-        r[0] for r in conn.execute(
-            "SELECT DISTINCT symbol FROM orders "
-            "WHERE status IN ('pending','carry')"
-        )
-    }
-    fetch_symbols = (
-        set(universe_symbols)
-        | set(current_positions.keys())
-        | order_syms
-        | ipo_listing_syms
-    )
+    rc = _step5_fetch_prices_and_universe(ctx)
+    if rc == 2:
+        return 2
 
-    # 5c. ST names + prices via cache / baostock + qlib
-    st_cached = _load_st_cache(trade_date, fetch_symbols)
-    if st_cached is not None:
-        st_names = st_cached
-        logger.debug("ST names from cache for %s", trade_date)
-    else:
-        st_names: set[str] = set()
-        try:
-            import baostock as bs  # noqa: PLC0415
+    _step6_adjustfactor(ctx)
+    _step7_csi1000_exits(ctx)
+    _step8_settle(ctx)
+    _step9_risk_checks(ctx)
 
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                for sym in fetch_symbols:
-                    code = sym.lower()
-                    if len(code) == 6:
-                        prefix = "sh" if code.startswith("6") else "sz"
-                        code = f"{prefix}.{code}"
-                    elif not code.startswith(("sh.", "sz.")):
-                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                        code = f"{prefix}.{sym[-6:]}"
-                    rs = bs.query_stock_basic(code=code, code_name="")
-                    while rs.error_code == "0" and rs.next():
-                        row_data = rs.get_row_data()
-                        if len(row_data) > 1 and "ST" in str(row_data[1]).upper():
-                            st_names.add(sym)
-                bs.logout()
-        except ImportError:
-            logger.warning("baostock not installed, ST detection unavailable")
+    rc = _step10_signal_generation(ctx)
+    if rc == 2:
+        return 2
 
-    # Prices from qlib
-    prices: dict[str, dict] = {}
-    if fetch_symbols:
-        raw = D.features(
-            instruments=list(fetch_symbols),
-            fields=["$close", "$change", "$volume", "$factor"],
-            start_time=trade_date,
-            end_time=trade_date,
-        )
-        if raw is not None and not raw.empty:
-            for idx, row_s in raw.iterrows():
-                # idx is (instrument, datetime) in qlib MultiIndex
-                inst = idx[0] if isinstance(idx, tuple) else str(idx)
-                sym = str(inst)[-6:] if len(str(inst)) > 6 else str(inst)
-                # Normalize to match universe symbol format
-                for fs in fetch_symbols:
-                    if fs.endswith(sym):
-                        sym = fs
-                        break
-                prices[sym] = {
-                    "close": float(row_s.get("$close", 0)),
-                    "change": float(row_s.get("$change", 0)),
-                    "volume": float(row_s.get("$volume", 0)),
-                    "factor": float(row_s.get("$factor", 1.0)),
-                    "threshold": get_limit_threshold(sym, st_names),
-                }
-
-    # 5d. benchmark closes
-    benchmarks = _fetch_benchmark_closes(trade_date)
-
-    # 5e. CSI1000 11-day closes for regime check (cache / baostock)
-    regime_cached = _load_regime_cache(trade_date)
-    if regime_cached is not None:
-        csi1000_closes_11d = regime_cached
-        logger.debug("CSI1000 regime from cache for %s", trade_date)
-    else:
-        csi1000_closes_11d: list[float] = []
-        start_60d = (
-            dt.date.fromisoformat(trade_date) - dt.timedelta(days=60)
-        ).isoformat()
-        try:
-            import baostock as bs  # noqa: PLC0415
-
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                rs = bs.query_history_k_data_plus(
-                    "sh.000852",
-                    "close",
-                    start_date=start_60d,
-                    end_date=trade_date,
-                    frequency="d",
-                )
-                closes: list[float] = []
-                while rs.error_code == "0" and rs.next():
-                    row_data = rs.get_row_data()
-                    try:
-                        closes.append(float(row_data[0]))
-                    except (IndexError, ValueError, TypeError):
-                        pass
-                csi1000_closes_11d = (
-                    closes[-11:] if len(closes) >= 11 else closes
-                )
-                bs.logout()
-        except ImportError:
-            pass
-
-    # 5f. industry_map via cache / baostock
-    ind_cached = _load_industry_cache(trade_date, fetch_symbols)
-    if ind_cached is not None:
-        industry_map = ind_cached
-        logger.debug("industry_map from cache for %s", trade_date)
-    else:
-        industry_map: dict[str, str] = {}
-        try:
-            import baostock as bs  # noqa: PLC0415
-
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                for sym in fetch_symbols:
-                    code = sym.lower()
-                    if len(code) == 6:
-                        prefix = "sh" if code.startswith("6") else "sz"
-                        code = f"{prefix}.{code}"
-                    elif not code.startswith(("sh.", "sz.")):
-                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                        code = f"{prefix}.{sym[-6:]}"
-                    rs = bs.query_stock_industry(code=code, date=trade_date)
-                    while rs.error_code == "0" and rs.next():
-                        row_data = rs.get_row_data()
-                        if len(row_data) > 3 and row_data[3]:
-                            industry_map[sym] = row_data[3]
-                bs.logout()
-        except ImportError:
-            pass
-
-    # 5g. market_data for filter_candidates
-    market_data: dict[str, dict] = {}
-    for sym in fetch_symbols:
-        p = prices.get(sym)
-        if p is None:
-            continue
-
-        # listing_days: trading days since first qlib bar
-        listing_days = 999
-        try:
-            first_bar_df = D.features(
-                instruments=[sym],
-                fields=["$close"],
-                start_time="2005-01-01",
-                end_time=trade_date,
-            )
-            if first_bar_df is not None and not first_bar_df.empty:
-                first_date = first_bar_df.index[0]
-                if isinstance(first_date, tuple):
-                    first_date = first_date[0]
-                first_bar_date = first_date.date() if hasattr(
-                    first_date, "date"
-                ) else first_date
-                listing_days = len(
-                    trading_days_between(first_bar_date, dt.date.fromisoformat(trade_date))
-                )
-        except Exception:
-            pass
-
-        # avg_turnover_20d
-        avg_turnover_20d = 0.0
-        try:
-            turnover_df = D.features(
-                instruments=[sym],
-                fields=["$volume", "$close", "$factor"],
-                start_time=(
-                    dt.date.fromisoformat(trade_date) - dt.timedelta(days=40)
-                ).isoformat(),
-                end_time=trade_date,
-            )
-            if turnover_df is not None and not turnover_df.empty:
-                # qlib $close is forward-adjusted; divide by $factor
-                # to recover actual CNY price for turnover calculation.
-                factor = turnover_df["$factor"].replace(0, 1)
-                unadj_close = turnover_df["$close"] / factor
-                turnover_vals = (
-                    turnover_df["$volume"] * unadj_close
-                ).tail(20)
-                if len(turnover_vals) > 0:
-                    avg_turnover_20d = float(turnover_vals.mean())
-        except Exception:
-            pass
-
-        market_data[sym] = {
-            "close": p["close"],
-            "listing_days": listing_days,
-            "avg_turnover_20d": avg_turnover_20d,
-        }
-
-    # -- Step 6: adjustfactor (D-47, audit-only) --
-    previous_factors = {
-        s: pos["factor"] for s, pos in current_positions.items()
-    }
-    current_factors = {
-        s: prices[s]["factor"]
-        for s in current_positions
-        if s in prices
-    }
-    current_positions, adj_records = check_and_apply_adjustfactor(
-        current_positions, previous_factors, current_factors
-    )
-    if adj_records:
-        log_dir = PROJECT_ROOT / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"adjust_{trade_date}.jsonl"
-        with log_path.open("a") as f:
-            for rec in adj_records:
-                f.write(json.dumps(rec) + "\n")
-        logger.warning(
-            "Adjustfactor changes detected for %d symbols on %s",
-            len(adj_records), trade_date,
-        )
-
-    # -- Step 7: CSI1000 exit detection (D-34) --
-    universe_set = set(universe_symbols)
-    csi1000_exits = {
-        s for s in current_positions if s not in universe_set
-    }
-    for s in csi1000_exits:
-        existing = conn.execute(
-            "SELECT id FROM orders WHERE symbol=? AND side='sell' "
-            "AND status IN ('pending','carry') AND trade_date <= ?",
-            (s, trade_date),
-        ).fetchone()
-        if existing is None:
-            qty = current_positions[s]["qty"]
-            next_td_date = next_trading_day(
-                dt.date.fromisoformat(trade_date)
-            ).isoformat()
-            # CSI1000 exit: next-day enforcement (post-close pipeline)
-            insert_order(
-                conn, next_td_date, s, "sell", qty, None,
-                "pending", 0, trade_date,
-            )
-
-    # -- Step 8: settle (skip for signal-only) --
-    settle_result = None
-    if steps != {"signal"}:
-        # 8a-pre. active cooldowns for carry-cancel
-        active_cooldowns = {
-            s for s, cd in cooldown_state.items()
-            if cd["cooldown_until"] >= trade_date
-        }
-
-        # 8a. yesterday's signals for TopK recheck
-        prev_date = previous_trading_day(
-            dt.date.fromisoformat(trade_date)
-        ).isoformat()
-        topk_rows = conn.execute(
-            "SELECT symbol FROM signals WHERE trade_date = ?",
-            (prev_date,),
-        ).fetchall()
-        if not topk_rows:
-            topk_rows = conn.execute(
-                "SELECT symbol FROM signals WHERE trade_date = "
-                "(SELECT MAX(trade_date) FROM signals "
-                "WHERE trade_date <= ?)",
-                (prev_date,),
-            ).fetchall()
-        topk_symbols = {r["symbol"] for r in topk_rows}
-
-        # 8b. pending orders
-        pending_orders = [
-            dict(r) for r in conn.execute(
-                "SELECT id, symbol, side, target_qty, carry_day "
-                "FROM orders "
-                "WHERE status IN ('pending','carry') "
-                "AND trade_date <= ?",
-                (trade_date,),
-            ).fetchall()
-        ]
-        all_orders = list(pending_orders)
-
-        # 8c2. carry cooldown cancel (two-pass, no mutation during iteration)
-        orders_to_cancel = [
-            o for o in all_orders
-            if o["side"] == "buy"
-            and o["carry_day"] > 0
-            and o["symbol"] in active_cooldowns
-        ]
-        cancel_ids: set[int] = set()
-        for o in orders_to_cancel:
-            log_settle_change(conn, trade_date, o["id"])
-            update_order(conn, o["id"], status="cancelled")
-            cancel_ids.add(o["id"])
-        all_orders = [o for o in all_orders if o["id"] not in cancel_ids]
-
-        # 8d. settle
-        settle_result = settle_day(
-            conn, trade_date, all_orders, prices,
-            current_positions, cash, topk_symbols, benchmarks, paper_cfg,
-        )
-
-        # 8e. carry day bump (non-suspended only)
-        bump_carry_days(
-            conn,
-            [o["order_id"] for o in settle_result.carries_to_bump],
-        )
-
-        # 8f. reload post-settle state
-        current_positions = get_latest_positions(conn)
-        cash = settle_result.cash
-
-    # -- Step 9: risk checks (after settle, uses post-settle NAV) --
-    # 9a. compute NAV
-    total_nav = compute_nav(current_positions, prices, cash)
-
-    # 9b. nav history + yesterday_nav
-    nav_rows = conn.execute(
-        "SELECT trade_date, total_nav FROM nav ORDER BY trade_date ASC"
-    ).fetchall()
-    nav_history = [dict(r) for r in nav_rows]
-    if len(nav_history) >= 2:
-        yesterday_nav = float(nav_history[-2]["total_nav"])
-    else:
-        yesterday_nav = total_nav
-
-    # 9c. run all risk checks
-    risk_result = run_all_risk_checks(
-        nav_history, yesterday_nav, current_positions, prices,
-        csi1000_closes_11d, industry_map, cooldown_state, cash,
-        is_soft_reduced, risk_cfg, trade_date,
-    )
-
-    # 9e. update is_soft_reduced
-    is_soft_reduced = risk_result.topk_override is not None
-    conn.execute(
-        "INSERT OR REPLACE INTO paper_state VALUES "
-        "('is_soft_reduced', ?)",
-        ("true" if is_soft_reduced else "false",),
-    )
-
-    # 9f. persist new cooldown entries
-    for symbol, entry in risk_result.cooldown_entries.items():
-        set_cooldown(conn, symbol, entry["cooldown_until"], entry["holding_high"])
-
-    # -- Step 10: signal generation (skip for settle-only) --
-    if steps != {"settle"}:
-        # 10a. resolve prediction file
-        if pred_path is None:
-            pred_path = PREDICTIONS_DIR / f"{trade_date}.parquet"
-            if not pred_path.exists():
-                logger.error(
-                    "Prediction file not found: %s "
-                    "(run the producer or sync predictions/)",
-                    pred_path,
-                )
-                record_run(conn, trade_date, "error")
-                try:
-                    from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-                    insert_pipeline_run(conn, trade_date, "error",
-                                       time.monotonic() - start_time,
-                                       "prediction file not found",
-                                       predictions_date_str)
-                except Exception:
-                    logger.warning("Failed to record pipeline_run", exc_info=True)
-                conn.commit()
-                return 2
-
-        # Extract predictions_date from filename (e.g. "2026-01-15.parquet")
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", pred_path.name)
-        if m:
-            predictions_date_str = m.group(1)
-
-        try:
-            signals_raw = generate_signals(
-                trade_date, conn=conn, pred_path=pred_path,
-                topk=paper_cfg["topk"],
-            )
-        except (FileNotFoundError, ValueError) as e:
-            logger.error(
-                "Signal generation failed for %s: %s", trade_date, e
-            )
-            record_run(conn, trade_date, "error")
-            try:
-                from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-                insert_pipeline_run(conn, trade_date, "error",
-                                   time.monotonic() - start_time,
-                                   str(e), predictions_date_str)
-            except Exception:
-                logger.warning("Failed to record pipeline_run", exc_info=True)
-            conn.commit()
-            return 2
-
-        # Provenance log
-        meta_path = PREDICTIONS_DIR / f"{trade_date}.meta.json"
-        if meta_path.exists():
-            try:
-                with meta_path.open() as f:
-                    meta = json.load(f)
-                logger.info(
-                    "Prediction provenance: model=%s window=%s",
-                    meta.get("model"), meta.get("window_id"),
-                )
-            except Exception:
-                pass
-
-        # 10b. filter candidates
-        candidate_syms = [s for s in signals_raw if s in market_data]
-        filtered_syms = filter_candidates(
-            candidate_syms, market_data,
-            paper_cfg["listing_min_days"],
-            paper_cfg["liquidity_min_turnover"],
-            config.get("universe", {}).get(
-                "exclude_close_above_cny", 300.0
-            ),
-        )
-        filtered_signals = {s: signals_raw[s] for s in filtered_syms}
-
-        # 10d. effective topk
-        effective_topk = (
-            risk_result.topk_override
-            if risk_result.topk_override
-            else paper_cfg["topk"]
-        )
-
-        # 10e. IPO-held exclusion + topk_dropout
-        ipo_held = {
-            s for s in current_positions
-            if market_data.get(s, {}).get("listing_days", 999)
-            < paper_cfg.get("listing_min_days", 60)
-        }
-        held_set = set(current_positions.keys()) - ipo_held
-        topk_for_dropout = max(0, effective_topk - len(ipo_held))
-        sell_syms, buy_syms = topk_dropout_orders(
-            filtered_signals, held_set, topk_for_dropout,
-            paper_cfg.get("n_drop", 1),
-        )
-
-        # 10e2. risk blocks on BUY side only
-        buy_syms = [
-            s for s in buy_syms
-            if industry_map.get(s) not in risk_result.blocked_industries
-            and s not in risk_result.blocked_rebuys
-        ]
-
-        # 10e3. sentiment veto (fail-open: errors skip veto, not block buys)
-        if config.get("paper", {}).get("sentiment", {}).get("enabled", False):
-            try:
-                from ashare_lab.paper.sentiment import run_sentiment_veto
-                veto_result = run_sentiment_veto(
-                    buy_syms, trade_date, industry_map, conn, config,
-                )
-                buy_syms = [
-                    s for s in buy_syms
-                    if s not in veto_result.vetoed_stocks
-                ]
-                if veto_result.global_halted:
-                    risk_result = replace(risk_result, buying_halted=True)
-                logger.info(
-                    "sentiment veto: %d stocks vetoed, %d industries, global=%s",
-                    len(veto_result.vetoed_stocks),
-                    len(veto_result.vetoed_industries),
-                    "halted" if veto_result.global_halted else "ok",
-                )
-            except Exception:
-                logger.warning(
-                    "Sentiment veto failed, continuing without veto",
-                    exc_info=True,
-                )
-
-        # 10f. T+1 sell guard
-        sell_syms = [
-            s for s in sell_syms
-            if current_positions.get(s, {}).get("buy_date") != trade_date
-        ]
-
-        # 10g. circuit breaker halts all buys
-        if risk_result.buying_halted:
-            buy_syms = []
-
-        # 10h. compute buy quantities
-        if effective_topk <= 0:
-            target_value = 0.0
-            buy_syms = []
-        else:
-            target_value = (
-                total_nav * config["cost_model"]["risk_degree"]
-            ) / effective_topk
-
-        # 10i. desired_sell_qty (unified rotation + forced)
-        forced_sells = risk_result.forced_sells
-        sell_set = set(sell_syms) | set(forced_sells.keys())
-        desired_sell_qty: dict[str, int] = {}
-        for s in sell_set:
-            if s in sell_syms:
-                # Rotation = full position exit
-                desired_sell_qty[s] = current_positions.get(s, {}).get("qty", 0)
-            else:
-                # Forced-only (concentration/trailing stop partial)
-                desired_sell_qty[s] = forced_sells[s]
-
-        # 10j. insert sells -- quantity-aware dedup
-        next_td_str = next_trading_day(
-            dt.date.fromisoformat(trade_date)
-        ).isoformat()
-        for s in sell_set:
-            already = conn.execute(
-                "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
-                "WHERE symbol=? AND side='sell' "
-                "AND status IN ('pending','carry')",
-                (s,),
-            ).fetchone()[0]
-            to_insert = desired_sell_qty[s] - already
-            if to_insert > 0:
-                # risk-forced sell: next-day enforcement (post-settle arch)
-                insert_order(
-                    conn, next_td_str, s, "sell", to_insert, None,
-                    "pending", 0, trade_date,
-                )
-
-        # Insert buys
-        for s in buy_syms:
-            close_price = prices.get(s, {}).get("close")
-            if (
-                not close_price
-                or close_price <= 0
-                or (isinstance(close_price, float) and close_price != close_price)
-            ):
-                logger.warning("Skip buy %s: invalid close price %s", s, close_price)
-                continue
-            target_qty = round_lots(target_value / close_price, "buy")
-            if target_qty <= 0:
-                continue
-            insert_order(
-                conn, next_td_str, s, "buy", target_qty, None,
-                "pending", 0, trade_date,
-            )
-
-    # -- Step 11: IPO processing (D-42/D-43) --
-    ipo_cash_changed = False
-    for ipo_row in ipo_won:
-        if ipo_row["listing_date"] != trade_date:
-            continue
-
-        symbol = ipo_row["symbol"]
-        won, shares = check_ipo_subscription(
-            ipo_row["ceiling_lots"], ipo_row["win_rate"]
-        )
-        if not won:
-            continue
-
-        # 11b. create position
-        new_pos = {
-            "qty": shares,
-            "avg_cost": ipo_row["issue_price"],
-            "market_value": shares * prices.get(symbol, {}).get(
-                "close", ipo_row["issue_price"]
-            ),
-            "buy_date": ipo_row["listing_date"],
-            "holding_high": prices.get(symbol, {}).get(
-                "close", ipo_row["issue_price"]
-            ),
-            "factor": prices.get(symbol, {}).get("factor", 1.0),
-        }
-        current_positions[symbol] = new_pos
-        cash -= shares * ipo_row["issue_price"]
-        ipo_cash_changed = True
-        snapshot_positions(conn, trade_date, current_positions)
-
-        # Determine sell date (guard: must have price data)
-        if symbol not in prices:
-            continue
-
-        sell_date = determine_ipo_sell_date(
-            symbol, ipo_row["listing_date"],
-            [(ipo_row["listing_date"], prices[symbol]["change"])],
-        )
-        if sell_date is None:
-            continue
-
-        # Normalize order date
-        if sell_date > trade_date:
-            order_date = sell_date
-        else:
-            order_date = next_trading_day(
-                dt.date.fromisoformat(trade_date)
-            ).isoformat()
-
-        # Quantity-aware dedup
-        already = conn.execute(
-            "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
-            "WHERE symbol=? AND side='sell' "
-            "AND status IN ('pending','carry')",
-            (symbol,),
-        ).fetchone()[0]
-        to_insert = shares - already
-        if to_insert > 0:
-            insert_order(
-                conn, order_date, symbol, "sell", to_insert, None,
-                "pending", 0, trade_date,
-            )
-
-    # 11c. held IPO positions re-evaluation
-    for sym, pos in list(current_positions.items()):
-        if market_data.get(sym, {}).get("listing_days", 999) >= paper_cfg.get(
-            "listing_min_days", 60
-        ):
-            continue
-        if pos.get("buy_date", "") == trade_date:
-            # Already handled in 11b above
-            continue
-
-        # Held IPO: get daily changes for determine_ipo_sell_date
-        try:
-            from qlib.data import D as D_ipo  # noqa: PLC0415
-
-            chg_df = D_ipo.features(
-                instruments=[sym],
-                fields=["$change"],
-                start_time=pos["buy_date"],
-                end_time=trade_date,
-            )
-            if chg_df is not None and not chg_df.empty:
-                daily_changes = [
-                    (str(d.date()) if hasattr(d, "date") else str(d), float(c))
-                    for d, c in zip(
-                        chg_df.index.get_level_values(0)
-                        if isinstance(chg_df.index, type(chg_df.index))
-                        else chg_df.index,
-                        chg_df["$change"],
-                    )
-                ]
-            else:
-                continue
-        except Exception:
-            continue
-
-        sell_date = determine_ipo_sell_date(sym, pos["buy_date"], daily_changes)
-        if sell_date is None:
-            continue
-        if sell_date > trade_date:
-            continue
-
-        # Sell date is today or in the past: insert sell for next day
-        order_date = next_trading_day(
-            dt.date.fromisoformat(trade_date)
-        ).isoformat()
-        already = conn.execute(
-            "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
-            "WHERE symbol=? AND side='sell' "
-            "AND status IN ('pending','carry')",
-            (sym,),
-        ).fetchone()[0]
-        to_insert = pos["qty"] - already
-        if to_insert > 0:
-            insert_order(
-                conn, order_date, sym, "sell", to_insert, None,
-                "pending", 0, trade_date,
-            )
-        snapshot_positions(conn, trade_date, current_positions)
-
-    # -- Step 11d: persist post-IPO nav if cash changed --
-    if ipo_cash_changed and settle_result is not None:
-        market_value = sum(
-            pos["qty"] * prices.get(s, {}).get("close", pos["avg_cost"])
-            for s, pos in current_positions.items()
-            if pos["qty"] > 0
-        )
-        new_total_nav = market_value + cash
-        record_nav(
-            conn, trade_date, cash, market_value, new_total_nav,
-            settle_result.pre_trade_nav, settle_result.post_trade_nav,
-            benchmarks["csi300"], benchmarks["csi1000"],
-        )
-
-    # -- Step 12: backup and finalize --
-    conn.commit()
-    backup_path = PROJECT_ROOT / "backups" / f"paper_{trade_date}.db"
-    hot_backup(db_path, backup_path)
-    cleanup_old_backups(
-        PROJECT_ROOT / "backups", paper_cfg["backup_retention_days"]
-    )
-    record_run(conn, trade_date, "settled")
-    conn.commit()
-
-    # -- Step 13: WeChat report delivery (non-blocking) --
-    if steps is None or "report" in (steps or set()):
-        try:
-            from ashare_lab.paper.report import generate_and_send_report
-            # generate_and_send_report opens a transaction, handles its own commits
-            report_rc = generate_and_send_report(trade_date, conn, config)
-            if report_rc != 0:
-                logger.warning("Report delivery failed for %s (rc=%d)", trade_date, report_rc)
-        except Exception as exc:
-            logger.warning("Report step failed for %s: %s", trade_date, exc)
-        finally:
-            conn.commit()  # safety commit for report status persistence
-
-    # -- Step 14: Record pipeline run (non-blocking) --
-    use_stale = os.environ.get("ASHARE_USE_STALE") == "1"
-    try:
-        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-        duration_s = time.monotonic() - start_time
-        status = "stale" if use_stale else "success"
-        insert_pipeline_run(conn, trade_date, status, duration_s,
-                            None, predictions_date_str)
-    except Exception:
-        logger.warning("Failed to record pipeline_run", exc_info=True)
-    finally:
-        conn.commit()
-
-    # -- Step 15: Graduation check (non-blocking, skip when stale) --
-    if not use_stale:
-        try:
-            from ashare_lab.paper.graduation import (  # noqa: PLC0415
-                check_graduation,
-                notify_graduation,
-            )
-            passed, stats = check_graduation(conn)
-            logger.info(
-                "Graduation gate: passed=%s rate=%.1f%% days_remaining=%d",
-                passed, stats["rate"] * 100, stats["days_remaining"],
-            )
-            if passed and stats.get("should_notify"):
-                notify_graduation(conn, stats)
-        except Exception:
-            logger.warning("Graduation check failed", exc_info=True)
+    _step11_ipo_processing(ctx)
+    _step12_backup_and_finalize(ctx)
+    _step13_report(ctx)
+    _step14_record_pipeline_run(ctx)
+    _step15_graduation(ctx)
 
     logger.info("Pipeline completed for %s", trade_date)
     return 0
+
 
 
 # ------------------------------------------------------------------
