@@ -135,7 +135,8 @@ Description=ashare-lab data update
 Type=oneshot
 WorkingDirectory=$REPO
 ExecStart=$REPO/scripts/ashare-data-update.sh
-Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$REPO/.venv/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=$REPO/.venv
 TimeoutStartSec=600
 StandardOutput=journal
 StandardError=journal
@@ -161,7 +162,8 @@ Description=ashare-lab daily pipeline
 Type=oneshot
 WorkingDirectory=$REPO
 ExecStart=$REPO/scripts/ashare-pipeline.sh
-Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$REPO/.venv/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=$REPO/.venv
 TimeoutStartSec=10800
 StandardOutput=journal
 StandardError=journal
@@ -187,7 +189,8 @@ Description=ashare-lab chenditc backup
 Type=oneshot
 WorkingDirectory=$REPO
 ExecStart=$REPO/scripts/ashare-chenditc.sh
-Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$REPO/.venv/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=$REPO/.venv
 TimeoutStartSec=3600
 StandardOutput=journal
 StandardError=journal
