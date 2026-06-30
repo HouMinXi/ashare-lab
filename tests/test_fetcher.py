@@ -94,6 +94,41 @@ def test_fetch_today_data_column_mapping():
     assert abs(df.iloc[0]["change"] - (-0.018234)) < 1e-6
 
 
+def test_fetch_today_data_compact_date_format():
+    """Compact YYYYMMDD format is accepted and normalized to YYYY-MM-DD in output."""
+    from ashare_lab.data.fetcher import fetch_today_data
+
+    fake_df = pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20260626",
+                "open": 10.42,
+                "high": 10.47,
+                "low": 10.19,
+                "close": 10.23,
+                "pre_close": 10.42,
+                "change": -0.19,
+                "pct_chg": -1.8234,
+                "vol": 1236481.64,
+                "amount": 1270902.94,
+            }
+        ]
+    )
+    mock_pro = MagicMock()
+    mock_pro.daily.return_value = fake_df
+
+    with (
+        patch("ashare_lab.data.fetcher._get_tushare_token", return_value="fake"),
+        patch("ashare_lab.data.fetcher.ts") as mock_ts,
+    ):
+        mock_ts.pro_api.return_value = mock_pro
+        result = fetch_today_data("20260626")
+
+    assert "sz000001" in result
+    assert result["sz000001"].iloc[0]["date"] == "2026-06-26"
+
+
 def test_fetch_today_data_empty_raises():
     """Empty tushare response raises RuntimeError."""
     from ashare_lab.data.fetcher import fetch_today_data

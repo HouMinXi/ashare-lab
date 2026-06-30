@@ -64,15 +64,14 @@ def test_completeness_pass():
 
 
 def test_completeness_warn():
-    """4000 stocks logs warning but does NOT raise."""
+    """4000 stocks logs completeness warning and result.passed is False."""
     from ashare_lab.data.validator import validate_daily_data
 
     data = _make_data(4000)
     result = validate_daily_data(data, "2026-06-26")
     completeness_warns = [w for w in result.warnings if "completeness" in w.lower()]
     assert len(completeness_warns) > 0
-    # Validation never raises
-    assert isinstance(result.passed, bool)
+    assert result.passed is False
 
 
 def test_nan_in_ohlcv_flagged():
@@ -203,11 +202,42 @@ def test_cross_validation_none_no_warns():
 
 
 def test_validation_never_raises():
-    """Validation with multiple problems returns result, never raises."""
+    """Validation with multiple problems returns result with passed=False, never raises."""
     from ashare_lab.data.validator import validate_daily_data
 
     data = _make_data(3000)  # low count
     data["sz000001"] = _make_stock_df(volume=0, close=float("nan"))
     result = validate_daily_data(data, "2026-06-26")
     assert len(result.warnings) > 0
-    assert isinstance(result.passed, bool)
+    assert result.passed is False
+
+
+def test_nan_in_change_column_skipped_gracefully():
+    """NaN in 'change' column: limit check is skipped silently, no crash, no spurious warning."""
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    df = data["sz000001"].copy()
+    df["change"] = float("nan")
+    data["sz000001"] = df
+    # Must not raise
+    result = validate_daily_data(data, "2026-06-26")
+    # NaN change does NOT produce a change-limit warning for sz000001
+    limit_warns = [
+        w for w in result.warnings if "sz000001" in w and "exceeds" in w
+    ]
+    assert len(limit_warns) == 0
+    # Overall result should pass (only that one stock has NaN change, OHLCV is valid)
+    assert result.passed is True
+
+
+def test_negative_change_exceeds_mainboard_limit_flagged():
+    """Negative change exceeding mainboard 10% limit is flagged."""
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    # -11% on mainboard -- should trigger the same limit check as +11%
+    data["sh600999"] = _make_stock_df(change=-0.11)
+    result = validate_daily_data(data, "2026-06-26")
+    warns = [w for w in result.warnings if "sh600999" in w]
+    assert len(warns) > 0
