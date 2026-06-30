@@ -74,15 +74,44 @@ def test_completeness_warn():
     assert result.passed is False
 
 
-def test_nan_in_ohlcv_flagged():
-    """NaN in OHLCV columns is flagged."""
+@pytest.mark.parametrize("col,kwargs", [
+    ("open",   {"open_": float("nan")}),
+    ("high",   {"high": float("nan")}),
+    ("low",    {"low": float("nan")}),
+    ("close",  {"close": float("nan")}),
+    ("volume", {"volume": float("nan")}),
+])
+def test_nan_in_ohlcv_flagged(col, kwargs):
+    """NaN in any of the five OHLCV columns is flagged."""
     from ashare_lab.data.validator import validate_daily_data
 
     data = _make_data(5500)
-    data["sz000001"] = _make_stock_df(close=float("nan"))
+    data["sz000001"] = _make_stock_df(**kwargs)
     result = validate_daily_data(data, "2026-06-26")
     nan_warns = [w for w in result.warnings if "nan" in w.lower()]
-    assert len(nan_warns) > 0
+    assert len(nan_warns) > 0, f"expected NaN warning for column '{col}'"
+
+
+def test_nan_in_volume_skips_zero_check():
+    """NaN volume: the volume==0 check is skipped silently (no 'volume' warning).
+
+    The validator guards the zero-volume check with:
+        if not (isinstance(vol, float) and math.isnan(vol)):
+    so NaN volume produces a NaN-in-OHLCV warning (Layer 1) but NOT
+    the 'volume is 0 (suspended)' warning (Layer 2).  This test documents
+    that intentional gap so future readers do not mistake it for a bug.
+    """
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    data["sz000001"] = _make_stock_df(volume=float("nan"))
+    result = validate_daily_data(data, "2026-06-26")
+    # Layer 1 must fire: NaN detected in 'volume' column
+    nan_warns = [w for w in result.warnings if "nan" in w.lower() and "sz000001" in w]
+    assert len(nan_warns) > 0, "expected NaN-in-volume Layer-1 warning"
+    # Layer 2 must NOT fire: 'volume is 0 (suspended)' check is bypassed for NaN
+    zero_warns = [w for w in result.warnings if "sz000001" in w and "suspended" in w.lower()]
+    assert len(zero_warns) == 0, f"unexpected zero-volume warning for NaN volume: {zero_warns}"
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +239,39 @@ def test_validation_never_raises():
     result = validate_daily_data(data, "2026-06-26")
     assert len(result.warnings) > 0
     assert result.passed is False
+
+
+
+
+def test_st_name_exact_match_flagged():
+    """Exact 'ST' and '*ST' names trigger the 5% limit, not the mainboard 10%."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("sz000999", {"sz000999": "ST"}) == 0.05
+    assert _change_limit("sz000998", {"sz000998": "*ST"}) == 0.05
+
+
+def test_st_name_with_space_flagged():
+    """'ST SomeName' (trailing space after ST) triggers 5% limit."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("sz000997", {"sz000997": "ST PingAn"}) == 0.05
+
+
+def test_st_star_prefix_flagged():
+    """'*ST SomeName' triggers 5% limit."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("sz000996", {"sz000996": "*ST Example"}) == 0.05
+
+
+def test_st_false_positive_avoided():
+    """Names containing 'ST' but not as a marker are not treated as ST stocks."""
+    from ashare_lab.data.validator import _change_limit
+
+    # 'STKN' contains 'ST' but is not an ST stock -- must use mainboard 10% limit
+    result = _change_limit("sz000995", {"sz000995": "STKN Holdings"})
+    assert result != 0.05, "STKN Holdings should not be flagged as ST"
 
 
 def test_nan_in_change_column_skipped_gracefully():

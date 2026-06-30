@@ -201,10 +201,21 @@ def test_cross_validation_mocked():
 
 
 def test_cross_validation_import_error():
-    """AKShare ImportError is caught, returns empty dict."""
+    """AKShare ImportError is caught, returns empty dict.
+
+    Uses builtins.__import__ side_effect so the ImportError is explicit and
+    deterministic, not reliant on CPython's None-in-sys.modules behaviour.
+    """
     from ashare_lab.data.fetcher import fetch_cross_validation_sample
 
-    with patch.dict("sys.modules", {"akshare": None}):
+    _real_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+
+    def _import_raiser(name, *args, **kwargs):
+        if name == "akshare":
+            raise ImportError("No module named 'akshare'")
+        return _real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=_import_raiser):
         result = fetch_cross_validation_sample("2026-06-26", ["sz000001"])
 
     assert result == {}
