@@ -98,6 +98,104 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
+    import datetime as dt  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
+    from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS  # noqa: PLC0415
+
+    today = dt.date.today()
+    if not is_trading_day(today):
+        print("not a trading day")
+        return 0
+
+    trade_date = latest_trading_day(today)
+
+    try:
+        import qlib  # noqa: PLC0415
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+        from qlib.data import D  # noqa: PLC0415
+        df = D.features(
+            instruments=CSI1000_SAMPLE_SYMBOLS,
+            fields=["$close"],
+            start_time=trade_date,
+            end_time=trade_date,
+        )
+        snapshot = {}
+        if df is not None and not df.empty:
+            for instrument, row in df.iterrows():
+                sym = instrument[0] if isinstance(instrument, tuple) else instrument
+                snapshot[str(sym)] = float(row["$close"])
+        else:
+            log.warning("No 17:00 incremental for %s; diff will be skipped", trade_date)
+    except Exception as exc:
+        log.warning("qlib query failed (non-fatal): %s", exc)
+        snapshot = {}
+
+    out = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
+    out.write_text(_json.dumps(snapshot))
+    log.info("snapshot saved: %s (%d symbols)", out, len(snapshot))
+    return 0
+
+
+def cmd_chenditc_diff(args: argparse.Namespace) -> int:
+    import datetime as dt  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+    from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
+
+    trade_date = latest_trading_day(dt.date.today())
+    snap_path = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
+
+    if not snap_path.exists():
+        log.info("No snapshot; diff skipped")
+        return 0
+
+    snapshot = _json.loads(snap_path.read_text())
+    if not snapshot:
+        log.info("No snapshot; diff skipped")
+        return 0
+
+    try:
+        import qlib  # noqa: PLC0415
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+        from qlib.data import D  # noqa: PLC0415
+        symbols = list(snapshot.keys())
+        df = D.features(
+            instruments=symbols,
+            fields=["$close"],
+            start_time=trade_date,
+            end_time=trade_date,
+        )
+    except Exception as exc:
+        log.error("qlib query failed in diff: %s", exc)
+        return 0
+
+    log_dir = PROJECT_ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+    diff_path = log_dir / f"chenditc_diff_{trade_date}.jsonl"
+
+    discrepancies = 0
+    with open(diff_path, "w") as f:
+        if df is not None and not df.empty:
+            for instrument, row in df.iterrows():
+                sym = str(instrument[0] if isinstance(instrument, tuple) else instrument)
+                chenditc_close = float(row["$close"])
+                incr_close = snapshot.get(sym)
+                if incr_close is not None and abs(chenditc_close - incr_close) > 0.001:
+                    entry = {
+                        "symbol": sym,
+                        "incremental_close": incr_close,
+                        "chenditc_close": chenditc_close,
+                        "diff": round(chenditc_close - incr_close, 4),
+                    }
+                    f.write(_json.dumps(entry) + "\n")
+                    log.warning("diff: %s incr=%.4f chenditc=%.4f", sym, incr_close, chenditc_close)
+                    discrepancies += 1
+
+    log.info("chenditc diff complete: %d discrepancies logged to %s", discrepancies, diff_path)
+    return 0
+
+
 def cmd_backfill(args: argparse.Namespace) -> int:
     try:
         rc = gap_fill(args.from_date, args.to_date)
@@ -289,6 +387,8 @@ def main() -> int:
     sub.add_parser("update", help="daily data refresh")
     sub.add_parser("fetch-today", help="tushare same-day fetch + qlib dump_update")
     sub.add_parser("validate", help="cross-source spot-check")
+    sub.add_parser("chenditc-snapshot", help="save qlib close prices before chenditc refresh")
+    sub.add_parser("chenditc-diff", help="compare incremental vs chenditc close prices")
 
     p_backfill = sub.add_parser("backfill", help="gap-fill missing dates from baostock")
     p_backfill.add_argument("from_date", help="start date YYYY-MM-DD (inclusive)")
@@ -354,6 +454,8 @@ def main() -> int:
         "fetch-today": cmd_fetch_today,
         "validate": cmd_validate,
         "backfill": cmd_backfill,
+        "chenditc-snapshot": cmd_chenditc_snapshot,
+        "chenditc-diff": cmd_chenditc_diff,
     }
     return commands[args.command](args)
 
