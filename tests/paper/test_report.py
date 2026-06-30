@@ -328,14 +328,14 @@ def test_generate_and_send_report_chinese_mode(mock_deliver, db_conn, paper_conf
 def test_cli_report_args():
     from ashare_lab.cli import main
     import sys
-    with patch.object(sys, "argv", ["ashare-lab", "paper", "report", "--date", "2025-01-06", "--detailed", "--dry-run"]):
+    # --detailed removed from cli.py (force_detailed param no longer exists in report.py)
+    with patch.object(sys, "argv", ["ashare-lab", "paper", "report", "--date", "2025-01-06", "--dry-run"]):
         with patch("ashare_lab.cli.cmd_paper_report") as mock_cmd:
             mock_cmd.return_value = 0
             main()
             mock_cmd.assert_called_once()
             args = mock_cmd.call_args[0][0]
             assert args.date == "2025-01-06"
-            assert args.detailed is True
             assert args.dry_run is True
 
 def test_generate_and_send_report_no_nav_row(db_conn, paper_config):
