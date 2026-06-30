@@ -117,10 +117,10 @@ mkdir -p "$UNIT_DIR"
 
 cat > "$UNIT_DIR/ashare-data-update.timer" << 'UNIT'
 [Unit]
-Description=ashare-lab data update (00:30 CST)
+Description=ashare-lab data update (17:00 CST)
 
 [Timer]
-OnCalendar=*-*-* 00:30:00
+OnCalendar=*-*-* 17:00:00
 Persistent=true
 
 [Install]
@@ -133,6 +133,7 @@ Description=ashare-lab data update
 
 [Service]
 Type=oneshot
+WorkingDirectory=$REPO
 ExecStart=$REPO/scripts/ashare-data-update.sh
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 TimeoutStartSec=600
@@ -142,10 +143,10 @@ UNIT
 
 cat > "$UNIT_DIR/ashare-pipeline.timer" << 'UNIT'
 [Unit]
-Description=ashare-lab pipeline (01:00 CST)
+Description=ashare-lab pipeline (18:00 CST)
 
 [Timer]
-OnCalendar=*-*-* 01:00:00
+OnCalendar=*-*-* 18:00:00
 Persistent=true
 
 [Install]
@@ -158,6 +159,7 @@ Description=ashare-lab daily pipeline
 
 [Service]
 Type=oneshot
+WorkingDirectory=$REPO
 ExecStart=$REPO/scripts/ashare-pipeline.sh
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 TimeoutStartSec=10800
@@ -165,9 +167,36 @@ StandardOutput=journal
 StandardError=journal
 UNIT
 
+cat > "$UNIT_DIR/ashare-chenditc.timer" << 'UNIT'
+[Unit]
+Description=ashare-lab chenditc backup (21:00 CST)
+
+[Timer]
+OnCalendar=*-*-* 21:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+cat > "$UNIT_DIR/ashare-chenditc.service" << UNIT
+[Unit]
+Description=ashare-lab chenditc backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO
+ExecStart=$REPO/scripts/ashare-chenditc.sh
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal
+UNIT
+
 systemctl --user daemon-reload
 systemctl --user enable --now ashare-data-update.timer
 systemctl --user enable --now ashare-pipeline.timer
+systemctl --user enable --now ashare-chenditc.timer
 
 # ---- Section 10: Log rotation note ----
 # ponytail: journald user logs auto-rotate via /etc/systemd/journald.conf
