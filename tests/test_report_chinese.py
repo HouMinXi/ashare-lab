@@ -1,4 +1,4 @@
-"""Tests for Chinese mobile-first report format (D-72-06)."""
+"""Tests for Chinese mobile-first report format."""
 
 from dataclasses import replace
 

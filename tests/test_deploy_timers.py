@@ -17,7 +17,7 @@ def deploy_text() -> str:
 
 
 class TestTimerSchedules:
-    """OnCalendar values must match D-72-01 schedule."""
+    """OnCalendar values must match the deploy schedule."""
 
     def test_timer1_17_00(self, deploy_text: str) -> None:
         # Timer 1 description + OnCalendar block

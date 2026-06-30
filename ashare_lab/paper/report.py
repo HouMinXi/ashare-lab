@@ -17,7 +17,7 @@ from ashare_lab.paper.ledger import insert_report
 
 logger = logging.getLogger(__name__)
 
-# Section separator per D-72-06 (Unicode box-drawing U+2501)
+# Section separator (Unicode box-drawing U+2501)
 _SEP = "━━"
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -260,7 +260,7 @@ def format_chinese_report(
     report_data: ReportData,
     sentiment_section: str | None = None,
 ) -> str:
-    """Format report as Chinese mobile-first template per D-72-06."""
+    """Format report as Chinese mobile-first template."""
     rd = report_data
     lines: list[str] = []
 
@@ -336,7 +336,7 @@ def format_chinese_report(
     else:
         lines.append("✅ 风控正常")
 
-    # Sentiment section (Phase 5 carry-forward)
+    # Sentiment section (optional, appended when available)
     if sentiment_section is not None:
         lines.append("")
         lines.append(sentiment_section)
@@ -605,7 +605,7 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
 
     report_data = gather_report_data(conn, trade_date, stock_names, industry_map, config)
 
-    # sentiment section (Phase 5, fail-open: old DBs may lack table)
+    # sentiment section (fail-open: old DBs may lack table)
     sentiment_text = None
     try:
         sentiment_text = _format_sentiment_section(conn, trade_date, config)

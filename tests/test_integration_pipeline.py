@@ -1,8 +1,8 @@
-"""Integration tests for Phase 7.2 pipeline wiring.
+"""Integration tests for realtime data pipeline wiring.
 
-Verifies that Plan 01-03 components (fetcher, validator, report) work
-together through pipeline.py: stock name cache preference, Chinese
-report format, and data flow correctness.
+Verifies that fetcher, validator, and report components work together
+through pipeline.py: stock name cache preference, Chinese report
+format, and data flow correctness.
 """
 
 from __future__ import annotations
