@@ -65,7 +65,7 @@ sync_code_to_gpu() {
     touch "$STAGING/ashare_lab/research/__init__.py"
     cp "$REPO/configs/baseline.yaml" "$STAGING/configs/"
 
-    if ! scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"'H:/ashare-lab/'"; then
+    if ! scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/"; then
         echo "WARNING: GPU code sync failed (non-fatal)"
         rm -rf "$STAGING"
         return 1
