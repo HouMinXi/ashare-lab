@@ -4,8 +4,7 @@ import json
 from unittest.mock import patch, MagicMock
 import pytest
 from ashare_lab.paper.report import (
-    ReportData, gather_report_data, determine_report_mode,
-    format_simple_report, format_detailed_report, call_deepseek_summary,
+    ReportData, gather_report_data, format_chinese_report,
     split_report_text, send_text_ilink, send_pushplus, send_serverchan,
     deliver_report,
     generate_and_send_report, _get_secret
@@ -72,24 +71,6 @@ def test_gather_report_data_no_trade_day(db_conn, paper_config):
     assert rd.trade_count == 0
     assert len(rd.trades) == 0
 
-def test_determine_report_mode_daily_loss(populated_db, paper_config):
-    rd = gather_report_data(populated_db, "2025-01-06", {}, {}, {"paper": paper_config})
-    assert determine_report_mode(rd, {"daily_loss_pct": 0.01, "min_trade_count": 5}) == "detailed"
-
-def test_determine_report_mode_trade_count(populated_db, paper_config):
-    rd = gather_report_data(populated_db, "2025-01-06", {}, {}, {"paper": paper_config})
-    assert determine_report_mode(rd, {"daily_loss_pct": 0.1, "min_trade_count": 1}) == "detailed"
-
-def test_determine_report_mode_risk_triggered(populated_db, paper_config):
-    rd = gather_report_data(populated_db, "2025-01-06", {}, {}, {"paper": paper_config})
-    assert determine_report_mode(rd, {"daily_loss_pct": 0.1, "min_trade_count": 5}) == "detailed"
-
-def test_determine_report_mode_simple(db_conn, paper_config):
-    from ashare_lab.paper.ledger import record_nav
-    record_nav(db_conn, "2025-01-06", 300_000.0, 0.0, 300_000.0, None, None, None, None)
-    rd = gather_report_data(db_conn, "2025-01-06", {}, {}, {"paper": paper_config})
-    assert determine_report_mode(rd, {"daily_loss_pct": 0.1, "min_trade_count": 5}) == "simple"
-
 def test_stock_names_resolve_cache(populated_db, paper_config):
     rd = gather_report_data(populated_db, "2025-01-06", {"SZ000001": "TestBank"}, {}, {"paper": paper_config})
     assert rd.trades[0]["name"] == "TestBank"
@@ -128,7 +109,8 @@ def dummy_report_data():
             "qty": 100,
             "market_value": 1000.0,
             "unrealized_pnl": 100.0,
-            "weight": 0.33
+            "weight": 0.33,
+            "daily_change_pct": 0.01,
         }],
         pending_orders=[{
             "symbol": "SZ000002",
@@ -148,105 +130,14 @@ def dummy_report_data():
         industry_distribution={"Bank": 1}
     )
 
-def test_format_simple_report_s1(dummy_report_data):
-    txt = format_simple_report(dummy_report_data)
-    assert "2025-01-06 | 1 trades | NAV 300,000.00" in txt.split("\n\n")[0]
+def test_format_chinese_report_header(dummy_report_data):
+    txt = format_chinese_report(dummy_report_data)
+    assert "2025-01-06" in txt.split("\n")[0]
+    assert "ashare-lab" in txt
 
-def test_format_simple_report_s2(dummy_report_data):
-    txt = format_simple_report(dummy_report_data)
-    assert "NAV: 300,000.00 | daily: +1.50%" in txt
-
-def test_format_simple_report_s3(dummy_report_data):
-    txt = format_simple_report(dummy_report_data)
-    assert "SZ000001 Test1 | buy | 100 shares | 10.00 | fees 3.00" in txt
-
-def test_format_simple_report_s4(dummy_report_data):
-    txt = format_simple_report(dummy_report_data)
-    assert "SZ000002 Test2 | sell | 200 shares" in txt
-
-def test_format_simple_report_no_trade(dummy_report_data):
-    from dataclasses import replace
-    rd = replace(dummy_report_data, trade_count=0, trades=[])
-    txt = format_simple_report(rd)
-    assert "no trades today" in txt
-
-def test_format_detailed_report_match_sections(dummy_report_data):
-    txt = format_detailed_report(dummy_report_data, None)
-    assert "NAV: 300,000.00" in txt
-    assert "SZ000001 Test1 | 100 | 1,000.00 | 100.00 | 0.33%" in txt
-
-def test_format_detailed_report_risk_status(dummy_report_data):
-    txt = format_detailed_report(dummy_report_data, None)
-    assert "drawdown: 5.00% | halt: no" in txt
-
-def test_format_detailed_report_with_llm(dummy_report_data):
-    txt = format_detailed_report(dummy_report_data, "This is LLM.")
-    assert txt.startswith("This is LLM.\n\nNAV:")
-
-def test_format_detailed_report_without_llm(dummy_report_data):
-    txt = format_detailed_report(dummy_report_data, None)
-    assert txt.startswith("NAV:")
-
-def test_stock_name_display(dummy_report_data):
-    txt = format_simple_report(dummy_report_data)
-    assert "SZ000001 Test1" in txt
-
-# Deepseek tests
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_success(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    mock_post.return_value.status_code = 200
-    mock_post.return_value.json.return_value = {"choices": [{"message": {"content": "summary"}}]}
-    assert call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}}) == "summary"
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_error(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    mock_post.side_effect = Exception("error")
-    assert call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}}) is None
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_timeout(mock_sec, mock_post, dummy_report_data):
-    from requests.exceptions import Timeout
-    mock_sec.return_value = "token"
-    mock_post.side_effect = Timeout("timeout")
-    assert call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}}) is None
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_malformed(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    mock_post.return_value.json.side_effect = json.JSONDecodeError("msg", "doc", 0)
-    assert call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}}) is None
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_model_id(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    mock_post.return_value.json.return_value = {"choices": [{"message": {"content": "summary"}}]}
-    call_deepseek_summary(dummy_report_data, {"paper": {"report": {"deepseek_model": "deepseek-v4-flash"}}})
-    assert mock_post.call_args[1]["json"]["model"] == "deepseek-v4-flash"
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_payload(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}})
-    data = json.loads(mock_post.call_args[1]["json"]["messages"][1]["content"])
-    assert "nav" in data
-    assert "daily_return_pct" in data
-    assert "industry_distribution" in data
-    assert "risk_status" in data
-
-@patch("requests.post")
-@patch("ashare_lab.paper.report._get_secret")
-def test_call_deepseek_thinking(mock_sec, mock_post, dummy_report_data):
-    mock_sec.return_value = "token"
-    call_deepseek_summary(dummy_report_data, {"paper": {"report": {}}})
-    assert mock_post.call_args[1]["json"]["thinking"] == {"type": "disabled"}
+def test_format_chinese_report_risk_normal(dummy_report_data):
+    txt = format_chinese_report(dummy_report_data)
+    assert "✅" in txt  # checkmark
 
 @patch("subprocess.run")
 def test_get_secret(mock_run):
@@ -415,23 +306,23 @@ def test_deliver_report_retry_resumes_from_sent(mock_tsleep, mock_asleep, mock_i
 
 # Integration
 def test_generate_and_send_report_dry_run(populated_db, paper_config):
-    paper_config["report"] = {"detailed_triggers": {"daily_loss_pct": 0.02, "min_trade_count": 5}}
+    paper_config["report"] = {}
     rc = generate_and_send_report("2025-01-06", populated_db, {"paper": paper_config}, dry_run=True)
     assert rc == 0
     r = populated_db.execute("SELECT * FROM reports").fetchone()
     assert r["delivery_status"] == "dry_run"
 
 @patch("ashare_lab.paper.report.deliver_report")
-def test_generate_and_send_report_simple(mock_deliver, db_conn, paper_config):
+def test_generate_and_send_report_chinese_mode(mock_deliver, db_conn, paper_config):
     mock_deliver.return_value = "sent"
-    paper_config["report"] = {"detailed_triggers": {"daily_loss_pct": 0.02, "min_trade_count": 5}}
+    paper_config["report"] = {}
     from ashare_lab.paper.ledger import record_nav
     record_nav(db_conn, "2024-12-30", 300_000.0, 0.0, 300_000.0, None, None, None, None)
-    record_nav(db_conn, "2025-01-06", 50000.0, 250000.0, 300000.0, None, None, 3000.0, 5000.0) # total nav 300,000 = 0% return
+    record_nav(db_conn, "2025-01-06", 50000.0, 250000.0, 300000.0, None, None, 3000.0, 5000.0)
     rc = generate_and_send_report("2025-01-06", db_conn, {"paper": paper_config})
     assert rc == 0
     mock_deliver.assert_called()
-    assert mock_deliver.call_args[0][2] == "simple"
+    assert mock_deliver.call_args[0][2] == "chinese"
 
 
 def test_cli_report_args():

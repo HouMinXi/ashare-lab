@@ -153,7 +153,6 @@ def cmd_paper_report(args: argparse.Namespace) -> int:
         rc = generate_and_send_report(
             trade_date, conn, config,
             dry_run=getattr(args, "dry_run", False),
-            force_detailed=getattr(args, "detailed", False)
         )
         conn.commit()
         return rc

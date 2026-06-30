@@ -17,6 +17,9 @@ from ashare_lab.paper.ledger import insert_report
 
 logger = logging.getLogger(__name__)
 
+# Section separator per D-72-06 (Unicode box-drawing U+2501)
+_SEP = "━━"
+
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 EP_SEND_MESSAGE = "ilink/bot/sendmessage"
 CHANNEL_VERSION = "2.2.0"
@@ -150,6 +153,30 @@ def gather_report_data(
         ind = industry_map.get(sym, "Unknown")
         ind_dist[ind] = ind_dist.get(ind, 0) + 1
 
+    # Daily change per stock from qlib bin data
+    daily_changes: dict[str, float] = {}
+    if positions:
+        try:
+            from qlib.data import D
+            pos_syms = [p["symbol"] for p in positions]
+            df = D.features(
+                instruments=pos_syms,
+                fields=["$change"],
+                start_time=trade_date,
+                end_time=trade_date,
+            )
+            if df is not None and not df.empty:
+                for idx_tuple, row in df.iterrows():
+                    sym = idx_tuple[0] if isinstance(idx_tuple, tuple) else str(idx_tuple)
+                    val = row.iloc[0]
+                    if val == val:  # not NaN
+                        daily_changes[sym] = float(val)
+        except Exception as exc:
+            logger.warning("qlib daily change query failed: %s", exc)
+
+    for p in positions:
+        p["daily_change_pct"] = daily_changes.get(p["symbol"], 0.0)
+
     # Pending orders
     order_rows = conn.execute(
         "SELECT symbol, side, target_qty FROM orders "
@@ -229,107 +256,91 @@ def gather_report_data(
     )
 
 
-def determine_report_mode(report_data: ReportData, triggers_config: dict, sentiment_veto_hit: bool = False) -> str:
-    if sentiment_veto_hit:
-        return "detailed"
-    if report_data.daily_return_pct <= -triggers_config["daily_loss_pct"] * 100.0:
-        return "detailed"
-    if report_data.trade_count >= triggers_config["min_trade_count"]:
-        return "detailed"
-    rs = report_data.risk_status
-    if rs["buying_halted"] or rs["is_soft_reduced"] or rs["sell_order_count"] > 0:
-        return "detailed"
-    return "simple"
+def format_chinese_report(
+    report_data: ReportData,
+    sentiment_section: str | None = None,
+) -> str:
+    """Format report as Chinese mobile-first template per D-72-06."""
+    rd = report_data
+    lines: list[str] = []
 
+    # Header
+    lines.append(f"\U0001f4ca ashare-lab {rd.trade_date}")
+    lines.append("")
 
-def format_simple_report(report_data: ReportData) -> str:
-    sections = []
-    
-    # S1
-    sections.append(f"{report_data.trade_date} | {report_data.trade_count} trades | NAV {report_data.total_nav:,.2f}")
-    
-    # S2
-    s2 = (
-        f"NAV: {report_data.total_nav:,.2f} | daily: {report_data.daily_return_pct:+.2f}%\n"
-        f"cumulative: {report_data.cumulative_return_pct:+.2f}% | drawdown: {report_data.max_drawdown_pct:.2f}%\n"
-        f"cash: {report_data.cash_ratio:.1f}% | vs CSI1000: {report_data.benchmark_return_pct:+.2f}%"
+    # NAV + metrics
+    excess = rd.daily_return_pct - rd.benchmark_return_pct
+    lines.append(f"\U0001f4b0 净值 {rd.total_nav:,.2f} ({rd.daily_return_pct:+.2f}%)")
+    lines.append(
+        f"\U0001f4c8 累计 {rd.cumulative_return_pct:+.2f}% | "
+        f"回撤 {rd.max_drawdown_pct:.2f}% | "
+        f"现金 {rd.cash_ratio:.1f}%"
     )
-    sections.append(s2)
-    
-    # S3
-    if report_data.trade_count == 0:
-        sections.append("no trades today")
-    else:
-        s3_lines = []
-        for t in report_data.trades:
-            name = f"{t['symbol']} {t['name']}".strip()
-            s3_lines.append(f"{name} | {t['side']} | {t['qty']} shares | {t['price']:.2f} | fees {t['total_fee']:.2f}")
-        sections.append("\n".join(s3_lines))
-        
-    # S4
-    if not report_data.pending_orders:
-        sections.append("no pending orders")
-    else:
-        s4_lines = []
-        for o in report_data.pending_orders:
-            name = f"{o['symbol']} {o['name']}".strip()
-            s4_lines.append(f"{name} | {o['side']} | {o['qty']} shares")
-        sections.append("\n".join(s4_lines))
-        
-    return "\n\n".join(sections)
+    lines.append(f"\U0001f3af 超额 vs CSI1000 {excess:+.2f}%")
 
+    # Trades
+    if rd.trades:
+        lines.append("")
+        lines.append(f"{_SEP} 今日交易 {_SEP}")
+        for t in rd.trades:
+            name = t["name"] or t["symbol"]
+            if t["side"] == "buy":
+                lines.append(f"\U0001f7e2 买 {name} {t['qty']}股 @{t['price']:.2f}")
+            else:
+                lines.append(f"\U0001f534 卖 {name} {t['qty']}股 @{t['price']:.2f}")
 
-def format_detailed_report(report_data: ReportData, llm_summary: str | None, sentiment_section: str | None = None) -> str:
-    sections = []
-    
-    if llm_summary is not None:
-        sections.append(llm_summary)
-        
-    s2 = (
-        f"NAV: {report_data.total_nav:,.2f} | daily: {report_data.daily_return_pct:+.2f}%\n"
-        f"cumulative: {report_data.cumulative_return_pct:+.2f}% | drawdown: {report_data.max_drawdown_pct:.2f}%\n"
-        f"cash: {report_data.cash_ratio:.1f}% | vs CSI1000: {report_data.benchmark_return_pct:+.2f}%"
-    )
-    sections.append(s2)
-    
-    if report_data.trade_count == 0:
-        sections.append("no trades today")
-    else:
-        s3_lines = []
-        for t in report_data.trades:
-            name = f"{t['symbol']} {t['name']}".strip()
-            s3_lines.append(f"{name} | {t['side']} | {t['qty']} shares | {t['price']:.2f} | fees {t['total_fee']:.2f}")
-        sections.append("\n".join(s3_lines))
-        
-    if not report_data.positions:
-        sections.append("no positions")
-    else:
-        s4_lines = []
-        for p in report_data.positions:
-            name = f"{p['symbol']} {p['name']}".strip()
-            s4_lines.append(f"{name} | {p['qty']} | {p['market_value']:,.2f} | {p['unrealized_pnl']:,.2f} | {p['weight']:.2f}%")
-        sections.append("\n".join(s4_lines))
-        
-    if not report_data.pending_orders:
-        sections.append("no pending orders")
-    else:
-        s5_lines = []
-        for o in report_data.pending_orders:
-            name = f"{o['symbol']} {o['name']}".strip()
-            s5_lines.append(f"{name} | {o['side']} | {o['qty']} shares")
-        sections.append("\n".join(s5_lines))
-        
-    rs = report_data.risk_status
-    s6 = (
-        f"drawdown: {report_data.max_drawdown_pct:.2f}% | halt: {'yes' if rs['buying_halted'] else 'no'}\n"
-        f"soft reduction: {'yes' if rs['is_soft_reduced'] else 'no'} | cooldowns: {rs['cooldown_count']}"
-    )
-    sections.append(s6)
+    # Positions sorted by daily change desc
+    if rd.positions:
+        sorted_pos = sorted(rd.positions, key=lambda p: p.get("daily_change_pct", 0.0), reverse=True)
+        lines.append("")
+        lines.append(f"{_SEP} 持仓分布 ({len(sorted_pos)}只) {_SEP}")
+        for p in sorted_pos:
+            name = p["name"] or p["symbol"]
+            change = p.get("daily_change_pct", 0.0)
+            display_change = change * 100.0
+            if change > 0:
+                indicator = f"\U0001f53a+{display_change:.2f}%"
+            elif change < 0:
+                indicator = f"\U0001f53b{display_change:.2f}%"
+            else:
+                indicator = f" {display_change:.2f}%"
+            lines.append(f"{name}  {p['weight']:.1f}% {indicator}")
 
+    # Pending orders
+    if rd.pending_orders:
+        lines.append("")
+        lines.append(f"{_SEP} 明日计划 {_SEP}")
+        for o in rd.pending_orders:
+            name = o["name"] or o["symbol"]
+            if o["side"] == "buy":
+                lines.append(f"\U0001f7e2 拟买 {name} {o['qty']}股")
+            else:
+                lines.append(f"\U0001f534 拟卖 {name} {o['qty']}股")
+
+    # Risk status
+    lines.append("")
+    rs = rd.risk_status
+    any_risk = rs["buying_halted"] or rs["is_soft_reduced"] or rs.get("drawdown_halted", False) or rs.get("regime_halted", False)
+    if any_risk:
+        warnings = []
+        if rs.get("drawdown_halted"):
+            warnings.append("回撤暂停")
+        if rs.get("regime_halted"):
+            warnings.append("市场放缓")
+        if rs["is_soft_reduced"]:
+            warnings.append("软减仓")
+        if rs["buying_halted"] and not warnings:
+            warnings.append("买入暂停")
+        lines.append(f"⚠️ {' | '.join(warnings)}")
+    else:
+        lines.append("✅ 风控正常")
+
+    # Sentiment section (Phase 5 carry-forward)
     if sentiment_section is not None:
-        sections.append(sentiment_section)
+        lines.append("")
+        lines.append(sentiment_section)
 
-    return "\n\n".join(sections)
+    return "\n".join(lines)
 
 
 def _format_sentiment_section(conn: sqlite3.Connection, trade_date: str, config: dict) -> str | None:
@@ -359,54 +370,6 @@ def _get_secret(key: str) -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning("Failed to get secret for %s: %s", key, e)
         raise
-
-
-def call_deepseek_summary(report_data: ReportData, config: dict) -> str | None:
-    try:
-        import requests
-    except ImportError:
-        return None
-
-    try:
-        api_key = _get_secret("ashare/deepseek-api-key")
-    except Exception:
-        return None
-
-    model = config["paper"]["report"].get("deepseek_model", "deepseek-v4-flash")
-    timeout = config["paper"]["report"].get("deepseek_timeout", 30)
-
-    data = {
-        "date": report_data.trade_date,
-        "nav": report_data.total_nav,
-        "daily_return_pct": report_data.daily_return_pct,
-        "position_count": len(report_data.positions),
-        "trade_count": report_data.trade_count,
-        "industry_distribution": report_data.industry_distribution,
-        "risk_status": {
-            "buying_halted": report_data.risk_status["buying_halted"],
-            "is_soft_reduced": report_data.risk_status["is_soft_reduced"],
-        }
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "用一句中文总结今日组合表现，包含主要驱动因素"},
-                    {"role": "user", "content": json.dumps(data, ensure_ascii=False)}
-                ],
-                "thinking": {"type": "disabled"}
-            },
-            timeout=timeout
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.warning("deepseek summary failed: %s", e)
-        return None
 
 
 def split_report_text(text: str, max_length: int = 4000) -> list[str]:
@@ -621,7 +584,7 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     return "failed"
 
 
-def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False, force_detailed: bool = False) -> int:
+def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False) -> int:
     nav_check = conn.execute("SELECT 1 FROM nav WHERE trade_date=?", (trade_date,)).fetchone()
     if not nav_check:
         logger.warning("No data for %s", trade_date)
@@ -641,32 +604,15 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
 
     report_data = gather_report_data(conn, trade_date, stock_names, industry_map, config)
 
-    # sentiment section for D7 (fail-open: old DBs may lack sentiment tables)
-    sentiment_veto_hit = False
+    # sentiment section (Phase 5, fail-open: old DBs may lack table)
     sentiment_text = None
     try:
-        veto_count = conn.execute(
-            "SELECT COUNT(*) FROM sentiment_events "
-            "WHERE event_type='veto' AND trade_date=?",
-            (trade_date,),
-        ).fetchone()[0]
-        sentiment_veto_hit = veto_count > 0
         sentiment_text = _format_sentiment_section(conn, trade_date, config)
     except Exception:
         pass
 
-    mode = "detailed" if force_detailed else determine_report_mode(
-        report_data, config["paper"]["report"]["detailed_triggers"],
-        sentiment_veto_hit=sentiment_veto_hit,
-    )
-
-    if mode == "simple":
-        report_text = format_simple_report(report_data)
-    else:
-        llm_summary = call_deepseek_summary(report_data, config)
-        if llm_summary is None:
-            logger.warning("deepseek summary unavailable for %s, detailed report will omit D1 section", trade_date)
-        report_text = format_detailed_report(report_data, llm_summary, sentiment_section=sentiment_text)
+    mode = "chinese"
+    report_text = format_chinese_report(report_data, sentiment_section=sentiment_text)
 
     if dry_run:
         insert_report(conn, trade_date, mode, report_text, None, "dry_run")
