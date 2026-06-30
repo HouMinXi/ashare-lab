@@ -53,6 +53,35 @@ else
     echo "WARNING: no data stamp found, proceeding anyway"
 fi
 
+# ---- Step 2b: Sync code to GPU (guard: predict.py must have --provider-uri) ----
+
+sync_code_to_gpu() {
+    local STAGING="/tmp/gpu-deploy"
+    rm -rf "$STAGING"
+    mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
+    cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/config.py" "$STAGING/ashare_lab/"
+    touch "$STAGING/ashare_lab/__init__.py"
+    touch "$STAGING/ashare_lab/research/__init__.py"
+    cp "$REPO/configs/baseline.yaml" "$STAGING/configs/"
+
+    if ! scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"'H:/ashare-lab/'"; then
+        echo "WARNING: GPU code sync failed (non-fatal)"
+        rm -rf "$STAGING"
+        return 1
+    fi
+    rm -rf "$STAGING"
+
+    # Guard: verify GPU predict.py accepts --provider-uri
+    if ! ssh -o ConnectTimeout=5 "${GPU_USER}@${GPU_HOST}" \
+        "cd /d H:\\ashare-lab && python -m ashare_lab.research.predict --help" 2>&1 | grep -q "provider-uri"; then
+        echo "ERROR: GPU predict.py missing --provider-uri after sync"
+        return 1
+    fi
+    echo "GPU code synced and verified"
+    return 0
+}
+
 # ---- Step 3: GPU inference with retry (B6: retry GPU BEFORE pipeline) ----
 
 try_gpu_inference() {
@@ -83,6 +112,9 @@ try_gpu_inference() {
         fi
         sleep 5
     done
+
+    # Sync code to GPU before inference
+    sync_code_to_gpu || echo "WARNING: code sync failed, proceeding with existing GPU code"
 
     # Run predict.py on GPU
     if ! timeout $GPU_PREDICT_TIMEOUT ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
