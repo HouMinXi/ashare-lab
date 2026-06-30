@@ -143,20 +143,28 @@ def test_positions_sorted_by_change_desc(base_report):
 
 def test_positive_change_up_triangle(base_report):
     text = format_chinese_report(base_report)
-    # PingAn has +5% change, should have up-triangle U+1F53A
+    # Find PingAn in positions section (after header), not in trades
+    in_pos = False
     for line in text.split("\n"):
-        if "PingAn" in line:
+        if "持仓" in line:
+            in_pos = True
+            continue
+        if in_pos and "PingAn" in line:
             assert "\U0001f53a" in line
             assert "5.00%" in line
             break
     else:
-        pytest.fail("PingAn line not found")
+        pytest.fail("PingAn position line not found")
 
 
 def test_negative_change_down_triangle(base_report):
     text = format_chinese_report(base_report)
+    in_pos = False
     for line in text.split("\n"):
-        if "WanKe" in line and "持仓" not in line:
+        if "持仓" in line:
+            in_pos = True
+            continue
+        if in_pos and "WanKe" in line:
             assert "\U0001f53b" in line
             assert "3.00%" in line
             break
