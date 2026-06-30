@@ -90,9 +90,13 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         for w in result.warnings:
             log.warning("validation: %s", w)
 
-    with tempfile.TemporaryDirectory() as tmp_csv_dir:
-        _write_csvs(tushare_data, Path(tmp_csv_dir))
-        _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
+    try:
+        with tempfile.TemporaryDirectory() as tmp_csv_dir:
+            _write_csvs(tushare_data, Path(tmp_csv_dir))
+            _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
+    except Exception as exc:
+        log.error("write/dump failed: %s", exc)
+        return 1
 
     log.info("fetch-today complete for %s (%d symbols)", trade_date, len(tushare_data))
     return 0
