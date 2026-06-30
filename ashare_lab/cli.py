@@ -58,7 +58,7 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         print("not a trading day")
         return 0
 
-    trade_date = latest_trading_day(today)
+    trade_date = str(latest_trading_day(today))
 
     try:
         tushare_data = fetch_today_data(trade_date)
@@ -113,7 +113,7 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
         print("not a trading day")
         return 0
 
-    trade_date = latest_trading_day(today)
+    trade_date = str(latest_trading_day(today))
 
     try:
         import qlib  # noqa: PLC0415
@@ -147,7 +147,7 @@ def cmd_chenditc_diff(args: argparse.Namespace) -> int:
     import json as _json  # noqa: PLC0415
     from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
 
-    trade_date = latest_trading_day(dt.date.today())
+    trade_date = str(latest_trading_day(dt.date.today()))
     snap_path = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
 
     if not snap_path.exists():
