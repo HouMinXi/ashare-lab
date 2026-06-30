@@ -118,12 +118,30 @@ def _load_st_cache(
 
 
 def _load_stock_names_cache(symbols: set[str]) -> dict[str, str] | None:
-    """Load stock names from cache CSV."""
-    path = _BS_CACHE_DIR / "stock_names.csv"
-    if not path.exists():
+    """Load stock names from cache CSV.
+
+    Prefers tushare-based cache (symbol,name columns) written by
+    fetcher.refresh_stock_names_cache. Falls back to legacy baostock
+    cache (code,code_name columns) for backward compatibility.
+    """
+    # Tushare cache: symbol column already in qlib format (e.g. sz000001)
+    ts_path = PROJECT_ROOT / "data" / "stock_names_cache.csv"
+    if ts_path.exists():
+        result: dict[str, str] = {}
+        with open(ts_path, newline="") as f:
+            for row in csv.DictReader(f):
+                sym = row.get("symbol", "")
+                if sym in symbols:
+                    result[sym] = row.get("name", "")
+        if result:
+            return result
+
+    # Baostock fallback: code column uses baostock format (sh.600006)
+    bs_path = _BS_CACHE_DIR / "stock_names.csv"
+    if not bs_path.exists():
         return None
-    result: dict[str, str] = {}
-    with open(path, newline="") as f:
+    result = {}
+    with open(bs_path, newline="") as f:
         for row in csv.DictReader(f):
             sym = _bs_code_to_universe(row["code"], symbols)
             if sym:
