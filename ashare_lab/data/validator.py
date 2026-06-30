@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass, field
+
+# Match A-share ST prefixes: "*ST" or "ST" followed by a non-ASCII-letter char
+# (Chinese name, digit, space). Avoids false positives like "STKN Holdings".
+_ST_PATTERN = re.compile(r"^\*?ST(?:[^\x41-\x5a\x61-\x7a]|$)")
 
 log = logging.getLogger(__name__)
 
@@ -37,12 +42,11 @@ def _change_limit(symbol: str, stock_names: dict[str, str] | None) -> float:
 
     Returns fractional limit (e.g. 0.10 for 10%).
     """
-    # ST detection via stock name.
-    # Match "*ST", "ST " (with trailing space), or exact "ST"/"*ST" to avoid
-    # false positives on unrelated names that happen to contain "ST" (e.g. "STKN").
+    # ST detection via stock name using _ST_PATTERN.
+    # Correctly handles "ST华英", "*ST重工" (Chinese directly after ST, no space).
     if stock_names:
         name = stock_names.get(symbol, "")
-        if name == "ST" or name == "*ST" or name.startswith("*ST") or name.startswith("ST "):
+        if _ST_PATTERN.match(name):
             return 0.05
 
     # Extract numeric code from qlib symbol (e.g. 'sz300999' -> '300999')

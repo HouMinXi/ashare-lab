@@ -423,7 +423,6 @@ def main() -> int:
 
     p_report = paper_sub.add_parser("report", help="generate and send daily report")
     p_report.add_argument("--date", help="trade date YYYY-MM-DD (default: latest settled)")
-    p_report.add_argument("--detailed", action="store_true", help="force detailed mode")
     p_report.add_argument("--dry-run", action="store_true", help="generate only, skip delivery")
 
     p_sentiment = paper_sub.add_parser("sentiment", help="run sentiment veto check")

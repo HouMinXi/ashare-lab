@@ -274,6 +274,27 @@ def test_st_false_positive_avoided():
     assert result != 0.05, "STKN Holdings should not be flagged as ST"
 
 
+def test_st_chinese_name_flagged():
+    """'ST华英' (ST directly followed by Chinese, no space) triggers 5% limit."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("sz000994", {"sz000994": "ST华英"}) == 0.05
+    assert _change_limit("sz000993", {"sz000993": "*ST重工"}) == 0.05
+
+
+def test_st_on_gem_board_overrides_20pct_limit():
+    """ST stock on GEM (300xxx) uses 5% limit, not the board's 20% limit."""
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    # 300xxx GEM board, normally 20% limit; ST override must apply 5%
+    data["sz300888"] = _make_stock_df(change=0.06)
+    names = {"sz300888": "*ST Example"}
+    result = validate_daily_data(data, "2026-06-26", stock_names=names)
+    warns = [w for w in result.warnings if "sz300888" in w]
+    assert len(warns) > 0, "ST stock on GEM must use 5% limit, not 20%"
+
+
 def test_nan_in_change_column_skipped_gracefully():
     """NaN in 'change' column: limit check is skipped silently, no crash, no spurious warning."""
     from ashare_lab.data.validator import validate_daily_data
