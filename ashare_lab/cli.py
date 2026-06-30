@@ -6,9 +6,12 @@ import argparse
 import json
 import logging
 import sys
+import tempfile
+from pathlib import Path
 
-from ashare_lab.data.fallback import gap_fill
-from ashare_lab.data.update import bootstrap, daily_refresh
+from ashare_lab.config import PROJECT_ROOT
+from ashare_lab.data.fallback import gap_fill, _write_csvs, _dump_bin_update
+from ashare_lab.data.update import bootstrap, daily_refresh, DEFAULT_PROVIDER_URI
 from ashare_lab.data.validate import (
     check_return_consistency,
     spot_check_raw,
@@ -37,6 +40,62 @@ def cmd_update(args: argparse.Namespace) -> int:
     except Exception as exc:
         log.error("update failed: %s", exc)
         return 2
+
+
+def cmd_fetch_today(args: argparse.Namespace) -> int:
+    import datetime as dt  # noqa: PLC0415
+    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
+    from ashare_lab.data.fetcher import (  # noqa: PLC0415
+        fetch_today_data,
+        fetch_cross_validation_sample,
+        refresh_stock_names_cache,
+        CSI1000_SAMPLE_SYMBOLS,
+    )
+    from ashare_lab.data.validator import validate_daily_data  # noqa: PLC0415
+
+    today = dt.date.today()
+    if not is_trading_day(today):
+        print("not a trading day")
+        return 0
+
+    trade_date = latest_trading_day(today)
+
+    try:
+        tushare_data = fetch_today_data(trade_date)
+    except RuntimeError as exc:
+        log.error("fetch_today_data failed: %s", exc)
+        return 1
+
+    cross_val_data: dict = {}
+    try:
+        cross_val_data = fetch_cross_validation_sample(
+            trade_date, CSI1000_SAMPLE_SYMBOLS
+        )
+    except Exception as exc:
+        log.warning("cross-validation fetch failed (non-fatal): %s", exc)
+
+    names_cache = PROJECT_ROOT / "data" / "stock_names_cache.csv"
+    stock_names: dict[str, str] | None = None
+    try:
+        stock_names = refresh_stock_names_cache(names_cache)
+    except Exception as exc:
+        log.warning("stock name cache refresh failed (non-fatal): %s", exc)
+
+    result = validate_daily_data(
+        tushare_data, trade_date,
+        cross_val_data=cross_val_data or None,
+        stock_names=stock_names,
+    )
+    if not result.passed:
+        for w in result.warnings:
+            log.warning("validation: %s", w)
+
+    with tempfile.TemporaryDirectory() as tmp_csv_dir:
+        _write_csvs(tushare_data, Path(tmp_csv_dir))
+        _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
+
+    log.info("fetch-today complete for %s (%d symbols)", trade_date, len(tushare_data))
+    return 0
 
 
 def cmd_backfill(args: argparse.Namespace) -> int:
@@ -228,6 +287,7 @@ def main() -> int:
 
     sub.add_parser("bootstrap", help="first-time data download")
     sub.add_parser("update", help="daily data refresh")
+    sub.add_parser("fetch-today", help="tushare same-day fetch + qlib dump_update")
     sub.add_parser("validate", help="cross-source spot-check")
 
     p_backfill = sub.add_parser("backfill", help="gap-fill missing dates from baostock")
@@ -291,6 +351,7 @@ def main() -> int:
     commands = {
         "bootstrap": cmd_bootstrap,
         "update": cmd_update,
+        "fetch-today": cmd_fetch_today,
         "validate": cmd_validate,
         "backfill": cmd_backfill,
     }

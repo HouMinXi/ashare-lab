@@ -1,5 +1,5 @@
 #!/bin/bash
-# ashare-pipeline.sh -- Timer 2 wrapper (01:00 CST)
+# ashare-pipeline.sh -- Timer 2 wrapper (18:00 CST)
 # Trading day check -> GPU inference (retry-first) -> stale fallback ->
 # pipeline with ASHARE_USE_STALE env -> pipeline retry -> alert.
 # No set -e: explicit error checks preserve retry/alert flow (R4H1).

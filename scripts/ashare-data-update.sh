@@ -1,5 +1,5 @@
 #!/bin/bash
-# ashare-data-update.sh -- Timer 1 wrapper (00:30 CST)
+# ashare-data-update.sh -- Timer 1 wrapper (17:00 CST)
 # Updates market data, writes atomic sentinel stamp, alerts on failure.
 # No set -e: explicit error checks preserve retry/alert flow (R4H1).
 set -uo pipefail
@@ -38,7 +38,7 @@ rm -f "$STAMP"
 
 rc=1
 for attempt in 1 2; do
-    python3 -m ashare_lab.cli update 2>"$STDERR_LOG"
+    python3 -m ashare_lab.cli fetch-today 2>"$STDERR_LOG"
     rc=$?
     if [ $rc -eq 0 ]; then
         date -Iseconds > "${STAMP}.tmp"
