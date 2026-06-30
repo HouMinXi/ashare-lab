@@ -49,11 +49,16 @@ def _change_limit(symbol: str, stock_names: dict[str, str] | None) -> float:
         if _ST_PATTERN.match(name):
             return 0.05
 
-    # Extract numeric code from qlib symbol (e.g. 'sz300999' -> '300999')
+    # Extract exchange prefix and numeric code
+    exchange = symbol[:2]
     code = symbol[2:]
 
-    # GEM (300xxx) and STAR (688xxx): 20% limit
-    if code.startswith("300") or code.startswith("688"):
+    # BJ (Beijing Exchange 43/83/87/92xxxx): 30% limit
+    if exchange == "bj":
+        return 0.30
+
+    # GEM (300xxx, 301xxx) and STAR (688xxx): 20% limit
+    if code.startswith("30") or code.startswith("688"):
         return 0.20
 
     # Default mainboard: 10%

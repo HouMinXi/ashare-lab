@@ -314,6 +314,45 @@ def test_nan_in_change_column_skipped_gracefully():
     assert result.passed is True
 
 
+def test_gem_301xxx_uses_20pct_limit():
+    """GEM registration-based (301xxx) uses 20% limit, not mainboard 10%."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("sz301607", None) == 0.20
+    assert _change_limit("sz301520", None) == 0.20
+
+
+def test_bj_stock_uses_30pct_limit():
+    """Beijing Exchange stocks use 30% daily limit."""
+    from ashare_lab.data.validator import _change_limit
+
+    assert _change_limit("bj920072", None) == 0.30
+    assert _change_limit("bj430047", None) == 0.30
+    assert _change_limit("bj830799", None) == 0.30
+
+
+def test_bj_over_30pct_flagged():
+    """BJ stock with change > 30% is flagged."""
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    data["bj920222"] = _make_stock_df(change=0.31)
+    result = validate_daily_data(data, "2026-06-26")
+    warns = [w for w in result.warnings if "bj920222" in w]
+    assert len(warns) > 0
+
+
+def test_bj_under_30pct_not_flagged():
+    """BJ stock with change < 30% is not flagged."""
+    from ashare_lab.data.validator import validate_daily_data
+
+    data = _make_data(5500)
+    data["bj920222"] = _make_stock_df(change=0.25)
+    result = validate_daily_data(data, "2026-06-26")
+    warns = [w for w in result.warnings if "bj920222" in w and "exceeds" in w]
+    assert len(warns) == 0
+
+
 def test_negative_change_exceeds_mainboard_limit_flagged():
     """Negative change exceeding mainboard 10% limit is flagged."""
     from ashare_lab.data.validator import validate_daily_data
