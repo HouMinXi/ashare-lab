@@ -387,15 +387,33 @@ class TestWindowSelection:
         with pytest.raises(ValueError, match="no trained model"):
             predict_for_date(trade_date)
 
-    def test_missing_model_file_raises_filenotfounderror(
+    def test_missing_model_file_falls_back_to_latest(
         self, monkeypatch, tmp_path
     ):
+        """When w{N}.pt is missing but latest.pt exists, use latest.pt."""
         trade_date = "2021-12-01"
         pred_df = _make_pred_df(trade_date)
         _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
 
-        # Delete the expected model file.
+        # Delete the window model but keep latest.pt
         (tmp_path / "models" / "w1.pt").unlink()
+
+        from ashare_lab.research.predict import predict_for_date
+
+        # Should succeed using latest.pt fallback, not raise
+        predict_for_date(trade_date)
+
+    def test_missing_all_models_raises_filenotfounderror(
+        self, monkeypatch, tmp_path
+    ):
+        """When both w{N}.pt and latest.pt are missing, raise."""
+        trade_date = "2021-12-01"
+        pred_df = _make_pred_df(trade_date)
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        # Delete both the window model and the fallback
+        (tmp_path / "models" / "w1.pt").unlink()
+        (tmp_path / "models" / "latest.pt").unlink()
 
         from ashare_lab.research.predict import predict_for_date
 

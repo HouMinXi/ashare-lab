@@ -95,6 +95,13 @@ def predict_for_date(
 
     if model_path is None:
         model_path = MODELS_DIR / f"w{window_id}.pt"
+        if not model_path.exists():
+            # Window's model not yet trained; fall back to latest.pt
+            fallback = MODELS_DIR / "latest.pt"
+            if fallback.exists():
+                log.warning("w%d.pt missing, falling back to latest.pt", window_id)
+                model_path = fallback
+            # else: let the FileNotFoundError below fire with the original path
 
     if not model_path.exists():
         raise FileNotFoundError(
