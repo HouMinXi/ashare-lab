@@ -37,10 +37,12 @@ def _change_limit(symbol: str, stock_names: dict[str, str] | None) -> float:
 
     Returns fractional limit (e.g. 0.10 for 10%).
     """
-    # ST detection via stock name
+    # ST detection via stock name.
+    # Match "*ST", "ST " (with trailing space), or exact "ST"/"*ST" to avoid
+    # false positives on unrelated names that happen to contain "ST" (e.g. "STKN").
     if stock_names:
         name = stock_names.get(symbol, "")
-        if "ST" in name:
+        if name == "ST" or name == "*ST" or name.startswith("*ST") or name.startswith("ST "):
             return 0.05
 
     # Extract numeric code from qlib symbol (e.g. 'sz300999' -> '300999')

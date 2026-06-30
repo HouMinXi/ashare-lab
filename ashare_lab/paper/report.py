@@ -297,6 +297,7 @@ def format_chinese_report(
         for p in sorted_pos:
             name = p["name"] or p["symbol"]
             change = p.get("daily_change_pct", 0.0)
+            # $change from qlib is fractional return (e.g. 0.05 = 5%); multiply by 100 for display
             display_change = change * 100.0
             if change > 0:
                 indicator = f"\U0001f53a+{display_change:.2f}%"
