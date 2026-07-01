@@ -317,28 +317,41 @@ def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
     result = {"csi300": 0.0, "csi1000": 0.0}
     indices = [("sh.000300", "csi300"), ("sh.000852", "csi1000")]
 
-    login_result = bs.login()
-    if login_result.error_code != "0":
-        logger.warning("baostock login failed: %s", login_result.error_msg)
-        return result
+    import signal as _signal  # noqa: PLC0415
 
+    def _baostock_timeout_handler(signum, frame):
+        raise TimeoutError("baostock query timed out")
+
+    old_handler = _signal.signal(_signal.SIGALRM, _baostock_timeout_handler)
+    _signal.alarm(30)  # 30s ceiling for all baostock calls
     try:
-        for code, key in indices:
-            rs = bs.query_history_k_data_plus(
-                code,
-                "close",
-                start_date=trade_date,
-                end_date=trade_date,
-                frequency="d",
-            )
-            while rs.error_code == "0" and rs.next():
-                row = rs.get_row_data()
-                try:
-                    result[key] = float(row[0])
-                except (IndexError, ValueError, TypeError):
-                    pass
+        login_result = bs.login()
+        if login_result.error_code != "0":
+            logger.warning("baostock login failed: %s", login_result.error_msg)
+            return result
+
+        try:
+            for code, key in indices:
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    "close",
+                    start_date=trade_date,
+                    end_date=trade_date,
+                    frequency="d",
+                )
+                while rs.error_code == "0" and rs.next():
+                    row = rs.get_row_data()
+                    try:
+                        result[key] = float(row[0])
+                    except (IndexError, ValueError, TypeError):
+                        pass
+        finally:
+            bs.logout()
+    except TimeoutError:
+        logger.warning("baostock timed out after 30s, benchmark unavailable")
     finally:
-        bs.logout()
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old_handler)
 
     return result
 
