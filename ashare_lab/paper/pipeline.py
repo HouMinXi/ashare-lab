@@ -465,6 +465,8 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     if cal_last and cal_last >= ctx.trade_date:
         logger.info("qlib data already covers %s (cal=%s), skipping chenditc", ctx.trade_date, cal_last)
+        import qlib  # noqa: PLC0415
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
         return -1
 
     try:
