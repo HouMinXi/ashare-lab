@@ -473,8 +473,12 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
     ) as resp:
         if resp.status != 200:
             resp_body = await resp.text()
-            raise RuntimeError(f"iLink error {resp.status}: {resp_body[:200]}")
-        return await resp.json(content_type=None)
+            raise RuntimeError(f"iLink HTTP {resp.status}: {resp_body[:200]}")
+        result = await resp.json(content_type=None)
+        ret_code = result.get("ret", 0)
+        if ret_code != 0:
+            raise RuntimeError(f"iLink API ret={ret_code} (token expired or invalid)")
+        return result
 
 
 def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bool:
