@@ -565,33 +565,22 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         | ctx.ipo_listing_syms
     )
 
-    # 5c. ST names
+    # 5c. ST names -- use tushare stock_names_cache + regex (no baostock)
+    from ashare_lab.data.validator import _ST_PATTERN  # noqa: PLC0415
     st_cached = _load_st_cache(ctx.trade_date, ctx.fetch_symbols)
     if st_cached is not None:
         ctx.st_names = st_cached
         logger.debug("ST names from cache for %s", ctx.trade_date)
     else:
         ctx.st_names = set()
-        try:
-            import baostock as bs  # noqa: PLC0415
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                for sym in ctx.fetch_symbols:
-                    code = sym.lower()
-                    if len(code) == 6:
-                        prefix = "sh" if code.startswith("6") else "sz"
-                        code = f"{prefix}.{code}"
-                    elif not code.startswith(("sh.", "sz.")):
-                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                        code = f"{prefix}.{sym[-6:]}"
-                    rs = bs.query_stock_basic(code=code, code_name="")
-                    while rs.error_code == "0" and rs.next():
-                        row_data = rs.get_row_data()
-                        if len(row_data) > 1 and "ST" in str(row_data[1]).upper():
-                            ctx.st_names.add(sym)
-                bs.logout()
-        except ImportError:
-            logger.warning("baostock not installed, ST detection unavailable")
+        names = _load_stock_names_cache(ctx.fetch_symbols)
+        if names:
+            for sym, name in names.items():
+                if _ST_PATTERN.match(name):
+                    ctx.st_names.add(sym)
+            logger.info("ST detection from stock_names_cache: %d ST stocks", len(ctx.st_names))
+        else:
+            logger.warning("no stock name cache available, ST detection skipped")
 
     # Prices from qlib
     ctx.prices = {}
@@ -621,7 +610,7 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
     # 5d. benchmarks
     ctx.benchmarks = _fetch_benchmark_closes(ctx.trade_date)
 
-    # 5e. CSI1000 11-day closes for regime check
+    # 5e. CSI1000 11-day closes for regime check (qlib, no baostock)
     regime_cached = _load_regime_cache(ctx.trade_date)
     if regime_cached is not None:
         ctx.csi1000_closes_11d = regime_cached
@@ -630,26 +619,19 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         ctx.csi1000_closes_11d = []
         start_60d = (dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=60)).isoformat()
         try:
-            import baostock as bs  # noqa: PLC0415
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                rs = bs.query_history_k_data_plus(
-                    "sh.000852", "close",
-                    start_date=start_60d, end_date=ctx.trade_date, frequency="d",
-                )
-                closes: list[float] = []
-                while rs.error_code == "0" and rs.next():
-                    row_data = rs.get_row_data()
-                    try:
-                        closes.append(float(row_data[0]))
-                    except (IndexError, ValueError, TypeError):
-                        pass
+            regime_df = D.features(
+                instruments=["SH000852"],
+                fields=["$close"],
+                start_time=start_60d,
+                end_time=ctx.trade_date,
+            )
+            if regime_df is not None and not regime_df.empty:
+                closes = [float(v) for v in regime_df["$close"].dropna().values]
                 ctx.csi1000_closes_11d = closes[-11:] if len(closes) >= 11 else closes
-                bs.logout()
-        except ImportError:
-            pass
+        except Exception as exc:
+            logger.warning("CSI1000 regime query failed: %s", exc)
 
-    # 5f. industry map
+    # 5f. industry map (baostock with 30s timeout ceiling)
     ind_cached = _load_industry_cache(ctx.trade_date, ctx.fetch_symbols)
     if ind_cached is not None:
         ctx.industry_map = ind_cached
@@ -658,22 +640,37 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         ctx.industry_map = {}
         try:
             import baostock as bs  # noqa: PLC0415
-            login_r = bs.login()
-            if login_r.error_code == "0":
-                for sym in ctx.fetch_symbols:
-                    code = sym.lower()
-                    if len(code) == 6:
-                        prefix = "sh" if code.startswith("6") else "sz"
-                        code = f"{prefix}.{code}"
-                    elif not code.startswith(("sh.", "sz.")):
-                        prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
-                        code = f"{prefix}.{sym[-6:]}"
-                    rs = bs.query_stock_industry(code=code, date=ctx.trade_date)
-                    while rs.error_code == "0" and rs.next():
-                        row_data = rs.get_row_data()
-                        if len(row_data) > 3 and row_data[3]:
-                            ctx.industry_map[sym] = row_data[3]
-                bs.logout()
+            import signal as _signal  # noqa: PLC0415
+
+            def _ind_timeout(signum, frame):
+                raise TimeoutError("industry baostock timed out")
+
+            old_h = _signal.signal(_signal.SIGALRM, _ind_timeout)
+            _signal.alarm(30)
+            try:
+                login_r = bs.login()
+                if login_r.error_code == "0":
+                    try:
+                        for sym in ctx.fetch_symbols:
+                            code = sym.lower()
+                            if len(code) == 6:
+                                prefix = "sh" if code.startswith("6") else "sz"
+                                code = f"{prefix}.{code}"
+                            elif not code.startswith(("sh.", "sz.")):
+                                prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                                code = f"{prefix}.{sym[-6:]}"
+                            rs = bs.query_stock_industry(code=code, date=ctx.trade_date)
+                            while rs.error_code == "0" and rs.next():
+                                row_data = rs.get_row_data()
+                                if len(row_data) > 3 and row_data[3]:
+                                    ctx.industry_map[sym] = row_data[3]
+                    finally:
+                        bs.logout()
+            except TimeoutError:
+                logger.warning("industry baostock timed out after 30s, partial map (%d entries)", len(ctx.industry_map))
+            finally:
+                _signal.alarm(0)
+                _signal.signal(_signal.SIGALRM, old_h)
         except ImportError:
             pass
 
