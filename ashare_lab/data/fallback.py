@@ -11,10 +11,10 @@ every ``fallback.max_symbols_per_session`` symbols (from pipeline.yaml).
 
 from __future__ import annotations
 
+import csv as csv_mod
 import datetime as dt
 import logging
-import subprocess
-import sys
+import struct
 import tempfile
 from pathlib import Path
 
@@ -262,48 +262,96 @@ def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
     return count
 
 
-def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
-    """Invoke qlib's dump_bin update to append CSV data to binary feature files.
+def _extend_instrument_end_dates(
+    inst_dir: Path, traded_syms: set[str], latest: str
+) -> None:
+    """Update instrument files so end_date covers *latest* for traded symbols."""
+    for inst_file in inst_dir.glob("*.txt"):
+        lines = inst_file.read_text(encoding="utf-8").splitlines()
+        new_lines: list[str] = []
+        changed = False
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[0] in traded_syms and parts[2] < latest:
+                parts[2] = latest
+                changed = True
+            new_lines.append("\t".join(parts))
+        if changed:
+            inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
-    Runs ``python -m qlib.scripts.dump_bin update`` as a subprocess so that
-    qlib's internal cached provider state does not interfere with the current
-    process.
+
+def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
+    """Append daily CSV data to qlib binary feature files.
+
+    Directly writes little-endian float32 values into the binary store,
+    appends new dates to the calendar, and extends instrument end-dates.
+    Replaces the previous ``qlib.scripts.dump_bin update`` subprocess
+    which silently produced no output on the copied qlib.scripts module.
 
     Args:
         csv_dir: Directory containing per-symbol ``{SYMBOL}.csv`` files.
         provider_uri: qlib data root to update in-place.
 
     Raises:
-        RuntimeError: dump_bin exits non-zero.
+        RuntimeError: No CSV files found or no instruments updated.
     """
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "qlib.scripts.dump_bin",
-            "update",
-            "--csv_path",
-            str(csv_dir),
-            "--qlib_dir",
-            str(provider_uri),
-            "--freq",
-            "day",
-            "--include_fields",
-            ",".join(c for c in _CSV_COLUMNS if c != "date"),
-            "--date_col_name",
-            "date",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=600,
+    feat_dir = provider_uri / "features"
+    cal_path = provider_uri / "calendars" / "day.txt"
+    inst_dir = provider_uri / "instruments"
+
+    csv_files = list(csv_dir.glob("*.csv"))
+    if not csv_files:
+        raise RuntimeError(f"no CSV files in {csv_dir}")
+
+    fields = [c for c in _CSV_COLUMNS if c != "date"]
+
+    # Discover new dates from one sample CSV (all share the same dates).
+    with open(csv_files[0], encoding="utf-8") as f:
+        new_dates = sorted({row["date"] for row in csv_mod.DictReader(f)})
+
+    # Append missing dates to calendar.
+    existing_dates: set[str] = set()
+    if cal_path.exists():
+        existing_dates = set(cal_path.read_text(encoding="utf-8").splitlines())
+    dates_to_add = [d for d in new_dates if d not in existing_dates]
+    if not dates_to_add:
+        log.info("dump_bin update: all dates already in calendar, skipping")
+        return
+    with open(cal_path, "a", encoding="utf-8") as f:
+        for d in dates_to_add:
+            f.write(d + "\n")
+
+    # Append binary data per instrument.
+    count = 0
+    traded_syms: set[str] = set()
+    for csv_file in csv_files:
+        sym = csv_file.stem
+        traded_syms.add(sym.upper())
+        sym_dir = feat_dir / sym
+        if not sym_dir.exists():
+            continue
+
+        with open(csv_file, encoding="utf-8") as f:
+            rows = sorted(csv_mod.DictReader(f), key=lambda r: r["date"])
+
+        for row in rows:
+            for field in fields:
+                bin_path = sym_dir / f"{field}.day.bin"
+                if not bin_path.exists():
+                    continue
+                with open(bin_path, "ab") as bf:
+                    bf.write(struct.pack("<f", float(row[field])))
+        count += 1
+
+    if not count:
+        raise RuntimeError("no instruments updated (feature dirs missing?)")
+
+    if new_dates:
+        _extend_instrument_end_dates(inst_dir, traded_syms, max(new_dates))
+
+    log.info(
+        "dump_bin update: %d instruments, %d new dates", count, len(dates_to_add)
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"dump_bin update failed (rc={result.returncode})\n"
-            f"stderr[-2000:]: {result.stderr[-2000:]}\n"
-            f"stdout[-2000:]: {result.stdout[-2000:]}"
-        )
-    log.info("dump_bin update succeeded")
 
 
 # ---------------------------------------------------------------------------

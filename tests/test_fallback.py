@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -439,3 +440,107 @@ class TestGapFill:
                 pytest.raises(RuntimeError, match="dump failed"),
             ):
                 gap_fill("2024-03-01", "2024-03-01", p)
+
+
+class TestDumpBinUpdate:
+    """Direct tests for _dump_bin_update (binary append implementation)."""
+
+    @staticmethod
+    def _make_qlib_dir(tmp: Path, symbols: list[str], dates: list[str]) -> Path:
+        provider = tmp / "cn_data"
+        (provider / "calendars").mkdir(parents=True)
+        (provider / "instruments").mkdir(parents=True)
+        cal = provider / "calendars" / "day.txt"
+        cal.write_text("\n".join(dates) + "\n" if dates else "")
+
+        inst_lines = []
+        for sym in symbols:
+            feat = provider / "features" / sym.lower()
+            feat.mkdir(parents=True)
+            for field in ("open", "close", "high", "low", "volume", "factor", "change"):
+                bin_path = feat / f"{field}.day.bin"
+                with open(bin_path, "wb") as f:
+                    for _ in dates:
+                        f.write(struct.pack("<f", 1.0))
+            start = dates[0] if dates else "2024-01-01"
+            end = dates[-1] if dates else "2024-01-01"
+            inst_lines.append(f"{sym}\t{start}\t{end}")
+
+        (provider / "instruments" / "all.txt").write_text(
+            "\n".join(inst_lines) + "\n"
+        )
+        return provider
+
+    @staticmethod
+    def _make_csv(csv_dir: Path, symbol: str, date: str) -> None:
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        (csv_dir / f"{symbol.lower()}.csv").write_text(
+            "date,open,high,low,close,volume,factor,change\n"
+            f"{date},10.0,11.0,9.0,10.5,1000.0,1.0,0.05\n"
+        )
+
+    def test_appends_binary_and_updates_calendar(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, "SH600519", "2024-03-04")
+
+        _dump_bin_update(csv_dir, provider)
+
+        cal = (provider / "calendars" / "day.txt").read_text().splitlines()
+        assert "2024-03-04" in cal
+
+        close_bin = provider / "features" / "sh600519" / "close.day.bin"
+        data = close_bin.read_bytes()
+        assert len(data) == 8  # 2 x float32
+        vals = struct.unpack("<2f", data)
+        assert vals[0] == pytest.approx(1.0)
+        assert vals[1] == pytest.approx(10.5)
+
+    def test_extends_instrument_end_date(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, "SH600519", "2024-03-04")
+
+        _dump_bin_update(csv_dir, provider)
+
+        inst = (provider / "instruments" / "all.txt").read_text()
+        assert "2024-03-04" in inst
+
+    def test_no_csvs_raises(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._make_qlib_dir(tmp_path, [], [])
+        with pytest.raises(RuntimeError, match="no CSV files"):
+            _dump_bin_update(tmp_path / "empty", provider)
+
+    def test_skips_duplicate_calendar_date(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, "SH600519", "2024-03-01")
+
+        _dump_bin_update(csv_dir, provider)
+
+        cal = (provider / "calendars" / "day.txt").read_text().splitlines()
+        assert cal.count("2024-03-01") == 1
+
+    def test_idempotent_double_call(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, "SH600519", "2024-03-04")
+
+        _dump_bin_update(csv_dir, provider)
+        size_after_first = (provider / "features" / "sh600519" / "close.day.bin").stat().st_size
+
+        # Second call with same date is a no-op (idempotent).
+        _dump_bin_update(csv_dir, provider)
+        size_after_second = (provider / "features" / "sh600519" / "close.day.bin").stat().st_size
+
+        assert size_after_first == size_after_second
