@@ -458,8 +458,16 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     recent_cutoff = dt.date.today() - dt.timedelta(days=10)
     if td < recent_cutoff:
         return -1
+
+    # If fetch-today already populated qlib data for this trade_date,
+    # skip the chenditc refresh entirely.
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI, daily_refresh  # noqa: PLC0415
+    cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
+    if cal_last and cal_last >= ctx.trade_date:
+        logger.info("qlib data already covers %s (cal=%s), skipping chenditc", ctx.trade_date, cal_last)
+        return -1
+
     try:
-        from ashare_lab.data.update import daily_refresh  # noqa: PLC0415
         stale = daily_refresh()
     except Exception as exc:
         logger.error("data refresh failed", exc_info=True)

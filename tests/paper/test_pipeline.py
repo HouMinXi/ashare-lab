@@ -294,6 +294,7 @@ class TestDataStaleSkip:
         # Inject update module mock that returns stale=1
         update_mod = MagicMock()
         update_mod.daily_refresh = MagicMock(return_value=1)
+        update_mod._read_calendar_last_date = MagicMock(return_value=None)
 
         with (
             patch(f"{_MOD}.load_config", return_value=base_config),
