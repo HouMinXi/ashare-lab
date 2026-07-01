@@ -433,13 +433,19 @@ class DailyRunContext:
 
 
 def _step1_init(ctx: DailyRunContext) -> None:
-    """Load config and open DB connection."""
+    """Load config, open DB, init qlib."""
     ctx.config = load_config()
     ctx.paper_cfg = ctx.config["paper"]
     ctx.risk_cfg = ctx.paper_cfg["risk"]
     ctx.db_path = PROJECT_ROOT / ctx.paper_cfg["db_path"]
     ctx.conn = get_connection(ctx.db_path)
     init_schema(ctx.conn)
+    try:
+        import qlib  # noqa: PLC0415
+        from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+    except Exception:
+        pass  # qlib not installed or already initialized
 
 
 def _step2_idempotency(ctx: DailyRunContext) -> int:
@@ -478,8 +484,6 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     if cal_last and cal_last >= ctx.trade_date:
         logger.info("qlib data already covers %s (cal=%s), skipping chenditc", ctx.trade_date, cal_last)
-        import qlib  # noqa: PLC0415
-        qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
         return -1
 
     try:
