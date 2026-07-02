@@ -241,6 +241,7 @@ def predict_for_date(
 
 if __name__ == "__main__":
     import argparse
+    import gc
 
     logging.basicConfig(
         level=logging.INFO,
@@ -255,3 +256,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     predict_for_date(args.date, provider_uri=args.provider_uri)
+
+    # Ensure GPU memory is released before process exits.
+    # Windows CUDA driver may not reclaim VRAM promptly without this
+    # when batch scripts launch hundreds of predict subprocesses.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    gc.collect()
