@@ -27,7 +27,7 @@ from ashare_lab.paper.ledger import init_schema
 from ashare_lab.paper.sentiment import (
     SentimentVetoResult,
     _build_stock_prompt,
-    _call_deepseek_score,
+    _call_llm_score,
     fetch_global_news,
     fetch_stock_news,
     run_sentiment_veto,
@@ -80,7 +80,7 @@ class TestSentimentSmoke:
             [{"title": "test", "content": "neutral news",
               "date": datetime.date.today().isoformat(), "media": "test"}],
         )
-        score = _call_deepseek_score(prompt, sent_cfg)
+        score = _call_llm_score(prompt, sent_cfg)
         assert isinstance(score, int)
         assert -3 <= score <= 3
 

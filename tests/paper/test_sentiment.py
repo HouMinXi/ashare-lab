@@ -231,13 +231,230 @@ class TestLogEvent:
 
 
 # -------------------------------------------------------------------
+# _call_llm_score request construction (mocked HTTP, real logic)
+# -------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCallLlmScoreWireFormat:
+    """Verify URL construction, headers, payload, and guard logic."""
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test-key")
+    @patch("requests.post")
+    def test_url_and_headers(self, mock_post, mock_secret, sentiment_config):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "2"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        score = _call_llm_score("test prompt", sentiment_config)
+
+        assert score == 2
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "https://api.deepseek.com/chat/completions"
+        assert call_args[1]["headers"]["Authorization"] == "Bearer sk-test-key"
+        body = call_args[1]["json"]
+        assert body["model"] == "deepseek-v4-flash"
+        assert body["messages"] == [{"role": "user", "content": "test prompt"}]
+        mock_secret.assert_called_once_with("ashare/deepseek-api-key")
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-mimo")
+    @patch("requests.post")
+    def test_custom_provider(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "-1"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.xiaomimimo.com/v1",
+            "llm_model": "mimo-v2.5-pro",
+            "llm_api_key_pass": "ashare/mimo-pro-key",
+            "llm_timeout": 60,
+            "llm_extra_body": {"max_tokens": 1024},
+        }
+        score = _call_llm_score("test", cfg)
+
+        assert score == -1
+        url = mock_post.call_args[0][0]
+        assert url == "https://api.xiaomimimo.com/v1/chat/completions"
+        body = mock_post.call_args[1]["json"]
+        assert body["max_tokens"] == 1024
+        assert body["model"] == "mimo-v2.5-pro"
+        mock_secret.assert_called_once_with("ashare/mimo-pro-key")
+
+    def test_bad_scheme_returns_zero(self, sentiment_config):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        cfg = {**sentiment_config, "llm_base_url": "ftp://bad.example.com"}
+        assert _call_llm_score("test", cfg) == 0
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test")
+    @patch("requests.post")
+    def test_extra_body_reserved_keys_dropped(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "0"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.deepseek.com",
+            "llm_model": "deepseek-v4-flash",
+            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_timeout": 5,
+            "llm_extra_body": {"model": "WRONG", "max_tokens": 512},
+        }
+        _call_llm_score("test", cfg)
+
+        body = mock_post.call_args[1]["json"]
+        assert body["model"] == "deepseek-v4-flash"
+        assert body["max_tokens"] == 512
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test")
+    @patch("requests.post")
+    def test_missing_choices_returns_zero(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"error": "bad request"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.deepseek.com",
+            "llm_model": "deepseek-v4-flash",
+            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_timeout": 5,
+            "llm_extra_body": {},
+        }
+        assert _call_llm_score("test", cfg) == 0
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test")
+    @patch("requests.post")
+    def test_backward_compat_old_keys(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "1"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {"deepseek_model": "deepseek-v4-flash", "deepseek_timeout": 10}
+        score = _call_llm_score("test", cfg)
+        assert score == 1
+        body = mock_post.call_args[1]["json"]
+        assert body["model"] == "deepseek-v4-flash"
+        assert mock_post.call_args[1]["timeout"] == 10
+        mock_secret.assert_called_once_with("ashare/deepseek-api-key")
+
+    def test_non_dict_extra_body_ignored(self, sentiment_config):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        cfg = {**sentiment_config, "llm_extra_body": "not-a-dict"}
+        with patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-t"), \
+             patch("requests.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {
+                "choices": [{"message": {"content": "0"}}],
+            }
+            mock_resp.raise_for_status = MagicMock()
+            mock_post.return_value = mock_resp
+            score = _call_llm_score("test", cfg)
+            assert score == 0
+            body = mock_post.call_args[1]["json"]
+            assert set(body.keys()) == {"model", "messages"}
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-t")
+    @patch("requests.post")
+    def test_messages_key_in_extra_body_dropped(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "2"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.deepseek.com",
+            "llm_model": "deepseek-v4-flash",
+            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_timeout": 5,
+            "llm_extra_body": {"messages": [{"role": "system", "content": "BAD"}]},
+        }
+        _call_llm_score("test prompt", cfg)
+        body = mock_post.call_args[1]["json"]
+        assert body["messages"] == [{"role": "user", "content": "test prompt"}]
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-t")
+    @patch("requests.post")
+    def test_empty_content_returns_zero(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": ""}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.deepseek.com",
+            "llm_model": "deepseek-v4-flash",
+            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_timeout": 5,
+            "llm_extra_body": {},
+        }
+        assert _call_llm_score("test", cfg) == 0
+
+    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-t")
+    @patch("requests.post")
+    def test_trailing_slash_normalized(self, mock_post, mock_secret):
+        from ashare_lab.paper.sentiment import _call_llm_score
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "1"}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "llm_base_url": "https://api.deepseek.com/",
+            "llm_model": "deepseek-v4-flash",
+            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_timeout": 5,
+            "llm_extra_body": {},
+        }
+        _call_llm_score("test", cfg)
+        url = mock_post.call_args[0][0]
+        assert url == "https://api.deepseek.com/chat/completions"
+
+
+# -------------------------------------------------------------------
 # score_news (mocked network)
 # -------------------------------------------------------------------
 
 
 @pytest.mark.unit
 class TestScoreNews:
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-2)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-2)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_stock_news")
     def test_stock_scoring(self, mock_fetch, mock_global, mock_score,
@@ -250,7 +467,7 @@ class TestScoreNews:
         assert result["stock_scores"]["SZ000001"] == -2
         mock_score.assert_called_once()
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score")
+    @patch("ashare_lab.paper.sentiment._call_llm_score")
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     def test_cache_hit_skips_api(self, mock_global, mock_score,
                                  sentiment_config, sentiment_db):
@@ -262,7 +479,7 @@ class TestScoreNews:
         assert result["stock_scores"]["SZ000001"] == -1.0
         mock_score.assert_not_called()
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-2)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-2)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_stock_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_industry_news")
@@ -277,7 +494,7 @@ class TestScoreNews:
         )
         assert result["industry_scores"]["banking"] == -2
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-3)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-3)
     @patch("ashare_lab.paper.sentiment.fetch_global_news")
     @patch("ashare_lab.paper.sentiment.fetch_stock_news", return_value=[])
     def test_global_scoring(self, mock_stock, mock_global, mock_score,
@@ -348,7 +565,7 @@ class TestFailOpen:
 
 @pytest.mark.unit
 class TestRunSentimentVeto:
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-3)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-3)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_stock_news")
     def test_happy_path_veto(self, mock_stock, mock_global, mock_score,
@@ -360,7 +577,7 @@ class TestRunSentimentVeto:
         )
         assert "SZ000001" in result.vetoed_stocks
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=1)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=1)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_stock_news")
     def test_happy_path_pass(self, mock_stock, mock_global, mock_score,
@@ -373,7 +590,7 @@ class TestRunSentimentVeto:
         assert "SZ000001" not in result.vetoed_stocks
         assert result.global_halted is False
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-3)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-3)
     @patch("ashare_lab.paper.sentiment.fetch_global_news")
     @patch("ashare_lab.paper.sentiment.fetch_stock_news", return_value=[])
     def test_global_halt_propagates(self, mock_stock, mock_global, mock_score,
@@ -385,7 +602,7 @@ class TestRunSentimentVeto:
         )
         assert result.global_halted is True
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-3)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-3)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_industry_news")
     @patch("ashare_lab.paper.sentiment.fetch_stock_news")
@@ -403,7 +620,7 @@ class TestRunSentimentVeto:
         assert "SZ000001" in result.vetoed_stocks
         assert "banking" in result.vetoed_industries
 
-    @patch("ashare_lab.paper.sentiment._call_deepseek_score", return_value=-2)
+    @patch("ashare_lab.paper.sentiment._call_llm_score", return_value=-2)
     @patch("ashare_lab.paper.sentiment.fetch_global_news", return_value=[])
     @patch("ashare_lab.paper.sentiment.fetch_stock_news")
     def test_events_logged(self, mock_stock, mock_global, mock_score,

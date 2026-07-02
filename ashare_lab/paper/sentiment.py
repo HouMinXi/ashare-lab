@@ -336,39 +336,89 @@ def _parse_score(response_text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# deepseek scoring
+# LLM scoring (OpenAI chat/completions compatible)
 # ---------------------------------------------------------------------------
 
 
-def _call_deepseek_score(prompt: str, config: dict) -> int:
-    """Call deepseek API for sentiment scoring.
+_LLM_RESERVED_KEYS = frozenset({"model", "messages"})
 
-    config is the flat sentiment sub-config.
+
+def _call_llm_score(prompt: str, config: dict) -> int:
+    """Call an OpenAI-compatible LLM API for sentiment scoring.
+
+    Provider, model, and credentials are read from config (the flat
+    sentiment sub-config).  Any provider that speaks the OpenAI
+    chat/completions wire format works: DeepSeek, MiMo, Kimi,
+    MiniMax, GLM, OpenAI, Gemini, Azure OpenAI, Bedrock.
+
     Returns integer score -3..+3, or 0 on any failure (fail-open).
     """
     try:
         import requests  # noqa: PLC0415
 
-        api_key = _get_secret("ashare/deepseek-api-key")
-        model = config.get("deepseek_model", "deepseek-v4-flash")
-        timeout = config.get("deepseek_timeout", 30)
+        # Read config with backward-compat fallback to old deepseek_* keys.
+        base_url = config.get(
+            "llm_base_url", config.get("deepseek_base_url", "https://api.deepseek.com"),
+        )
+        model = config.get(
+            "llm_model", config.get("deepseek_model", "deepseek-v4-flash"),
+        )
+        api_key_pass = config.get("llm_api_key_pass", "ashare/deepseek-api-key")
+        timeout = config.get(
+            "llm_timeout", config.get("deepseek_timeout", 30),
+        )
+        extra_body = config.get("llm_extra_body", {})
+
+        # Validate base_url scheme.
+        if not base_url.startswith(("http://", "https://")):
+            logger.warning("llm_base_url missing scheme: %s", base_url)
+            return 0
+
+        # Guard against non-dict or reserved-key collisions in extra_body.
+        if not isinstance(extra_body, dict):
+            logger.warning("llm_extra_body is not a dict, ignoring")
+            extra_body = {}
+        elif extra_body:
+            collisions = _LLM_RESERVED_KEYS & set(extra_body)
+            if collisions:
+                    logger.warning(
+                        "llm_extra_body contains reserved keys %s, dropping them",
+                        collisions,
+                    )
+                    extra_body = {
+                        k: v for k, v in extra_body.items()
+                        if k not in _LLM_RESERVED_KEYS
+                    }
+
+        api_key = _get_secret(api_key_pass)
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            **extra_body,
+        }
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        logger.debug("llm scoring: %s model=%s", url, model)
         resp = requests.post(
-            "https://api.deepseek.com/chat/completions",
+            url,
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "user", "content": prompt},
-                ],
-                "thinking": {"type": "disabled"},
-            },
+            json=body,
             timeout=timeout,
         )
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+
+        # Defensive response parsing -- providers may return unexpected shapes.
+        data = resp.json()
+        choices = data.get("choices")
+        if not choices:
+            logger.warning("llm response missing 'choices': %s", str(data)[:200])
+            return 0
+        content = choices[0].get("message", {}).get("content", "")
+        if not content:
+            logger.warning("llm response empty content: %s", str(data)[:200])
+            return 0
         return _parse_score(content)
     except Exception:
-        logger.warning("deepseek scoring failed", exc_info=True)
+        logger.warning("llm scoring failed", exc_info=True)
         return 0
 
 
@@ -460,7 +510,7 @@ def score_news(
         prompt = _build_stock_prompt(
             sym, stock_names.get(sym, sym), articles,
         )
-        score = _call_deepseek_score(prompt, config)
+        score = _call_llm_score(prompt, config)
         stock_scores[sym] = score
         _write_cache(conn, trade_date, "stock", sym, score, len(articles))
 
@@ -479,7 +529,7 @@ def score_news(
             _write_cache(conn, trade_date, "industry", ind, 0, 0)
             continue
         prompt = _build_industry_prompt(ind, articles)
-        score = _call_deepseek_score(prompt, config)
+        score = _call_llm_score(prompt, config)
         industry_scores[ind] = score
         _write_cache(conn, trade_date, "industry", ind, score, len(articles))
 
@@ -492,7 +542,7 @@ def score_news(
         articles = fetch_global_news(config)
         if articles:
             prompt = _build_global_prompt(articles)
-            global_score = float(_call_deepseek_score(prompt, config))
+            global_score = float(_call_llm_score(prompt, config))
             _write_cache(
                 conn, trade_date, "global", "global",
                 global_score, len(articles),

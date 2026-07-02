@@ -211,8 +211,11 @@ def sentiment_config() -> dict:
         "news_count": 10,
         "rate_limit_base": 0.0,
         "rate_limit_jitter": 0.0,
-        "deepseek_model": "deepseek-v4-flash",
-        "deepseek_timeout": 5,
+        "llm_base_url": "https://api.deepseek.com",
+        "llm_model": "deepseek-v4-flash",
+        "llm_api_key_pass": "ashare/deepseek-api-key",
+        "llm_timeout": 5,
+        "llm_extra_body": {},
     }
 
 
