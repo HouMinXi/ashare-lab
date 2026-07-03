@@ -381,14 +381,14 @@ def _call_llm_score(prompt: str, config: dict) -> int:
         elif extra_body:
             collisions = _LLM_RESERVED_KEYS & set(extra_body)
             if collisions:
-                    logger.warning(
-                        "llm_extra_body contains reserved keys %s, dropping them",
-                        collisions,
-                    )
-                    extra_body = {
-                        k: v for k, v in extra_body.items()
-                        if k not in _LLM_RESERVED_KEYS
-                    }
+                logger.warning(
+                    "llm_extra_body contains reserved keys %s, dropping them",
+                    collisions,
+                )
+                extra_body = {
+                    k: v for k, v in extra_body.items()
+                    if k not in _LLM_RESERVED_KEYS
+                }
 
         api_key = _get_secret(api_key_pass)
         body = {

@@ -118,6 +118,7 @@ paper:
     rate_limit_base: 1.0
     rate_limit_jitter: 0.5
     # LLM provider config (OpenAI chat/completions compatible).
+    # base_url, model, api_key_pass, extra_body must match the same provider.
     # Supported base_url values:
     #   DeepSeek:      https://api.deepseek.com
     #   MiMo Pro:      https://api.xiaomimimo.com/v1
