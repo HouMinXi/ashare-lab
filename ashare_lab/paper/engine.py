@@ -490,9 +490,10 @@ def settle_day(
                 old_qty = pos["qty"]
                 old_avg = pos["avg_cost"]
                 new_qty = old_qty + fill_qty
-                pos["avg_cost"] = (
-                    (old_avg * old_qty + fill_price * fill_qty) / new_qty
-                )
+                if new_qty > 0:
+                    pos["avg_cost"] = (
+                        (old_avg * old_qty + fill_price * fill_qty) / new_qty
+                    )
                 pos["qty"] = new_qty
                 pos["market_value"] = new_qty * close
                 pos["holding_high"] = max(

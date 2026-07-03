@@ -158,6 +158,13 @@ CREATE TABLE IF NOT EXISTS graduation_status (
     graduated_at  TEXT,
     notified_at   TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_orders_date_status
+    ON orders (created_run_date, status);
+CREATE INDEX IF NOT EXISTS idx_trades_date
+    ON trades (trade_date);
+CREATE INDEX IF NOT EXISTS idx_sentiment_scores_date
+    ON sentiment_scores (trade_date);
 """
 
 _INITIAL_STATE_SQL = """\

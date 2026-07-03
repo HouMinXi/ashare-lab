@@ -129,6 +129,8 @@ def check_market_regime(
     if len(csi1000_closes) < lookback_days + 1:
         return False
     window = csi1000_closes[-(lookback_days + 1):]
+    if window[0] <= 0:
+        return False
     cumulative_return = (window[-1] / window[0]) - 1
     return cumulative_return < -decline_threshold
 
@@ -270,6 +272,8 @@ def run_all_risk_checks(
             close_price = (
                 current_prices.get(symbol, {}).get("close", pos["avg_cost"])
             )
+            if close_price <= 0:
+                continue
             excess_qty = max(1, math.ceil(excess_cny / close_price))
             forced_sells[symbol] = min(excess_qty, pos["qty"])
 

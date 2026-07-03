@@ -679,48 +679,92 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
             pass
 
     # 5g. market_data for filter_candidates
+    # Batch D.features: 2 calls instead of 2*N per-symbol calls.
     ctx.market_data = {}
-    for sym in ctx.fetch_symbols:
-        p = ctx.prices.get(sym)
-        if p is None:
-            continue
-        listing_days = 999
-        try:
-            first_bar_df = D.features(
-                instruments=[sym], fields=["$close"],
-                start_time="2005-01-01", end_time=ctx.trade_date,
-            )
-            if first_bar_df is not None and not first_bar_df.empty:
-                first_date = first_bar_df.index[0]
-                if isinstance(first_date, tuple):
-                    first_date = first_date[0]
+    priced_symbols = [s for s in ctx.fetch_symbols if s in ctx.prices]
+    if not priced_symbols:
+        # ponytail: equivalent to old code's empty for-loop producing empty dict
+        return -1
+
+    # 5g-0. build suffix -> symbol reverse-lookup (O(1) matching, no nested loop)
+    import pandas as pd  # noqa: PLC0415
+    suffix_to_sym = {}
+    for sym in priced_symbols:
+        suffix = sym[-6:] if len(sym) > 6 else sym
+        if suffix in suffix_to_sym:
+            logger.warning("suffix collision: %s vs %s (suffix=%s)", sym, suffix_to_sym[suffix], suffix)
+        suffix_to_sym[suffix] = sym
+
+    def _match_inst(inst_key):
+        """Map qlib instrument ID to our symbol via 6-digit suffix."""
+        s = str(inst_key)
+        suffix = s[-6:] if len(s) > 6 else s
+        matched = suffix_to_sym.get(suffix)
+        if matched is None:
+            logger.debug("no symbol match for qlib instrument %s", s)
+        return matched
+
+    # 5g-1. listing_days: batch query first bar date for all symbols
+    listing_days_map = {}
+    try:
+        first_bar_df = D.features(
+            instruments=priced_symbols, fields=["$close"],
+            start_time="2005-01-01", end_time=ctx.trade_date,
+        )
+        if first_bar_df is not None and not first_bar_df.empty:
+            td = dt.date.fromisoformat(ctx.trade_date)
+            for inst in first_bar_df.index.get_level_values(0).unique():
+                sym_df = first_bar_df.loc[inst]
+                # pandas .loc on MultiIndex returns Series for single-row results
+                if isinstance(sym_df, pd.Series):
+                    sym_df = sym_df.to_frame().T
+                if sym_df.empty:
+                    continue
+                first_date = sym_df.index[0]
                 first_bar_date = first_date.date() if hasattr(first_date, "date") else first_date
-                listing_days = len(
-                    trading_days_between(first_bar_date, dt.date.fromisoformat(ctx.trade_date))
-                )
-        except Exception:
-            pass
-        avg_turnover_20d = 0.0
-        try:
-            turnover_df = D.features(
-                instruments=[sym],
-                fields=["$volume", "$close", "$factor"],
-                start_time=(dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=40)).isoformat(),
-                end_time=ctx.trade_date,
-            )
-            if turnover_df is not None and not turnover_df.empty:
+                matched = _match_inst(inst)
+                if matched:
+                    listing_days_map[matched] = len(
+                        trading_days_between(first_bar_date, td)
+                    )
+            del first_bar_df  # free ~40MB before turnover query
+    except Exception:
+        logger.debug("batch listing_days query failed", exc_info=True)
+
+    # 5g-2. turnover: batch query 40-day volume/close/factor for all symbols
+    turnover_map = {}
+    start_40d = (dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=40)).isoformat()
+    try:
+        turnover_batch = D.features(
+            instruments=priced_symbols,
+            fields=["$volume", "$close", "$factor"],
+            start_time=start_40d, end_time=ctx.trade_date,
+        )
+        if turnover_batch is not None and not turnover_batch.empty:
+            for inst in turnover_batch.index.get_level_values(0).unique():
+                sym_df = turnover_batch.loc[inst]
+                if isinstance(sym_df, pd.Series):
+                    sym_df = sym_df.to_frame().T
+                if sym_df.empty:
+                    continue
                 # qlib $close is forward-adjusted; divide by $factor to recover actual CNY price
-                factor = turnover_df["$factor"].replace(0, 1)
-                unadj_close = turnover_df["$close"] / factor
-                turnover_vals = (turnover_df["$volume"] * unadj_close).tail(20)
+                factor = sym_df["$factor"].replace(0, 1)
+                unadj_close = sym_df["$close"] / factor
+                turnover_vals = (sym_df["$volume"] * unadj_close).tail(20)
                 if len(turnover_vals) > 0:
-                    avg_turnover_20d = float(turnover_vals.mean())
-        except Exception:
-            pass
+                    matched = _match_inst(inst)
+                    if matched:
+                        turnover_map[matched] = float(turnover_vals.mean())
+            del turnover_batch
+    except Exception:
+        logger.debug("batch turnover query failed", exc_info=True)
+
+    # 5g-3. assemble market_data (both maps keyed by our symbol, independent lookups)
+    for sym in priced_symbols:
         ctx.market_data[sym] = {
-            "close": p["close"],
-            "listing_days": listing_days,
-            "avg_turnover_20d": avg_turnover_20d,
+            "close": ctx.prices[sym]["close"],
+            "listing_days": listing_days_map.get(sym, 999),
+            "avg_turnover_20d": turnover_map.get(sym, 0.0),
         }
 
     return -1  # continue
