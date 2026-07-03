@@ -121,7 +121,7 @@ paper:
     # base_url, model, api_key_pass, extra_body must match the same provider.
     # Supported base_url values:
     #   DeepSeek:      https://api.deepseek.com
-    #   MiMo Pro:      https://api.xiaomimimo.com/v1
+    #   MiMo Pro:      https://token-plan-cn.xiaomimimo.com/v1
     #   Kimi:          https://api.moonshot.ai/v1
     #   MiniMax:       https://api.minimax.io/v1
     #   GLM/Zhipu:     https://open.bigmodel.cn/api/paas/v4
