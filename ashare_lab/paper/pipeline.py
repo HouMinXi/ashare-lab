@@ -569,7 +569,13 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         | ctx.ipo_listing_syms
     )
 
-    # 5c. ST names -- use tushare stock_names_cache + regex (no baostock)
+    # settle-only fast path: skip regime, industry, market_data (signal-path only).
+    # settle needs prices + benchmarks + ST names; risk checks degrade gracefully
+    # on empty csi1000_closes / industry_map / market_data.
+    settle_only = ctx.steps == {"settle"}
+
+    # 5c. ST names -- always runs (local CSV cache, no network).
+    # ST status determines limit threshold (5% vs 10%) used by settle_day.
     from ashare_lab.data.validator import _ST_PATTERN  # noqa: PLC0415
     st_cached = _load_st_cache(ctx.trade_date, ctx.fetch_symbols)
     if st_cached is not None:
@@ -613,6 +619,27 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
 
     # 5d. benchmarks
     ctx.benchmarks = _fetch_benchmark_closes(ctx.trade_date)
+
+    # 5e-5g settle fast path: use local cache only (no network fallback).
+    # Risk checks (step 9) persist cooldowns and soft-reduce state, so regime
+    # and industry data must be populated when cached. market_data is signal-
+    # path only (filter_candidates) and safe to skip.
+    if settle_only:
+        # 5e. regime: cache-only, no qlib D.features fallback
+        regime_cached = _load_regime_cache(ctx.trade_date)
+        ctx.csi1000_closes_11d = regime_cached if regime_cached is not None else []
+        if not ctx.csi1000_closes_11d:
+            logger.warning("settle: no cached regime data for %s, market regime check disabled", ctx.trade_date)
+
+        # 5f. industry: cache-only, no baostock fallback
+        ind_cached = _load_industry_cache(ctx.trade_date, ctx.fetch_symbols)
+        ctx.industry_map = ind_cached if ind_cached is not None else {}
+        if not ctx.industry_map:
+            logger.warning("settle: no cached industry data for %s, concentration check disabled", ctx.trade_date)
+
+        # 5g. market_data: signal-path only, not needed for settle
+        ctx.market_data = {}
+        return -1
 
     # 5e. CSI1000 11-day closes for regime check (qlib, no baostock)
     regime_cached = _load_regime_cache(ctx.trade_date)
