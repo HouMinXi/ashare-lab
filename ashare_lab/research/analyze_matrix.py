@@ -91,9 +91,9 @@ def compute_oracle(
     """Compute oracle (best-per-window) headroom over incumbent.
 
     Only receives survivor records -- caller must filter out killed candidates
-    before calling (D-14: dead candidates inflate oracle headroom).
+    before calling (dead candidates inflate oracle headroom).
 
-    Uses window intersection (N11): only compares windows present in BOTH
+    Uses window intersection: only compares windows present in BOTH
     the records and incumbent_excess.
 
     Args:
@@ -109,7 +109,7 @@ def compute_oracle(
     for r in records:
         by_window.setdefault(r["window"], []).append(r)
 
-    # N11 fix: intersect windows.
+    # Intersect windows: oracle must not credit windows the incumbent never traded.
     record_windows = set(by_window.keys())
     incumbent_windows = set(incumbent_excess.keys())
     common_windows = sorted(record_windows & incumbent_windows)
@@ -153,9 +153,9 @@ def generate_gate_decision(
 ) -> Path:
     """Generate GATE_DECISION.md from matrix experiment results.
 
-    Applies D-02 kill gate (IC < kill_ic OR maxdd worse than kill_maxdd)
-    per candidate.  N3 fix: kill gate runs FIRST, then only survivors go
-    to oracle computation (D-14).
+    Applies the kill gate (IC < kill_ic OR maxdd worse than kill_maxdd)
+    per candidate.  Kill gate runs FIRST, then only survivors go
+    to oracle computation.
 
     Args:
         results_jsonl: Path to results.jsonl with all candidate results.
@@ -188,7 +188,7 @@ def generate_gate_decision(
     for r in records:
         by_model.setdefault(r["model"], []).append(r)
 
-    # Apply D-02 kill gate per candidate.
+    # Apply kill gate per candidate.
     verdicts: list[dict] = []
     survivors: list[dict] = []
 
@@ -229,7 +229,7 @@ def generate_gate_decision(
         if status == "ALIVE":
             survivors.extend(candidate_records)
 
-    # N3 fix: oracle only sees survivors.
+    # Oracle only sees survivors: dead candidates would inflate headroom.
     oracle = compute_oracle(survivors, incumbent_excess)
 
     # Correlation among survivors (if result_dirs provided).
@@ -285,10 +285,10 @@ def generate_gate_decision(
     lines.append(f"- **Headroom**: {oracle['headroom']:.4f}")
     lines.append(f"- **Common windows**: {oracle['n_common_windows']}")
     lines.append("")
-    # D-14: oracle headroom framing.
+    # Oracle headroom framing: kill-only, never a promise.
     lines.append(
         "> Oracle headroom is used to KILL combination work when headroom is "
-        "tiny, never to promise gains (D-14)."
+        "tiny, never to promise gains."
     )
     lines.append("")
 
@@ -306,7 +306,7 @@ def generate_gate_decision(
         if low_corr_pairs:
             lines.append(
                 "Pairs with Spearman rho < 0.6 (candidates for Phase 2 "
-                "combination testing per D-04):\n"
+                "combination testing when correlation < 0.6):\n"
             )
             lines.append("| Pair A | Pair B | Spearman rho |")
             lines.append("|--------|--------|--------------|")
@@ -317,14 +317,14 @@ def generate_gate_decision(
         lines.append("")
 
     # Section 4: Recommendations
-    # D-10: ranking uses after-cost excess + bear floor, not IC alone.
+    # Ranking uses after-cost excess + bear floor, not IC alone.
     lines.append("## Recommendations\n")
     alive = [v for v in verdicts if v["status"] == "ALIVE"]
     if alive:
-        # Rank survivors by total excess (D-10).
+        # Rank survivors by total excess.
         alive_sorted = sorted(alive, key=lambda v: v["total_excess"], reverse=True)
         lines.append(
-            "Survivors ranked by total after-cost excess return (D-10: "
+            "Survivors ranked by total after-cost excess return ("
             "IC is kill floor only, ranking uses excess + bear floor):\n"
         )
         for rank, v in enumerate(alive_sorted, 1):

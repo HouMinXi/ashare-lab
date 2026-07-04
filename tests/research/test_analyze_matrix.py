@@ -152,7 +152,7 @@ class TestOracle:
         assert all(w == "incumbent" for w in winners.values())
 
     def test_window_intersection(self):
-        """Oracle only compares common windows (N11 fix)."""
+        """Oracle only compares common windows (common-windows-only)."""
         # Records for windows 1-5 only.
         records = [_base_record("cand_a", w, excess=0.05) for w in range(1, 6)]
         # Incumbent has windows 1-10.
@@ -174,7 +174,7 @@ class TestOracle:
 
 class TestGateDecision:
     def test_oracle_excludes_dead(self, tmp_path):
-        """Killed candidates do NOT appear in oracle winner_matrix (N3 fix)."""
+        """Killed candidates do NOT appear in oracle winner_matrix (survivors-only oracle)."""
         # Candidate A: alive, high excess.
         # Candidate B: killed by IC < 0.02.
         records = [
@@ -271,7 +271,7 @@ class TestGateDecision:
         assert "## Candidate Verdicts" in md
         assert "## Oracle Analysis" in md
         assert "## Recommendations" in md
-        assert "D-14" in md  # Oracle framing warning
+        assert "never to promise gains" in md  # Oracle framing warning
 
     def test_jsonl_schema_validation(self, tmp_path):
         """Missing required key in JSONL record raises ValueError."""
