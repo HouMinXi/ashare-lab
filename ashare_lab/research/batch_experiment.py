@@ -247,9 +247,10 @@ def run_matrix(
                     cmd += '"'
 
                     with _gpu_lock():
+                        # ponytail: errors='replace' -- Windows GPU emits GBK in stderr
                         result = subprocess.run(
-                            cmd, shell=True, capture_output=True, text=True,
-                            timeout=7200,
+                            cmd, shell=True, capture_output=True,
+                            encoding="utf-8", errors="replace", timeout=7200,
                         )
 
                     if result.returncode != 0:
@@ -320,8 +321,8 @@ def run_matrix(
 
                 with _gpu_lock():
                     result = subprocess.run(
-                        cmd, shell=True, capture_output=True, text=True,
-                        timeout=7200,
+                        cmd, shell=True, capture_output=True,
+                        encoding="utf-8", errors="replace", timeout=7200,
                     )
 
                 if result.returncode != 0:
