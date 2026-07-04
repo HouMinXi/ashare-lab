@@ -3,32 +3,13 @@
 Global rules in ~/CLAUDE.md apply. This file adds project-specific rules only -- no state, no architecture descriptions (those live in project memory).
 
 
-## Review Gate
+## Checkpoint Pipeline
 
-Every code change -- source, test, config with behavioral impact -- passes this pipeline before commit:
+Inherits ~/CLAUDE.md "GSD Checkpoint Pipeline" verbatim. Project-specific additions only:
 
-1. Forge three-cycle review (9 passes minimum, zero findings exit)
-2. /anti-ai-audit on all changed files (code comments, docstrings, commit message)
-3. Non-ASCII check on every changed file
-
-A commit that skips step 2 is incomplete even if forge passes. AI-smell in comments, docstrings, and log messages is as real as a bug -- future readers cannot tell intent from template.
-
-
-## Plan Review Pipeline
-
-Every phase plan set (PLAN.md files) must pass this pipeline before execution. Exit criteria: 0B/0H/0M/0L across ALL stages (internal + external).
-
-1. **Internal adversarial review**: gsd-plan-checker until 0B/0H/0M/0L
-2. **External 4-model cross-review**: aicc dispatch to gm (Gemini), ds (DeepSeek), mm (MiniMax), mimo (MiMo) in parallel. Usage in global memory `reference_aicc_tool.md`. Model profiles in `reference_aicc_model_review_profiles.md`.
-3. **Triage external results**:
-   - If ALL 4 models return 0B/0H/0M/0L → present plans to user for human review → EXIT
-   - If ANY findings → consolidate cross-model results, fix all B+H+M+L → step 4
-4. **Internal adversarial re-review**: gsd-plan-checker on fixed plans, verify fixes did not introduce new issues, must pass 0B/0H/0M/0L
-5. **Loop**: return to step 2 (external re-review on fixed plans). Repeat until step 3 reaches the clean exit.
-
-The 4-model panel covers L0 (mm surface), L0.5 (mimo signatures), L1 (ds docs), L2 (kimi integration), L3 (gm runtime). A plan set that skips external cross-review has only one model's blind spots checked.
-
-When gm fails (VPN exit CN), proceed with 3 models. Retry gm in the next round. gm's L3 runtime findings are the highest-severity unique catches -- do not declare convergence without at least one successful gm round.
+- CP1b model panel: gm (L3 runtime), ds (L1 docs), mm (L0 surface), mimo (L0.5 signatures). When gm fails (VPN exit CN), proceed with 3 models, retry gm next round.
+- CP3 forge backend: mimo-pro (gate.yaml, stream: true, timeout_s: 3600) or deepseek fallback.
+- Non-code changes (docs/config/chore) skip to CP5 only.
 
 
 ## Machine Roles
