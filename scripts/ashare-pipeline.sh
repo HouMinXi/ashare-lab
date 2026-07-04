@@ -125,7 +125,7 @@ try_gpu_inference() {
 
     # SCP predictions back
     mkdir -p "$PREDICTIONS_DIR"
-    if ! scp "${GPU_USER}@${GPU_HOST}":"'H:/ashare-lab/predictions/${TRADE_DATE}.parquet'" "$PREDICTIONS_DIR/"; then
+    if ! scp "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.parquet" "$PREDICTIONS_DIR/"; then
         echo "ERROR: SCP predictions failed"
         return 1
     fi
