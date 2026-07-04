@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 # Minimum instruments per date to compute IC (fewer => unreliable correlation).
 _MIN_INSTRUMENTS = 5
 
+# Formal JSONL record schema for matrix experiment results.
+# matrix_runner.py writes these keys; analyze_matrix.py reads them.
+CELL_SCHEMA_KEYS = ["model", "window", "ic", "excess", "maxdd", "completed_at"]
+
 
 def daily_rank_ic(pred: pd.Series, label: pd.Series) -> pd.Series:
     """Compute per-date Spearman rank IC between predictions and labels.
@@ -58,6 +62,29 @@ def daily_rank_ic(pred: pd.Series, label: pd.Series) -> pd.Series:
 
     result = pd.Series(ic_values, name="rank_ic", dtype=float)
     return result
+
+
+def compute_max_drawdown(portfolio_df: pd.DataFrame) -> float:
+    """Compute maximum drawdown from daily portfolio returns.
+
+    Args:
+        portfolio_df: DataFrame with a "return" column of daily returns.
+
+    Returns:
+        Maximum drawdown as a negative float (e.g. -0.15 for 15%).
+        Returns 0.0 if portfolio_df is empty or all returns are non-negative
+        such that no drawdown occurs.
+    """
+    if portfolio_df.empty:
+        return 0.0
+    cumulative = (1 + portfolio_df["return"]).cumprod()
+    running_max = cumulative.cummax()
+    # Guard: cumulative can hit 0 when a return equals -1.0 (total loss).
+    # running_max / running_max would be 0/0 -> NaN, violating the contract.
+    if (running_max == 0).any():
+        return -1.0
+    drawdown = (cumulative - running_max) / running_max
+    return float(drawdown.min())
 
 
 def aggregate_window_metrics(

@@ -1,0 +1,19 @@
+---
+# Candidate E: ALSTM, Alpha360
+# Pitfall 3: d_feat=6 (6 raw features), NOT 360
+model:
+  type: alstm
+  tag: e_alstm360
+  handler: alpha360
+  d_feat: 6
+  step_len: 60
+  hidden_size: 64
+  num_layers: 2
+  dropout: 0.0
+  n_epochs: 200
+  lr: 0.001
+  batch_size: 800
+  early_stop: 20
+  GPU: 0
+matrix:
+  tag: e_alstm360

@@ -1,13 +1,14 @@
-"""Walk-forward window training: multi-model (LGB / ALSTM / TRA) on CSI1000.
+"""Walk-forward window training: multi-model on CSI1000.
 
 Provides apply_price_filter() and train_window(). All qlib imports are
 deferred inside function bodies so this module is importable without a
 qlib runtime (required for unit test isolation).
 
 Supported model types (config model.type):
-  lgbm  -- LightGBM + DatasetH (tabular, GPU OpenCL)
-  alstm -- Attention-LSTM + TSDatasetH (time-series, CUDA)
-  tra   -- Temporal Routing Adaptor + MTSDatasetH (multi-pattern, CUDA)
+  lgbm      -- LightGBM + DatasetH (tabular, GPU OpenCL)
+  alstm     -- Attention-LSTM + TSDatasetH (time-series, CUDA)
+  tra       -- Temporal Routing Adaptor + MTSDatasetH (multi-pattern, CUDA)
+  densemble -- DoubleEnsemble + DatasetH (sample reweighting + feature selection)
 """
 
 from __future__ import annotations
@@ -101,13 +102,15 @@ def train_window(
     window: dict,
     exp_dir: Path,
     universe: str,
+    seed: int | None = None,
 ) -> tuple:
     """Train a model on one walk-forward window and return predictions.
 
-    Supports three model types selected via config model.type:
-      lgbm  -- LightGBM + DatasetH; saves w{id}.pkl via to_pickle()
-      alstm -- Attention-LSTM + TSDatasetH; saves w{id}.pt via torch.save()
-      tra   -- Temporal Routing Adaptor + MTSDatasetH; saves w{id}.pt via torch.save()
+    Supports four model types selected via config model.type:
+      lgbm      -- LightGBM + DatasetH; saves w{id}.pkl via to_pickle()
+      alstm     -- Attention-LSTM + TSDatasetH; saves w{id}.pt via torch.save()
+      tra       -- Temporal Routing Adaptor + MTSDatasetH; saves w{id}.pt via torch.save()
+      densemble -- DoubleEnsemble + DatasetH; saves w{id}.pkl via to_pickle()
 
     Initialises qlib once per process (guarded), builds the handler for the
     configured feature set (Alpha158 or Alpha360), wraps it in the appropriate
@@ -177,6 +180,14 @@ def train_window(
 
     cfg_model = load_config().get("model", {})
     model_type = cfg_model.get("type", "lgbm").lower()
+
+    VALID_MODEL_TYPES = {"lgbm", "alstm", "tra", "densemble"}
+    if model_type not in VALID_MODEL_TYPES:
+        raise ValueError(
+            f"unknown model.type={model_type!r}, expected one of {sorted(VALID_MODEL_TYPES)}"
+        )
+
+    effective_seed = seed if seed is not None else 42
 
     # -----------------------------------------------------------------------
     # Build data handler + dataset.
@@ -256,6 +267,7 @@ def train_window(
         )
         log.info("W%d: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
     else:
+        # lgbm and densemble both use DatasetH (tabular, no time-axis batching).
         dataset = DatasetH(handler=handler, segments=segs)
 
     # -----------------------------------------------------------------------
@@ -277,7 +289,7 @@ def train_window(
             batch_size=cfg_model.get("batch_size", 800),
             early_stop=cfg_model.get("early_stop", 20),
             GPU=cfg_model.get("GPU", 0),
-            seed=42,
+            seed=effective_seed,
         )
         model.fit(dataset)
     elif model_type == "tra":
@@ -306,7 +318,35 @@ def train_window(
             n_epochs=cfg_model.get("n_epochs", 200),
             early_stop=cfg_model.get("early_stop", 30),
             lr=cfg_model.get("lr", 1e-3),
-            seed=42,
+            seed=effective_seed,
+        )
+        model.fit(dataset)
+    elif model_type == "densemble":
+        from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+
+        # DEnsembleModel has no seed param; best-effort via global np.random.seed.
+        # Safe only under subprocess isolation (one train_window call per process).
+        np.random.seed(effective_seed)
+
+        log.info("W%d: DEnsembleModel num_models=%d epochs=%d", window_id,
+                 cfg_model.get("num_models", 6), cfg_model.get("epochs", 28))
+        model = DEnsembleModel(
+            base_model="gbm",
+            num_models=cfg_model.get("num_models", 6),
+            epochs=cfg_model.get("epochs", 28),
+            decay=cfg_model.get("decay", 0.5),
+            early_stopping_rounds=cfg_model.get("early_stopping_rounds", 10),
+            enable_sr=cfg_model.get("enable_sr", True),
+            enable_fs=cfg_model.get("enable_fs", True),
+            learning_rate=cfg_model.get("learning_rate", 0.2),
+            colsample_bytree=cfg_model.get("colsample_bytree", 0.8879),
+            subsample=cfg_model.get("subsample", 0.8789),
+            lambda_l1=cfg_model.get("lambda_l1", 205.6999),
+            lambda_l2=cfg_model.get("lambda_l2", 580.9768),
+            max_depth=cfg_model.get("max_depth", 8),
+            num_leaves=cfg_model.get("num_leaves", 210),
         )
         model.fit(dataset)
     else:
@@ -321,7 +361,7 @@ def train_window(
             "max_depth": cfg_model.get("max_depth", 8),
             "num_leaves": cfg_model.get("num_leaves", 210),
             "device": lgb_device,
-            "random_state": 42,
+            "random_state": effective_seed,
             "verbose": -1,
         }
         if lgb_device == "gpu":

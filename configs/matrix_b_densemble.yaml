@@ -1,0 +1,23 @@
+---
+# Candidate B: DoubleEnsemble, Alpha158
+# Benchmark params from qlib official (H7: not defaults)
+model:
+  type: densemble
+  tag: b_densemble
+  handler: alpha158
+  num_models: 6
+  epochs: 28
+  decay: 0.5
+  early_stopping_rounds: 10
+  enable_sr: true
+  enable_fs: true
+  # LGB sub-model params: benchmark uses lr=0.2, not our tuned 0.0421
+  learning_rate: 0.2
+  colsample_bytree: 0.8879
+  subsample: 0.8789
+  lambda_l1: 205.6999
+  lambda_l2: 580.9768
+  max_depth: 8
+  num_leaves: 210
+matrix:
+  tag: b_densemble

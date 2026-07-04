@@ -1,0 +1,30 @@
+---
+# Candidate C: TRA, Alpha360
+# Pitfall 1: input_size=6 (6 raw features x 60 timesteps), NOT 360
+model:
+  type: tra
+  tag: c_tra360
+  handler: alpha360
+  step_len: 60
+  backbone:
+    input_size: 6
+    hidden_size: 64
+    num_layers: 2
+    rnn_arch: GRU
+    use_attn: true
+    dropout: 0.0
+  routing:
+    num_states: 3
+    hidden_size: 32
+    tau: 1.0
+    src_info: LR_TPE
+    rnn_arch: GRU
+    num_layers: 1
+    dropout: 0.0
+  transport_method: router
+  pretrain: true
+  n_epochs: 200
+  early_stop: 30
+  lr: 0.001
+matrix:
+  tag: c_tra360
