@@ -145,6 +145,114 @@ class TestApplyPriceFilter:
 
 
 # ---------------------------------------------------------------------------
+# Tests for model_type validation and DEnsembleModel dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_model_type_raises():
+    """Unknown model.type raises ValueError with the bad value in the message."""
+    import ashare_lab.research.train as train_mod
+
+    mock_qlib = mock.MagicMock()
+    mock_qlib.config.C = mock.MagicMock(registered=True)
+
+    with mock.patch.dict("sys.modules", {
+        "qlib": mock_qlib,
+        "qlib.config": mock_qlib.config,
+        "qlib.contrib.data.handler": mock.MagicMock(),
+        "qlib.contrib.model.gbdt": mock.MagicMock(),
+        "qlib.data.dataset": mock.MagicMock(),
+        "qlib.contrib.data.dataset": mock.MagicMock(),
+        "ashare_lab.data.update": mock.MagicMock(),
+    }), mock.patch(
+        "ashare_lab.research.train.load_config",
+        return_value={"model": {"type": "bogus", "handler": "alpha158"}},
+    ):
+        window = {
+            "window_id": 1,
+            "train_start": "2018-01-01", "train_end": "2020-12-31",
+            "valid_start": "2021-01-01", "valid_end": "2021-06-30",
+            "test_start": "2021-07-01", "test_end": "2021-12-31",
+        }
+        with pytest.raises(ValueError, match="bogus"):
+            train_mod.train_window(window, Path("/tmp/test_exp"), "csi1000")
+
+
+def test_densemble_dispatch():
+    """model.type=densemble calls DEnsembleModel with expected params."""
+    import ashare_lab.research.train as train_mod
+
+    mock_qlib = mock.MagicMock()
+    mock_qlib.config.C = mock.MagicMock(registered=True)
+
+    mock_de_cls = mock.MagicMock()
+    mock_de_mod = mock.MagicMock()
+    mock_de_mod.DEnsembleModel = mock_de_cls
+    mock_de_instance = mock.MagicMock()
+    mock_de_cls.return_value = mock_de_instance
+    # predict returns a Series
+    mock_de_instance.predict.return_value = pd.Series(
+        [0.5], index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    mock_dataset_cls = mock.MagicMock()
+    mock_dataset_mod = mock.MagicMock()
+    mock_dataset_mod.DatasetH = mock_dataset_cls
+    mock_dataset_mod.TSDatasetH = mock.MagicMock()
+    mock_dataset_instance = mock.MagicMock()
+    mock_dataset_cls.return_value = mock_dataset_instance
+
+    # prepare returns a DataFrame with one label column
+    mock_dataset_instance.prepare.return_value = pd.DataFrame(
+        {"label": [0.01]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    with mock.patch.dict("sys.modules", {
+        "qlib": mock_qlib,
+        "qlib.config": mock_qlib.config,
+        "qlib.contrib.data.handler": mock.MagicMock(),
+        "qlib.contrib.model.gbdt": mock.MagicMock(),
+        "qlib.contrib.model.double_ensemble": mock_de_mod,
+        "qlib.data.dataset": mock_dataset_mod,
+        "qlib.contrib.data.dataset": mock.MagicMock(),
+        "ashare_lab.data.update": mock.MagicMock(),
+    }), mock.patch(
+        "ashare_lab.research.train.load_config",
+        return_value={"model": {
+            "type": "densemble", "handler": "alpha158",
+            "num_models": 6, "epochs": 28, "decay": 0.5,
+        }},
+    ), mock.patch(
+        "ashare_lab.research.train.apply_price_filter",
+        side_effect=lambda pred, *a, **kw: pred,
+    ):
+        window = {
+            "window_id": 1,
+            "train_start": "2018-01-01", "train_end": "2020-12-31",
+            "valid_start": "2021-01-01", "valid_end": "2021-06-30",
+            "test_start": "2021-07-01", "test_end": "2021-12-31",
+        }
+        model_path, pred, label = train_mod.train_window(
+            window, Path("/tmp/test_exp"), "csi1000",
+        )
+
+    # Verify DEnsembleModel was constructed with expected params
+    call_kwargs = mock_de_cls.call_args
+    assert call_kwargs.kwargs["num_models"] == 6
+    assert call_kwargs.kwargs["epochs"] == 28
+    assert call_kwargs.kwargs["decay"] == 0.5
+    assert call_kwargs.kwargs["base_model"] == "gbm"
+    mock_de_instance.fit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Tests for run_backtest
 # ---------------------------------------------------------------------------
 

@@ -9,7 +9,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from ashare_lab.research.metrics import aggregate_window_metrics, daily_rank_ic
+from ashare_lab.research.metrics import (
+    CELL_SCHEMA_KEYS,
+    aggregate_window_metrics,
+    compute_max_drawdown,
+    daily_rank_ic,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +40,54 @@ def _make_bench_close(dates, closes):
     """Build a benchmark close Series with DatetimeIndex."""
     idx = pd.DatetimeIndex([pd.Timestamp(d) for d in dates])
     return pd.Series(closes, index=idx, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Tests for compute_max_drawdown and CELL_SCHEMA_KEYS
+# ---------------------------------------------------------------------------
+
+
+def test_compute_max_drawdown():
+    """Known return series produces correct max drawdown."""
+    # [0.1, -0.2, 0.05, -0.15]:
+    # cumulative: 1.1, 0.88, 0.924, 0.7854
+    # running_max: 1.1, 1.1, 1.1, 1.1
+    # drawdown: 0, -0.2, -0.16, -0.286
+    df = _make_portfolio_df(
+        ["2023-01-03", "2023-01-04", "2023-01-05", "2023-01-06"],
+        [0.1, -0.2, 0.05, -0.15],
+    )
+    result = compute_max_drawdown(df)
+    assert result < 0, "Max drawdown should be negative"
+    # Hand-calculated: (0.7854 - 1.1) / 1.1 = -0.286
+    assert result == pytest.approx(-0.286, abs=0.001)
+
+
+def test_maxdd_empty():
+    """Empty DataFrame returns 0.0."""
+    df = pd.DataFrame({"return": []}, index=pd.DatetimeIndex([]))
+    assert compute_max_drawdown(df) == 0.0
+
+
+def test_maxdd_all_positive():
+    """All-positive returns means no drawdown -> 0.0."""
+    df = _make_portfolio_df(
+        ["2023-01-03", "2023-01-04", "2023-01-05"],
+        [0.01, 0.02, 0.03],
+    )
+    assert compute_max_drawdown(df) == 0.0
+
+
+def test_maxdd_total_loss():
+    """Return of -1.0 (total loss) returns -1.0, not NaN."""
+    df = _make_portfolio_df(["2023-01-03"], [-1.0])
+    result = compute_max_drawdown(df)
+    assert result == -1.0
+
+
+def test_cell_schema_keys():
+    """CELL_SCHEMA_KEYS contains exactly the 6 expected keys."""
+    assert CELL_SCHEMA_KEYS == ["model", "window", "ic", "excess", "maxdd", "completed_at"]
 
 
 # ---------------------------------------------------------------------------
