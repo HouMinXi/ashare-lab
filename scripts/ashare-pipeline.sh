@@ -89,6 +89,18 @@ sync_code_to_gpu() {
 # ---- Step 3: GPU inference with retry (B6: retry GPU BEFORE pipeline) ----
 
 try_gpu_inference() {
+    # Check GPU lock before any work (guards both first attempt and retry).
+    if [ -e /tmp/ashare-gpu.lock ]; then
+        exec 9<>/tmp/ashare-gpu.lock
+        if ! flock -n 9; then
+            echo "GPU locked by batch_experiment.py, skipping inference (using stale predictions)"
+            exec 9>&-
+            return 1
+        fi
+        flock -u 9
+        exec 9>&-
+    fi
+
     local GPU_START=$SECONDS
 
     # WoL
@@ -137,23 +149,9 @@ try_gpu_inference() {
     return 0
 }
 
-# First GPU attempt (skip if batch_experiment.py holds the GPU lock)
-if [ -e /tmp/ashare-gpu.lock ]; then
-    exec 9<>/tmp/ashare-gpu.lock
-    if ! flock -n 9; then
-        echo "GPU locked by batch_experiment.py, skipping inference (using stale predictions)"
-        exec 9>&-
-        GPU_RC=1
-    else
-        flock -u 9
-        exec 9>&-
-        try_gpu_inference
-        GPU_RC=$?
-    fi
-else
-    try_gpu_inference
-    GPU_RC=$?
-fi
+# First GPU attempt
+try_gpu_inference
+GPU_RC=$?
 
 # GPU retry: wait 30min, try once more (BEFORE pipeline, B6)
 if [ $GPU_RC -ne 0 ]; then

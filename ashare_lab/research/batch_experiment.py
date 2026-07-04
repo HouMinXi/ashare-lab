@@ -92,10 +92,13 @@ def commit_summary_csv(output_dir: str, project_root: str) -> None:
         ["git", "add", "matrix_summary.csv"],
         cwd=project_root, check=True, timeout=60,
     )
-    subprocess.run(
+    result = subprocess.run(
         ["git", "commit", "-m", "research: update matrix summary CSV"],
         cwd=project_root, check=False, timeout=60,
+        capture_output=True, text=True,
     )
+    if result.returncode != 0 and "nothing to commit" not in result.stdout:
+        log.error("git commit failed: %s", result.stderr[:200])
 
 
 def scp_config_to_gpu(
@@ -133,9 +136,17 @@ def scp_results(
             ["scp", "-r", remote, str(local.parent)],
             check=False, timeout=300,
         )
+        if result.returncode != 0:
+            log.warning(
+                "scp_results failed for %s (rc=%d). Retry: scp -r %s %s",
+                model_tag, result.returncode, remote, local.parent,
+            )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        log.warning("scp_results failed for %s: %s", model_tag, exc)
+        log.warning(
+            "scp_results failed for %s: %s. Retry: scp -r %s %s",
+            model_tag, exc, remote, local.parent,
+        )
         return False
 
 
@@ -259,18 +270,15 @@ def run_matrix(
                         )
                         continue
                     record["model"] = seed_tag
-                    append_result(jsonl_path, record)
-                    completed.add((seed_tag, wid))
-                    seed_preds_collected.append(seed)
 
-                    # SCP prediction parquet back.
+                    # SCP artifacts BEFORE marking complete (W2-F2: a cell
+                    # is complete only when its parquets are on X500).
                     pred_name = f"pred_w{wid}_seed{seed}.parquet"
                     scp_pred_from_gpu(
                         gpu_host, gpu_repo,
                         f"matrix_results/{tag}", str(Path(output_dir) / tag),
                         pred_name,
                     )
-                    # Labels from first seed only.
                     if seed == seeds[0]:
                         scp_pred_from_gpu(
                             gpu_host, gpu_repo,
@@ -278,6 +286,10 @@ def run_matrix(
                             str(Path(output_dir) / tag),
                             f"labels_w{wid}.parquet",
                         )
+
+                    append_result(jsonl_path, record)
+                    completed.add((seed_tag, wid))
+                    seed_preds_collected.append(seed)
 
                 # Average predictions across seeds if all completed.
                 if len(seed_preds_collected) == len(seeds):
@@ -327,10 +339,7 @@ def run_matrix(
                         tag, wid, result.stdout[-200:],
                     )
                     continue
-                append_result(jsonl_path, record)
-                completed.add((tag, wid))
-
-                # SCP prediction + labels back.
+                # SCP artifacts BEFORE marking complete (W2-F2).
                 scp_pred_from_gpu(
                     gpu_host, gpu_repo,
                     f"matrix_results/{tag}", str(Path(output_dir) / tag),
@@ -341,6 +350,9 @@ def run_matrix(
                     f"matrix_results/{tag}", str(Path(output_dir) / tag),
                     f"labels_w{wid}.parquet",
                 )
+
+                append_result(jsonl_path, record)
+                completed.add((tag, wid))
 
         # SCP full results dir after all windows.
         scp_ok = scp_results(output_dir, tag, gpu_host, gpu_repo)
