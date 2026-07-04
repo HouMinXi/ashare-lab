@@ -60,10 +60,14 @@ sync_code_to_gpu() {
     rm -rf "$STAGING"
     mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
     cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
+    # matrix_runner and matrix configs may not exist on fresh deploys.
+    cp "$REPO/ashare_lab/research/matrix_runner.py" "$STAGING/ashare_lab/research/" 2>/dev/null || true
     cp "$REPO/ashare_lab/config.py" "$STAGING/ashare_lab/"
     touch "$STAGING/ashare_lab/__init__.py"
     touch "$STAGING/ashare_lab/research/__init__.py"
     cp "$REPO/configs/baseline.yaml" "$STAGING/configs/"
+    cp "$REPO"/configs/matrix_*.yaml "$STAGING/configs/" 2>/dev/null || true
 
     if ! scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/"; then
         echo "WARNING: GPU code sync failed (non-fatal)"
@@ -133,9 +137,23 @@ try_gpu_inference() {
     return 0
 }
 
-# First GPU attempt
-try_gpu_inference
-GPU_RC=$?
+# First GPU attempt (skip if batch_experiment.py holds the GPU lock)
+if [ -e /tmp/ashare-gpu.lock ]; then
+    exec 9<>/tmp/ashare-gpu.lock
+    if ! flock -n 9; then
+        echo "GPU locked by batch_experiment.py, skipping inference (using stale predictions)"
+        exec 9>&-
+        GPU_RC=1
+    else
+        flock -u 9
+        exec 9>&-
+        try_gpu_inference
+        GPU_RC=$?
+    fi
+else
+    try_gpu_inference
+    GPU_RC=$?
+fi
 
 # GPU retry: wait 30min, try once more (BEFORE pipeline, B6)
 if [ $GPU_RC -ne 0 ]; then
