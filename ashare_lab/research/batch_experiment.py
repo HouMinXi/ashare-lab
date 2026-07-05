@@ -247,11 +247,17 @@ def run_matrix(
                     cmd += '"'
 
                     with _gpu_lock():
-                        # ponytail: errors='replace' -- Windows GPU emits GBK in stderr
-                        result = subprocess.run(
-                            cmd, shell=True, capture_output=True,
-                            encoding="utf-8", errors="replace", timeout=7200,
-                        )
+                        try:
+                            result = subprocess.run(
+                                cmd, shell=True, capture_output=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=14400,
+                            )
+                        except subprocess.TimeoutExpired:
+                            log.error(
+                                "TIMEOUT %s w%d seed%d after 4h", tag, wid, seed,
+                            )
+                            continue
 
                     if result.returncode != 0:
                         log.error(
@@ -320,10 +326,15 @@ def run_matrix(
                 cmd += '"'
 
                 with _gpu_lock():
-                    result = subprocess.run(
-                        cmd, shell=True, capture_output=True,
-                        encoding="utf-8", errors="replace", timeout=7200,
-                    )
+                    try:
+                        result = subprocess.run(
+                            cmd, shell=True, capture_output=True,
+                            encoding="utf-8", errors="replace",
+                            timeout=14400,
+                        )
+                    except subprocess.TimeoutExpired:
+                        log.error("TIMEOUT %s w%d after 4h", tag, wid)
+                        continue
 
                 if result.returncode != 0:
                     log.error(
