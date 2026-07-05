@@ -84,7 +84,7 @@ def apply_regime_filter(
 ) -> tuple[pd.Series, int]:
     """Adjust effective topk based on regime signal.
 
-    Does NOT retrain the model (per D-08). Only adjusts position sizing:
+    Does NOT retrain the model. Only adjusts position sizing:
       - ma20_above_pct < cash_threshold: go to cash (effective_topk = 0)
       - ma20_above_pct < reduce_threshold: halve (effective_topk = topk // 2)
       - otherwise: full exposure (effective_topk = topk)
