@@ -1,11 +1,14 @@
 ---
-# Candidate C: TRA, Alpha360
-# Pitfall 1: input_size=6 (6 raw features x 60 timesteps), NOT 360
+# Candidate F: TRA sample-mode, Alpha360
+# MODEL VARIANT -- batch_size>0 uses transport_sample (different Sinkhorn scope
+# than daily mode). This is a separate candidate, not a speedup of C.
 model:
   type: tra
-  tag: c_tra360
+  tag: f_tra360_sample
   handler: alpha360
   step_len: 60
+  batch_size: 512
+  use_amp: true
   backbone:
     input_size: 6
     hidden_size: 64
@@ -26,6 +29,6 @@ model:
   n_epochs: 200
   early_stop: 30
   lr: 0.001
-  use_amp: true
 matrix:
-  tag: c_tra360
+  tag: f_tra360_sample
+  seeds: [42, 123, 456]

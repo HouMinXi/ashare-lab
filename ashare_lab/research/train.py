@@ -256,16 +256,41 @@ def train_window(
         # Note: batch_size<0 is required only for memory_mode='daily', not 'sample' (see
         # MTSDatasetH source: assert memory_mode=="sample" or batch_size<0).
         # num_states must match routing_cfg["num_states"] passed to TRAModel below.
+        tra_batch_size: int = cfg_model.get("batch_size", -1)
+        if tra_batch_size == 0:
+            raise ValueError(
+                "model.batch_size must not be 0 (use -1 for daily mode, >0 for sample mode)"
+            )
         dataset = MTSDatasetH(
             handler=handler,
             segments=segs,
             seq_len=step_len,
             num_states=num_states,
             memory_mode="sample",
-            batch_size=-1,
+            batch_size=tra_batch_size,
             shuffle=True,
         )
         log.info("W%d: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
+        # ponytail: pin_memory on MTSDatasetH iter; upgrade to DataLoader if
+        # profiling shows host-to-device transfer is still the bottleneck.
+        if cfg_model.get("use_amp", False):
+            import torch as _torch  # noqa: PLC0415
+
+            if _torch.cuda.is_available():
+                _orig_iter = dataset.__class__.__iter__
+
+                def _pinned_iter(self):
+                    for batch in _orig_iter(self):
+                        yield {
+                            k: v.pin_memory() if hasattr(v, "pin_memory") else v
+                            for k, v in batch.items()
+                        }
+
+                dataset.__class__ = type(
+                    dataset.__class__.__name__ + "Pinned",
+                    (dataset.__class__,),
+                    {"__iter__": _pinned_iter},
+                )
     else:
         # lgbm and densemble both use DatasetH (tabular, no time-axis batching).
         dataset = DatasetH(handler=handler, segments=segs)
@@ -291,6 +316,17 @@ def train_window(
             GPU=cfg_model.get("GPU", 0),
             seed=effective_seed,
         )
+        if cfg_model.get("use_amp", False):
+            import torch as _torch  # noqa: PLC0415
+
+            _original_fit = model.fit
+
+            def _amp_fit(dataset, *a, **kw):
+                with _torch.amp.autocast(device_type="cuda", dtype=_torch.bfloat16):
+                    return _original_fit(dataset, *a, **kw)
+
+            model.fit = _amp_fit
+            log.info("W%d: AMP enabled (bfloat16)", window_id)
         model.fit(dataset)
     elif model_type == "tra":
         # TRAModel: Temporal Routing Adaptor (KDD 2021).
@@ -320,6 +356,28 @@ def train_window(
             lr=cfg_model.get("lr", 1e-3),
             seed=effective_seed,
         )
+        if cfg_model.get("use_amp", False):
+            import torch as _torch  # noqa: PLC0415
+
+            # bf16 tensor .numpy() crashes -- no numpy bf16 dtype.
+            # Cast to fp32 before the original assign_data writes back.
+            _orig_assign = dataset.assign_data
+
+            def _safe_assign(index, vals):
+                if isinstance(vals, _torch.Tensor):
+                    vals = vals.float()
+                return _orig_assign(index, vals)
+
+            dataset.assign_data = _safe_assign
+
+            _original_fit = model.fit
+
+            def _amp_fit(dataset, *a, **kw):
+                with _torch.amp.autocast(device_type="cuda", dtype=_torch.bfloat16):
+                    return _original_fit(dataset, *a, **kw)
+
+            model.fit = _amp_fit
+            log.info("W%d: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
         model.fit(dataset)
     elif model_type == "densemble":
         from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415

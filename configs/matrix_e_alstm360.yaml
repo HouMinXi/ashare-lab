@@ -15,5 +15,6 @@ model:
   batch_size: 800
   early_stop: 20
   GPU: 0
+  use_amp: true
 matrix:
   tag: e_alstm360
