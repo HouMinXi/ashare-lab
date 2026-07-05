@@ -282,7 +282,9 @@ def train_window(
                 def _pinned_iter(self):
                     for batch in _orig_iter(self):
                         yield {
-                            k: v.pin_memory() if hasattr(v, "pin_memory") else v
+                            k: v.pin_memory()
+                            if hasattr(v, "pin_memory") and not v.is_cuda
+                            else v
                             for k, v in batch.items()
                         }
 
