@@ -158,6 +158,17 @@ def run_cell(
         if missing:
             raise ValueError(f"record missing keys: {missing}")
 
+        # Persist result to GPU-local file so batch_experiment can recover
+        # it via SCP if the SSH stdout pipe breaks.
+        result_name = (
+            f"result_w{window_id}_seed{seed}.json"
+            if seed is not None
+            else f"result_w{window_id}.json"
+        )
+        result_path = out / result_name
+        result_path.write_text(json.dumps(record), encoding="utf-8")
+        log.info("result written: %s", result_path)
+
         return record
 
     finally:

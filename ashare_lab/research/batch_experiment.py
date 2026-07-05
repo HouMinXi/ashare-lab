@@ -150,6 +150,51 @@ def scp_results(
         return False
 
 
+def _kill_remote_python(gpu_host: str) -> None:
+    """Kill all python.exe on GPU to clean orphaned processes."""
+    try:
+        subprocess.run(
+            f'ssh -o ConnectTimeout=5 {gpu_host} "taskkill /f /im python.exe"',
+            shell=True, capture_output=True, timeout=15,
+        )
+        log.info("killed remote python processes on %s", gpu_host)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.warning("remote cleanup failed: %s", exc)
+
+
+def _recover_result_from_gpu(
+    gpu_host: str,
+    gpu_repo: str,
+    tag: str,
+    wid: int,
+    local_dir: str,
+    seed: int | None = None,
+) -> dict | None:
+    """Try to SCP result JSON from GPU when stdout was lost.
+
+    Returns parsed record dict, or None if file does not exist on GPU.
+    """
+    result_name = (
+        f"result_w{wid}_seed{seed}.json"
+        if seed is not None
+        else f"result_w{wid}.json"
+    )
+    remote = f"{gpu_host}:{gpu_repo}/matrix_results/{tag}/{result_name}"
+    local_path = Path(local_dir) / tag / result_name
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cp = subprocess.run(
+            ["scp", remote, str(local_path)],
+            check=False, capture_output=True, timeout=15,
+        )
+        if cp.returncode != 0:
+            return None
+        return json.loads(local_path.read_text(encoding="utf-8"))
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+        log.warning("result recovery failed for %s w%d: %s", tag, wid, exc)
+        return None
+
+
 @contextmanager
 def _gpu_lock():
     """Serialize GPU access via flock."""
@@ -257,24 +302,31 @@ def run_matrix(
                             log.error(
                                 "TIMEOUT %s w%d seed%d after 4h", tag, wid, seed,
                             )
+                            _kill_remote_python(gpu_host)
                             continue
 
-                    if result.returncode != 0:
-                        log.error(
-                            "FAIL %s w%d seed%d: %s",
-                            tag, wid, seed, result.stderr[-500:],
-                        )
-                        continue
+                    record = None
+                    if result.returncode == 0:
+                        stdout_lines = result.stdout.strip().split("\n")
+                        try:
+                            record = json.loads(stdout_lines[-1])
+                        except json.JSONDecodeError:
+                            pass
 
-                    # Parse last stdout line as JSON record.
-                    stdout_lines = result.stdout.strip().split("\n")
-                    try:
-                        record = json.loads(stdout_lines[-1])
-                    except json.JSONDecodeError:
-                        log.error(
-                            "FAIL %s w%d seed%d: no valid JSON in stdout: %s",
-                            tag, wid, seed, result.stdout[-200:],
+                    if record is None:
+                        record = _recover_result_from_gpu(
+                            gpu_host, gpu_repo, tag, wid, output_dir,
+                            seed=seed,
                         )
+
+                    if record is None:
+                        log.error(
+                            "FAIL %s w%d seed%d: no result from stdout "
+                            "or GPU file. stderr: %s",
+                            tag, wid, seed,
+                            (result.stderr or "")[-500:],
+                        )
+                        _kill_remote_python(gpu_host)
                         continue
                     record["model"] = seed_tag
 
@@ -334,22 +386,30 @@ def run_matrix(
                         )
                     except subprocess.TimeoutExpired:
                         log.error("TIMEOUT %s w%d after 4h", tag, wid)
+                        _kill_remote_python(gpu_host)
                         continue
 
-                if result.returncode != 0:
-                    log.error(
-                        "FAIL %s w%d: %s", tag, wid, result.stderr[-500:],
-                    )
-                    continue
+                record = None
+                if result.returncode == 0:
+                    stdout_lines = result.stdout.strip().split("\n")
+                    try:
+                        record = json.loads(stdout_lines[-1])
+                    except json.JSONDecodeError:
+                        pass
 
-                stdout_lines = result.stdout.strip().split("\n")
-                try:
-                    record = json.loads(stdout_lines[-1])
-                except json.JSONDecodeError:
-                    log.error(
-                        "FAIL %s w%d: no valid JSON in stdout: %s",
-                        tag, wid, result.stdout[-200:],
+                if record is None:
+                    # stdout lost or SSH failed; try GPU-side result file.
+                    record = _recover_result_from_gpu(
+                        gpu_host, gpu_repo, tag, wid, output_dir,
                     )
+
+                if record is None:
+                    log.error(
+                        "FAIL %s w%d: no result from stdout or GPU file. "
+                        "stderr: %s", tag, wid,
+                        (result.stderr or "")[-500:],
+                    )
+                    _kill_remote_python(gpu_host)
                     continue
                 # SCP artifacts BEFORE marking complete (W2-F2).
                 scp_pred_from_gpu(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -14,6 +15,8 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from ashare_lab.research.batch_experiment import (
+    _kill_remote_python,
+    _recover_result_from_gpu,
     append_result,
     commit_summary_csv,
     discover_configs,
@@ -592,3 +595,66 @@ def test_average_seeds_direct(
     assert ("a_avg", 1) in completed
     rec = json.loads(jsonl.read_text().strip())
     assert rec["model"] == "a_avg"
+
+
+# -- test_kill_remote_python --
+
+@patch("subprocess.run")
+def test_kill_remote_python_success(mock_run: MagicMock) -> None:
+    mock_run.return_value = MagicMock(returncode=0)
+    _kill_remote_python("fake@host")
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+    assert "taskkill" in cmd
+    assert "python.exe" in cmd
+
+
+@patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 15))
+def test_kill_remote_python_timeout(mock_run: MagicMock) -> None:
+    """Timeout is swallowed, not raised."""
+    _kill_remote_python("fake@host")  # must not raise
+
+
+# -- test_recover_result_from_gpu --
+
+@patch("subprocess.run")
+def test_recover_result_success(mock_run: MagicMock, tmp_path: Path) -> None:
+    record = _make_record("a", 1)
+    local_path = tmp_path / "a" / "result_w1.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def fake_scp(cmd, **kwargs):
+        # Simulate SCP writing the file.
+        local_path.write_text(json.dumps(record))
+        return MagicMock(returncode=0)
+
+    mock_run.side_effect = fake_scp
+    result = _recover_result_from_gpu("host", "/repo", "a", 1, str(tmp_path))
+    assert result == record
+
+
+@patch("subprocess.run")
+def test_recover_result_scp_fails(mock_run: MagicMock, tmp_path: Path) -> None:
+    mock_run.return_value = MagicMock(returncode=1)
+    result = _recover_result_from_gpu("host", "/repo", "a", 1, str(tmp_path))
+    assert result is None
+
+
+@patch("subprocess.run")
+def test_recover_result_with_seed(mock_run: MagicMock, tmp_path: Path) -> None:
+    record = _make_record("a_seed42", 1)
+    local_path = tmp_path / "a" / "result_w1_seed42.json"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def fake_scp(cmd, **kwargs):
+        local_path.write_text(json.dumps(record))
+        return MagicMock(returncode=0)
+
+    mock_run.side_effect = fake_scp
+    result = _recover_result_from_gpu(
+        "host", "/repo", "a", 1, str(tmp_path), seed=42,
+    )
+    assert result == record
+    # Verify correct filename was used.
+    scp_cmd = mock_run.call_args[0][0]
+    assert "result_w1_seed42.json" in str(scp_cmd)
