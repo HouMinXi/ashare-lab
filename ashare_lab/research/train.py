@@ -108,7 +108,7 @@ def train_window(
 
     Supports four model types selected via config model.type:
       lgbm      -- LightGBM + DatasetH; saves w{id}.pkl via to_pickle()
-      alstm     -- Attention-LSTM + TSDatasetH; saves w{id}.pt via torch.save()
+      alstm     -- Attention-LSTM + TSDatasetH (or DatasetH for alpha360); saves w{id}.pt via torch.save()
       tra       -- Temporal Routing Adaptor + MTSDatasetH; saves w{id}.pt via torch.save()
       densemble -- DoubleEnsemble + DatasetH; saves w{id}.pkl via to_pickle()
 
@@ -240,9 +240,16 @@ def train_window(
 
     if model_type == "alstm":
         step_len = cfg_model.get("step_len", 20)
-        dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
+        if cfg_handler == "alpha360":
+            # Alpha360 produces 360 flat features (6 fields x 60 lags).
+            # ALSTM.forward reshapes (N, 360) -> (N, 6, 60) -> (N, 60, 6)
+            # internally via view + permute.  Use flat DatasetH to avoid
+            # double-windowing (TSDatasetH would yield (N, step_len, 360)).
+            dataset = DatasetH(handler=handler, segments=segs)
+            log.info("W%d: ALSTM alpha360 flat path (DatasetH)", window_id)
+        else:
+            dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
     elif model_type == "tra":
-        step_len = cfg_model.get("step_len", 60)
         routing_cfg: dict = dict(cfg_model.get("routing", {}))
         num_states: int = routing_cfg.get("num_states", 0)
         if num_states < 1:
@@ -250,16 +257,23 @@ def train_window(
                 "model.routing.num_states must be >= 1 for TRA "
                 "(got %r); add routing.num_states to configs/baseline.yaml" % num_states
             )
-        # MTSDatasetH maintains per-stock loss memory for TRA's optimal transport.
-        # batch_size=-1 selects daily sampling (one batch = all stocks for one trading day),
-        # which aligns with daily financial data structure; matches the MTSDatasetH default.
-        # Note: batch_size<0 is required only for memory_mode='daily', not 'sample' (see
-        # MTSDatasetH source: assert memory_mode=="sample" or batch_size<0).
-        # num_states must match routing_cfg["num_states"] passed to TRAModel below.
         tra_batch_size: int = cfg_model.get("batch_size", -1)
         if tra_batch_size == 0:
             raise ValueError(
                 "model.batch_size must not be 0 (use -1 for daily mode, >0 for sample mode)"
+            )
+        step_len = cfg_model.get("step_len", 60)
+        if cfg_handler == "alpha360":
+            # Alpha360 + MTSDatasetH is incompatible at input_size=6:
+            # Alpha360's 360 cols = 6 fields x 60 lags (already windowed).
+            # MTSDatasetH with seq_len=60 double-windows to (N, 60, 360).
+            # seq_len=1 breaks TRA's routing memory (hist_loss length 0).
+            # TRA with Alpha360 requires input_size=360 or a custom handler.
+            raise ValueError(
+                "TRA with handler=alpha360 and input_size=6 is not supported: "
+                "Alpha360 produces 360 flat features (6 fields x 60 lags) "
+                "which conflicts with MTSDatasetH windowing. Use handler=alpha158 "
+                "with input_size=158, or set backbone.input_size=360."
             )
         dataset = MTSDatasetH(
             handler=handler,
@@ -301,10 +315,13 @@ def train_window(
     # Build model.
     # -----------------------------------------------------------------------
     if model_type == "alstm":
-        # pytorch_alstm_ts is the TSDatasetH-compatible variant
-        from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
-
         d_feat = cfg_model.get("d_feat", 360)
+        if cfg_handler == "alpha360":
+            # Flat variant: takes (N, 360) and reshapes to (N, 60, 6) internally.
+            from qlib.contrib.model.pytorch_alstm import ALSTM  # noqa: PLC0415
+        else:
+            # TS variant: takes TSDatasetH output directly.
+            from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
         log.info("W%d: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
         model = ALSTM(
             d_feat=d_feat,
@@ -318,18 +335,23 @@ def train_window(
             GPU=cfg_model.get("GPU", 0),
             seed=effective_seed,
         )
+        _original_fit_alstm = None
         if cfg_model.get("use_amp", False):
             import torch as _torch  # noqa: PLC0415
 
-            _original_fit = model.fit
+            _original_fit_alstm = model.fit
 
             def _amp_fit(dataset, *a, **kw):
                 with _torch.amp.autocast(device_type="cuda", dtype=_torch.bfloat16):
-                    return _original_fit(dataset, *a, **kw)
+                    return _original_fit_alstm(dataset, *a, **kw)
 
             model.fit = _amp_fit
             log.info("W%d: AMP enabled (bfloat16)", window_id)
-        model.fit(dataset)
+        try:
+            model.fit(dataset)
+        finally:
+            if _original_fit_alstm is not None:
+                model.fit = _original_fit_alstm  # restore for pickling
     elif model_type == "tra":
         # TRAModel: Temporal Routing Adaptor (KDD 2021).
         # GPU device is auto-detected via torch.cuda.is_available() at module level;
@@ -358,6 +380,7 @@ def train_window(
             lr=cfg_model.get("lr", 1e-3),
             seed=effective_seed,
         )
+        _original_fit_tra = None
         if cfg_model.get("use_amp", False):
             import torch as _torch  # noqa: PLC0415
 
@@ -372,15 +395,19 @@ def train_window(
 
             dataset.assign_data = _safe_assign
 
-            _original_fit = model.fit
+            _original_fit_tra = model.fit
 
             def _amp_fit(dataset, *a, **kw):
                 with _torch.amp.autocast(device_type="cuda", dtype=_torch.bfloat16):
-                    return _original_fit(dataset, *a, **kw)
+                    return _original_fit_tra(dataset, *a, **kw)
 
             model.fit = _amp_fit
             log.info("W%d: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
-        model.fit(dataset)
+        try:
+            model.fit(dataset)
+        finally:
+            if _original_fit_tra is not None:
+                model.fit = _original_fit_tra  # restore for pickling
     elif model_type == "densemble":
         from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415
 
