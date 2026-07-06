@@ -129,16 +129,16 @@ paper:
     #   Gemini:        https://generativelanguage.googleapis.com/v1beta/openai
     #   Azure OpenAI:  https://{resource}.openai.azure.com/openai/v1
     #   Bedrock:       https://bedrock-runtime.{region}.amazonaws.com/openai/v1
-    llm_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
-    llm_model: "mimo-v2.5-pro"
-    llm_api_key_pass: "api/mimo-pro"
+    llm_base_url: "http://localhost:20129/v1"
+    llm_model: "harness-priority"
+    llm_api_key_pass: "api/omniroute"
     llm_timeout: 30
     llm_extra_body: {}
   report:
     # LLM config -- see sentiment section above for supported providers.
-    llm_base_url: "https://token-plan-cn.xiaomimimo.com/v1"
-    llm_model: "mimo-v2.5-pro"
-    llm_api_key_pass: "api/mimo-pro"
+    llm_base_url: "http://localhost:20129/v1"
+    llm_model: "harness-priority"
+    llm_api_key_pass: "api/omniroute"
     llm_timeout: 30
     llm_extra_body: {}
     ilink_timeout: 15
