@@ -144,7 +144,7 @@ paper:
     ilink_timeout: 15
     ilink_max_message_length: 4000
     ilink_chunk_delay: 0.3
-    fallback_service: "serverchan"
+    fallback_service: ""
     fallback_timeout: 15
     detailed_triggers:
       daily_loss_pct: 0.02
