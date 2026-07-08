@@ -342,16 +342,23 @@ class TestCallLlmScoreWireFormat:
         }
         assert _call_llm_score("test", cfg) == 0
 
-    def test_missing_required_keys_returns_zero(self):
+    def test_missing_required_keys_returns_zero(self, caplog):
+        import logging
         from ashare_lab.paper.sentiment import _call_llm_score
 
         # Old deepseek_* keys no longer recognized -- missing llm_* = return 0.
-        cfg = {"deepseek_model": "some-model", "deepseek_timeout": 10}
-        assert _call_llm_score("test", cfg) == 0
+        with caplog.at_level(logging.ERROR):
+            cfg = {"deepseek_model": "some-model", "deepseek_timeout": 10}
+            assert _call_llm_score("test", cfg) == 0
+            assert "missing required key" in caplog.text
+
+        caplog.clear()
 
         # Partial config -- missing llm_model.
-        cfg2 = {"llm_base_url": "http://localhost:20129/v1"}
-        assert _call_llm_score("test", cfg2) == 0
+        with caplog.at_level(logging.ERROR):
+            cfg2 = {"llm_base_url": "http://localhost:20129/v1"}
+            assert _call_llm_score("test", cfg2) == 0
+            assert "missing required key" in caplog.text
 
     def test_non_dict_extra_body_ignored(self, sentiment_config):
         from ashare_lab.paper.sentiment import _call_llm_score
