@@ -36,3 +36,4 @@ run_*.py
 results/
 results_*/
 *.html
+.mcp.json

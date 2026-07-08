@@ -92,6 +92,21 @@ Phase 3+ paper engine runs on X500. Test results for Phase 3/4/5 are collected f
 The 60/40 TRA/nTRA blend ratio is LOCKED. Do not sweep weights, add parameters, or introduce trainable blend coefficients. Live OOS decides whether to keep it.
 
 
+## Fleet Zone Discipline (harness-fleet org-charter 2026-07-07)
+
+ashare group sovereign territory (Zone C): paper.db, models, pipeline, sentinel, gpu-win BOX operations. No other group edits Zone C; cross-zone needs are contracts via fleet.
+
+**H0b ownership**: ashare EXECUTES + OPERATES qwen serving on gpu-win. Zero ashare-lab code edits during observation window. Config edits via mhou_workspace worktree only.
+
+**gpu-win contention**: serving is default GPU owner; training batches acquire `H:\gpu.lock`, serving yields. Stale-lock TTL (mtime-based expiry).
+
+**X500 timer namespace** (reserved): dsa-sentinel 18:50, data-update 00:30, pipeline 01:00, fetch-today 17:00/18:00/21:00 (CST). Harness dispatcher gets separate namespace per J2.
+
+Fleet law binding: S1/S2/S2b, known-answer validation, pre-registration, zone discipline, R4 agent contract, Golden Rules 1-6. Full ref: memory `reference_fleet_assignments.md`.
+
+**Coordinated session**: trinity-router (`~/code/trinity-router/`) is part of ashare group (assigned 2026-07-07). Provides LLM benchmark infrastructure (probe_common, worker_pool, HumanEval+/DebugBench/MBPP/LCB datasets, 8-model baseline). Current task: H0b W1 qwen3.6-27B evaluation.
+
+
 ## Sync Rule
 
 Any change to this CLAUDE.md or to ashare-lab project memory must be followed by a scan of ~/CLAUDE.md and ~/code/ashare-lab/.planning/ memory files for consistency. If a rule here contradicts or duplicates a global rule, resolve it: project-specific overrides go here, universal rules stay global, and duplicates are removed from the less-specific location.
