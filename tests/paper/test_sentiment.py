@@ -256,12 +256,12 @@ class TestCallLlmScoreWireFormat:
 
         assert score == 2
         call_args = mock_post.call_args
-        assert call_args[0][0] == "https://api.deepseek.com/chat/completions"
+        assert call_args[0][0] == "http://localhost:20129/v1/chat/completions"
         assert call_args[1]["headers"]["Authorization"] == "Bearer sk-test-key"
         body = call_args[1]["json"]
-        assert body["model"] == "deepseek-v4-flash"
+        assert body["model"] == "auto/smart"
         assert body["messages"] == [{"role": "user", "content": "test prompt"}]
-        mock_secret.assert_called_once_with("ashare/deepseek-api-key")
+        mock_secret.assert_called_once_with("api/omniroute")
 
     @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-mimo")
     @patch("requests.post")
@@ -311,16 +311,16 @@ class TestCallLlmScoreWireFormat:
         mock_post.return_value = mock_resp
 
         cfg = {
-            "llm_base_url": "https://api.deepseek.com",
-            "llm_model": "deepseek-v4-flash",
-            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_base_url": "http://localhost:20129/v1",
+            "llm_model": "auto/smart",
+            "llm_api_key_pass": "api/omniroute",
             "llm_timeout": 5,
             "llm_extra_body": {"model": "WRONG", "max_tokens": 512},
         }
         _call_llm_score("test", cfg)
 
         body = mock_post.call_args[1]["json"]
-        assert body["model"] == "deepseek-v4-flash"
+        assert body["model"] == "auto/smart"
         assert body["max_tokens"] == 512
 
     @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test")
@@ -334,33 +334,24 @@ class TestCallLlmScoreWireFormat:
         mock_post.return_value = mock_resp
 
         cfg = {
-            "llm_base_url": "https://api.deepseek.com",
-            "llm_model": "deepseek-v4-flash",
-            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_base_url": "http://localhost:20129/v1",
+            "llm_model": "auto/smart",
+            "llm_api_key_pass": "api/omniroute",
             "llm_timeout": 5,
             "llm_extra_body": {},
         }
         assert _call_llm_score("test", cfg) == 0
 
-    @patch("ashare_lab.paper.sentiment._get_secret", return_value="sk-test")
-    @patch("requests.post")
-    def test_backward_compat_old_keys(self, mock_post, mock_secret):
+    def test_missing_required_keys_returns_zero(self):
         from ashare_lab.paper.sentiment import _call_llm_score
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": "1"}}],
-        }
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
+        # Old deepseek_* keys no longer recognized -- missing llm_* = return 0.
+        cfg = {"deepseek_model": "some-model", "deepseek_timeout": 10}
+        assert _call_llm_score("test", cfg) == 0
 
-        cfg = {"deepseek_model": "deepseek-v4-flash", "deepseek_timeout": 10}
-        score = _call_llm_score("test", cfg)
-        assert score == 1
-        body = mock_post.call_args[1]["json"]
-        assert body["model"] == "deepseek-v4-flash"
-        assert mock_post.call_args[1]["timeout"] == 10
-        mock_secret.assert_called_once_with("ashare/deepseek-api-key")
+        # Partial config -- missing llm_model.
+        cfg2 = {"llm_base_url": "http://localhost:20129/v1"}
+        assert _call_llm_score("test", cfg2) == 0
 
     def test_non_dict_extra_body_ignored(self, sentiment_config):
         from ashare_lab.paper.sentiment import _call_llm_score
@@ -392,9 +383,9 @@ class TestCallLlmScoreWireFormat:
         mock_post.return_value = mock_resp
 
         cfg = {
-            "llm_base_url": "https://api.deepseek.com",
-            "llm_model": "deepseek-v4-flash",
-            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_base_url": "http://localhost:20129/v1",
+            "llm_model": "auto/smart",
+            "llm_api_key_pass": "api/omniroute",
             "llm_timeout": 5,
             "llm_extra_body": {"messages": [{"role": "system", "content": "BAD"}]},
         }
@@ -415,9 +406,9 @@ class TestCallLlmScoreWireFormat:
         mock_post.return_value = mock_resp
 
         cfg = {
-            "llm_base_url": "https://api.deepseek.com",
-            "llm_model": "deepseek-v4-flash",
-            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_base_url": "http://localhost:20129/v1",
+            "llm_model": "auto/smart",
+            "llm_api_key_pass": "api/omniroute",
             "llm_timeout": 5,
             "llm_extra_body": {},
         }
@@ -436,15 +427,15 @@ class TestCallLlmScoreWireFormat:
         mock_post.return_value = mock_resp
 
         cfg = {
-            "llm_base_url": "https://api.deepseek.com/",
-            "llm_model": "deepseek-v4-flash",
-            "llm_api_key_pass": "ashare/deepseek-api-key",
+            "llm_base_url": "http://localhost:20129/v1/",
+            "llm_model": "auto/smart",
+            "llm_api_key_pass": "api/omniroute",
             "llm_timeout": 5,
             "llm_extra_body": {},
         }
         _call_llm_score("test", cfg)
         url = mock_post.call_args[0][0]
-        assert url == "https://api.deepseek.com/chat/completions"
+        assert url == "http://localhost:20129/v1/chat/completions"
 
 
 # -------------------------------------------------------------------

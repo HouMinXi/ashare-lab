@@ -132,12 +132,23 @@ try_gpu_inference() {
     # Sync code to GPU before inference
     sync_code_to_gpu || echo "WARNING: code sync failed, proceeding with existing GPU code"
 
+    # W4: clear GPU for predict (stop ollama + llama-server)
+    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training' || \
+        echo "WARNING: gpu-switch training failed (non-fatal)"
+
     # Run predict.py on GPU
+    local predict_rc=0
     if ! timeout $GPU_PREDICT_TIMEOUT ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
         "cd /d H:\\ashare-lab && python -m ashare_lab.research.predict --date $TRADE_DATE --provider-uri H:/.qlib/qlib_data/cn_data"; then
         echo "ERROR: GPU predict.py failed or timed out"
-        return 1
+        predict_rc=1
     fi
+
+    # W4: restore ollama after predict (always, even on failure)
+    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat ollama' || \
+        echo "WARNING: gpu-switch ollama failed (non-fatal)"
+
+    [ $predict_rc -ne 0 ] && return 1
 
     # SCP predictions back
     mkdir -p "$PREDICTIONS_DIR"

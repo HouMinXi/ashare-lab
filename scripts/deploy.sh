@@ -36,7 +36,7 @@ python3 -m ashare_lab.cli update || echo "WARNING: data update failed (non-fatal
 echo "==> Checking prerequisites"
 
 MISSING=0
-for key in ashare/weixin-token ashare/weixin-chat-id ashare/deepseek-api-key; do
+for key in ashare/weixin-token ashare/weixin-chat-id api/omniroute; do
     if ! pass show "$key" >/dev/null 2>&1; then
         echo "ERROR: pass key '$key' not found. Add with: pass insert $key"
         MISSING=1

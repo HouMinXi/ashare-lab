@@ -721,3 +721,68 @@ def test_ping_ok_failure(mock_run: MagicMock) -> None:
     from ashare_lab.research.batch_experiment import _ping_ok
     mock_run.return_value = MagicMock(returncode=1)
     assert _ping_ok("1.2.3.4") is False
+
+
+# -- W4: ollama service control tests --
+
+
+@patch("subprocess.run")
+def test_gpu_switch_stop_ok(mock_run: MagicMock) -> None:
+    from ashare_lab.research.batch_experiment import _gpu_switch
+    mock_run.return_value = MagicMock(returncode=0)
+    _gpu_switch("admin@192.168.100.11", "training")
+    cmd = mock_run.call_args[0][0]
+    assert "gpu-switch" in " ".join(cmd)
+    assert "training" in " ".join(cmd)
+
+
+@patch("subprocess.run")
+def test_gpu_switch_start_ok(mock_run: MagicMock) -> None:
+    from ashare_lab.research.batch_experiment import _gpu_switch
+    mock_run.return_value = MagicMock(returncode=0)
+    _gpu_switch("admin@192.168.100.11", "ollama")
+    cmd = mock_run.call_args[0][0]
+    assert "ollama" in " ".join(cmd)
+
+
+@patch("subprocess.run")
+def test_gpu_switch_failure_warns(mock_run: MagicMock, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+    from ashare_lab.research.batch_experiment import _gpu_switch
+    mock_run.return_value = MagicMock(returncode=1, stderr="access denied")
+    with caplog.at_level(logging.WARNING):
+        _gpu_switch("admin@192.168.100.11", "training")
+    assert "failed" in caplog.text
+
+
+@patch("ashare_lab.research.batch_experiment._gpu_switch")
+@patch("ashare_lab.research.batch_experiment._run_matrix_inner")
+@patch("ashare_lab.research.batch_experiment.ensure_gpu_online")
+def test_run_matrix_stops_ollama_and_restarts(
+    mock_gpu: MagicMock,
+    mock_inner: MagicMock,
+    mock_ctl: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """run_matrix stops ollama before training, restarts after."""
+    from ashare_lab.research.batch_experiment import run_matrix
+    run_matrix(str(tmp_path), str(tmp_path / "out"))
+    actions = [c[0][1] for c in mock_ctl.call_args_list]
+    assert actions == ["training", "ollama"]
+
+
+@patch("ashare_lab.research.batch_experiment._gpu_switch")
+@patch("ashare_lab.research.batch_experiment._run_matrix_inner", side_effect=RuntimeError("boom"))
+@patch("ashare_lab.research.batch_experiment.ensure_gpu_online")
+def test_run_matrix_restarts_ollama_on_crash(
+    mock_gpu: MagicMock,
+    mock_inner: MagicMock,
+    mock_ctl: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Ollama service restarts even if training crashes (finally block)."""
+    from ashare_lab.research.batch_experiment import run_matrix
+    with pytest.raises(RuntimeError, match="boom"):
+        run_matrix(str(tmp_path), str(tmp_path / "out"))
+    start_calls = [c for c in mock_ctl.call_args_list if c[0][1] == "ollama"]
+    assert len(start_calls) == 1

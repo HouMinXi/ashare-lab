@@ -356,17 +356,15 @@ def _call_llm_score(prompt: str, config: dict) -> int:
     try:
         import requests  # noqa: PLC0415
 
-        # Read config with backward-compat fallback to old deepseek_* keys.
-        base_url = config.get(
-            "llm_base_url", config.get("deepseek_base_url", "https://api.deepseek.com"),
-        )
-        model = config.get(
-            "llm_model", config.get("deepseek_model", "deepseek-v4-flash"),
-        )
-        api_key_pass = config.get("llm_api_key_pass", "ashare/deepseek-api-key")
-        timeout = config.get(
-            "llm_timeout", config.get("deepseek_timeout", 30),
-        )
+        # LLM config -- provider-agnostic, all fields required in config.
+        for key in ("llm_base_url", "llm_model", "llm_api_key_pass"):
+            if key not in config:
+                logger.error("sentiment config missing required key: %s", key)
+                return 0
+        base_url = config["llm_base_url"]
+        model = config["llm_model"]
+        api_key_pass = config["llm_api_key_pass"]
+        timeout = config.get("llm_timeout", 30)
         extra_body = config.get("llm_extra_body", {})
 
         # Validate base_url scheme.

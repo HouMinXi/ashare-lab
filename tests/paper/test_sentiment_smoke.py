@@ -1,6 +1,6 @@
-"""T3 smoke tests: real eastmoney news fetch + real deepseek scoring.
+"""T3 smoke tests: real eastmoney news fetch + real LLM scoring via OmniRoute.
 
-Run on X500 only (needs pass store with ashare/deepseek-api-key).
+Run on X500 only (needs pass store with api/omniroute).
 All tests marked @pytest.mark.integration -- excluded from normal runs.
 """
 
@@ -13,14 +13,14 @@ import subprocess
 
 import pytest
 
-# Module-level skip: if deepseek API key is not available, skip everything.
+# Module-level skip: if OmniRoute API key is not available, skip everything.
 try:
     subprocess.run(
-        ["pass", "show", "ashare/deepseek-api-key"],
+        ["pass", "show", "api/omniroute"],
         capture_output=True, text=True, check=True, timeout=5,
     )
 except Exception:
-    pytest.skip("deepseek API key not available", allow_module_level=True)
+    pytest.skip("OmniRoute API key not available", allow_module_level=True)
 
 from ashare_lab.config import load_config
 from ashare_lab.paper.ledger import init_schema
@@ -74,7 +74,7 @@ class TestSentimentSmoke:
             assert "date" in a
 
     @pytest.mark.timeout(60)
-    def test_deepseek_score_live(self, sent_cfg):
+    def test_llm_score_live(self, sent_cfg):
         prompt = _build_stock_prompt(
             "000001", "Ping An Bank",
             [{"title": "test", "content": "neutral news",

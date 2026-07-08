@@ -318,9 +318,53 @@ def run_matrix(
         project_root: Git repo root for CSV commit.  None = skip commit.
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    jsonl_path = str(Path(output_dir) / "results.jsonl")
-
     ensure_gpu_online(ip=gpu_host.rsplit("@", 1)[-1])
+    _gpu_switch(gpu_host, "training")
+
+    try:
+        _run_matrix_inner(
+            configs_dir, output_dir, smoke, n_epochs,
+            windows, gpu_host, gpu_repo, project_root,
+        )
+    finally:
+        _gpu_switch(gpu_host, "ollama")
+
+
+def _gpu_switch(gpu_host: str, target: str) -> None:
+    """Switch GPU consumer on gpu-win via H:\\gpu-switch.bat over SSH.
+
+    Valid targets: ollama, llama-server, training.
+    Never raises -- logs warnings on failure so the finally block
+    in run_matrix cannot mask the original training exception.
+    """
+    try:
+        host_ip = gpu_host.rsplit("@", 1)[-1]
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", f"admin@{host_ip}",
+             r"H:\gpu-switch.bat", target],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        if result.returncode == 0:
+            log.info("gpu-switch %s OK on %s", target, host_ip)
+        else:
+            log.warning("gpu-switch %s failed (rc=%d): %s",
+                         target, result.returncode, result.stderr.strip())
+    except Exception:
+        log.warning("gpu-switch %s error on %s", target, gpu_host, exc_info=True)
+
+
+def _run_matrix_inner(
+    configs_dir: str,
+    output_dir: str,
+    smoke: bool,
+    n_epochs: int | None,
+    windows: list[int] | None,
+    gpu_host: str,
+    gpu_repo: str,
+    project_root: str | None,
+) -> None:
+    """Inner matrix loop, extracted for ollama stop/start wrapping."""
+    jsonl_path = str(Path(output_dir) / "results.jsonl")
 
     # SCP baseline.yaml to GPU at start.
     from ashare_lab.config import CONFIG_PATH  # noqa: PLC0415
