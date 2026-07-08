@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from ashare_lab.research.batch_experiment import (
+    _DEFAULT_GPU_IP,
     _kill_remote_python,
     _recover_result_from_gpu,
     append_result,
@@ -26,6 +27,14 @@ from ashare_lab.research.batch_experiment import (
     scp_results,
 )
 from ashare_lab.research.metrics import CELL_SCHEMA_KEYS
+
+
+@pytest.fixture(autouse=True)
+def _mock_gpu_online(monkeypatch):
+    """Prevent real WOL/ping in all tests."""
+    monkeypatch.setattr(
+        "ashare_lab.research.batch_experiment.ensure_gpu_online", lambda *a, **kw: None,
+    )
 
 
 def _make_record(model: str = "a_lgb", window: int = 1, **overrides) -> dict:
@@ -658,3 +667,57 @@ def test_recover_result_with_seed(mock_run: MagicMock, tmp_path: Path) -> None:
     # Verify correct filename was used.
     scp_cmd = mock_run.call_args[0][0]
     assert "result_w1_seed42.json" in str(scp_cmd)
+
+
+# -- ensure_gpu_online / _ping_ok unit tests --
+
+
+def _real_ensure_gpu_online():
+    """Import the real function, bypassing autouse mock."""
+    import importlib
+    import ashare_lab.research.batch_experiment as mod
+    importlib.reload(mod)
+    return mod.ensure_gpu_online
+
+
+def test_ensure_gpu_already_online(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ashare_lab.research.batch_experiment as mod
+    real_fn = _real_ensure_gpu_online()
+    monkeypatch.setattr(mod, "_ping_ok", lambda ip: True)
+    real_fn()  # should return immediately
+
+
+def test_ensure_gpu_wol_then_online(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ashare_lab.research.batch_experiment as mod
+    real_fn = _real_ensure_gpu_online()
+    ping_results = iter([False, False, True])
+    monkeypatch.setattr(mod, "_ping_ok", lambda ip: next(ping_results))
+    monkeypatch.setattr(mod, "_wait_ssh", lambda ip, **kw: None)
+    monkeypatch.setattr("wakeonlan.wake", lambda mac, **kw: None)
+    real_fn(timeout=30, poll=0)
+
+
+def test_ensure_gpu_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ashare_lab.research.batch_experiment as mod
+    real_fn = _real_ensure_gpu_online()
+    monkeypatch.setattr(mod, "_ping_ok", lambda ip: False)
+    monkeypatch.setattr("wakeonlan.wake", lambda mac, **kw: None)
+    with pytest.raises(RuntimeError, match="did not respond"):
+        real_fn(timeout=1, poll=0)
+
+
+@patch("subprocess.run")
+def test_ping_ok_success(mock_run: MagicMock) -> None:
+    from ashare_lab.research.batch_experiment import _ping_ok
+    mock_run.return_value = MagicMock(returncode=0)
+    assert _ping_ok("1.2.3.4") is True
+    cmd = mock_run.call_args[0][0]
+    assert "ping" in cmd
+    assert "1.2.3.4" in cmd
+
+
+@patch("subprocess.run")
+def test_ping_ok_failure(mock_run: MagicMock) -> None:
+    from ashare_lab.research.batch_experiment import _ping_ok
+    mock_run.return_value = MagicMock(returncode=1)
+    assert _ping_ok("1.2.3.4") is False

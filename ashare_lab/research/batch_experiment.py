@@ -26,8 +26,96 @@ from ashare_lab.research.metrics import CELL_SCHEMA_KEYS
 log = logging.getLogger(__name__)
 
 _DEFAULT_GPU_HOST = "admin@192.168.100.11"
+_DEFAULT_GPU_IP = "192.168.100.11"
+_DEFAULT_GPU_MAC = "04:7c:16:49:be:32"
 _DEFAULT_GPU_REPO = r"H:\ashare-lab"
 _GPU_LOCK_PATH = "/tmp/ashare-gpu.lock"
+
+
+def ensure_gpu_online(
+    ip: str = _DEFAULT_GPU_IP,
+    mac: str = _DEFAULT_GPU_MAC,
+    timeout: int = 180,
+    poll: int = 5,
+) -> None:
+    """Wake GPU machine via WOL if offline, block until SSH is ready.
+
+    Raises:
+        RuntimeError: If machine does not come online within timeout.
+    """
+    import time  # noqa: PLC0415
+
+    if _ping_ok(ip):
+        log.info("GPU %s already online", ip)
+        return
+
+    try:
+        from wakeonlan import wake  # noqa: PLC0415
+        wake(mac, ip_address=_broadcast_for(ip))
+        log.info("WOL sent to %s (%s)", ip, mac)
+    except ImportError:
+        raise RuntimeError(
+            "GPU offline and wakeonlan not installed: pip install wakeonlan"
+        )
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll)
+        if _ping_ok(ip):
+            _wait_ssh(ip)
+            log.info("GPU %s online after WOL", ip)
+            return
+
+    raise RuntimeError(f"GPU {ip} did not respond within {timeout}s after WOL")
+
+
+def _broadcast_for(ip: str) -> str:
+    """Derive broadcast address from local interface matching the target IP's subnet."""
+    import ipaddress  # noqa: PLC0415
+    import netifaces  # noqa: PLC0415
+
+    target = ipaddress.IPv4Address(ip)
+    for iface in netifaces.interfaces():
+        addrs = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
+        for a in addrs:
+            addr = a.get("addr", "")
+            mask = a.get("netmask", "")
+            if not addr or not mask:
+                continue
+            try:
+                net = ipaddress.IPv4Network(f"{addr}/{mask}", strict=False)
+                if target in net:
+                    return str(net.broadcast_address)
+            except ValueError:
+                continue
+    raise RuntimeError(
+        f"No local interface found in the same subnet as {ip}; "
+        "cannot determine broadcast address for WOL"
+    )
+
+
+def _ping_ok(ip: str) -> bool:
+    """Single ping, return True if host responds."""
+    return subprocess.run(
+        ["ping", "-c", "1", "-W", "2", ip],
+        capture_output=True,
+        timeout=10,
+    ).returncode == 0
+
+
+def _wait_ssh(ip: str, port: int = 22, timeout: int = 60, poll: int = 3) -> None:
+    """Poll until SSH port accepts connections."""
+    import socket  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((ip, port), timeout=5):
+                return
+        except OSError:
+            time.sleep(poll)
+    log.warning("SSH port %d on %s not ready after %ds, proceeding anyway", port, ip, timeout)
 
 
 def discover_configs(configs_dir: str) -> list[Path]:
@@ -231,6 +319,8 @@ def run_matrix(
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     jsonl_path = str(Path(output_dir) / "results.jsonl")
+
+    ensure_gpu_online(ip=gpu_host.rsplit("@", 1)[-1])
 
     # SCP baseline.yaml to GPU at start.
     from ashare_lab.config import CONFIG_PATH  # noqa: PLC0415
