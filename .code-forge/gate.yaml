@@ -1,0 +1,21 @@
+backends:
+  deepseek:
+    type: api
+    format: openai
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    model: deepseek-v4-flash
+    max_tokens: 8192
+    default: true
+  mimo-pro:
+    type: api
+    format: openai
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
+    api_key_env: MIMO_PRO_API_KEY
+    model: mimo-v2.5-pro
+    stream: true
+    timeout_s: 3600
+
+test:
+  command: [pytest, -q, --timeout=60]
+  timeout_seconds: 900
