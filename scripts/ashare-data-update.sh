@@ -24,7 +24,7 @@ sync_gpu_data() {
         echo "sync_gpu_data: scp failed"
         return 1
     fi
-    if ! ssh "${GPU_USER}@${GPU_HOST}" "cd /d H:/.qlib/qlib_data && tar xzf cn_data_sync.tar.gz && del cn_data_sync.tar.gz"; then
+    if ! ssh "${GPU_USER}@${GPU_HOST}" "cd /d H:\.qlib\qlib_data && rmdir /s /q cn_data 2>nul && tar xzf cn_data_sync.tar.gz && del cn_data_sync.tar.gz"; then
         echo "sync_gpu_data: ssh extract failed"
         return 1
     fi
