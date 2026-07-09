@@ -132,6 +132,15 @@ try_gpu_inference() {
     # Sync code to GPU before inference
     sync_code_to_gpu || echo "WARNING: code sync failed, proceeding with existing GPU code"
 
+    # Verify GPU has today's trade date in qlib calendar (prevent stale data race)
+    local gpu_has_date
+    gpu_has_date=$(ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
+        "python -c \"import qlib; qlib.init(provider_uri='H:/.qlib/qlib_data/cn_data', region='cn'); from qlib.data import D; cal=D.calendar(start_time='$TRADE_DATE',end_time='$TRADE_DATE'); print('yes' if len(cal)>0 else 'no')\"" 2>/dev/null | tail -1)
+    if [ "$gpu_has_date" != "yes" ]; then
+        echo "ERROR: GPU qlib data missing trade date $TRADE_DATE (data sync incomplete)"
+        return 1
+    fi
+
     # W4: clear GPU for predict (stop ollama + llama-server)
     ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training' || \
         echo "WARNING: gpu-switch training failed (non-fatal)"
