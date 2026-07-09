@@ -14,6 +14,7 @@ def base_report():
         total_nav=300000.0,
         cash=150000.0,
         daily_return_pct=1.5,
+        daily_pnl=4500.0,
         cumulative_return_pct=10.0,
         max_drawdown_pct=5.0,
         cash_ratio=50.0,
@@ -46,6 +47,7 @@ def base_report():
                 "unrealized_pnl": 100.0,
                 "weight": 10.0,
                 "daily_change_pct": 0.05,
+                "daily_pnl": 50.0,
             },
             {
                 "symbol": "SZ000002",
@@ -55,6 +57,7 @@ def base_report():
                 "unrealized_pnl": -50.0,
                 "weight": 40.0,
                 "daily_change_pct": -0.03,
+                "daily_pnl": -120.0,
             },
             {
                 "symbol": "SZ000003",
@@ -64,6 +67,7 @@ def base_report():
                 "unrealized_pnl": 0.0,
                 "weight": 50.0,
                 "daily_change_pct": 0.0,
+                "daily_pnl": 0.0,
             },
         ],
         pending_orders=[
@@ -132,13 +136,13 @@ def test_positions_sorted_by_change_desc(base_report):
             if "明日" in line or "风控" in line or "✅" in line or "⚠" in line:
                 break
             pos_lines.append(line)
-    # PingAn (+5%) should come before ZhongXin (0%) before WanKe (-3%)
+    # Sorted by abs(daily_change) desc: PingAn (5%) > WanKe (3%) > ZhongXin (0%)
     names_in_order = []
     for pl in pos_lines:
         for name in ["PingAn", "ZhongXin", "WanKe"]:
             if name in pl:
                 names_in_order.append(name)
-    assert names_in_order == ["PingAn", "ZhongXin", "WanKe"]
+    assert names_in_order == ["PingAn", "WanKe", "ZhongXin"]
 
 
 def test_positive_change_up_triangle(base_report):

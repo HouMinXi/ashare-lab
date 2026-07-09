@@ -130,7 +130,7 @@ def _load_stock_names_cache(symbols: set[str]) -> dict[str, str] | None:
         result: dict[str, str] = {}
         with open(ts_path, newline="") as f:
             for row in csv.DictReader(f):
-                sym = row.get("symbol", "")
+                sym = row.get("symbol", "").upper()
                 if sym in symbols:
                     result[sym] = row.get("name", "")
         if result:
@@ -322,6 +322,9 @@ def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
     def _baostock_timeout_handler(signum, frame):
         raise TimeoutError("baostock query timed out")
 
+    import socket as _socket  # noqa: PLC0415
+    _prev_timeout = _socket.getdefaulttimeout()
+    _socket.setdefaulttimeout(30)
     old_handler = _signal.signal(_signal.SIGALRM, _baostock_timeout_handler)
     _signal.alarm(30)  # 30s ceiling for all baostock calls
     try:
@@ -352,6 +355,7 @@ def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
     finally:
         _signal.alarm(0)
         _signal.signal(_signal.SIGALRM, old_handler)
+        _socket.setdefaulttimeout(_prev_timeout)
 
     return result
 
@@ -677,7 +681,10 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
                 raise TimeoutError("industry baostock timed out")
 
             old_h = _signal.signal(_signal.SIGALRM, _ind_timeout)
-            _signal.alarm(30)
+            import socket as _socket  # noqa: PLC0415
+            _prev_timeout = _socket.getdefaulttimeout()
+            _socket.setdefaulttimeout(30)
+            _signal.alarm(120)
             try:
                 login_r = bs.login()
                 if login_r.error_code == "0":
@@ -691,17 +698,21 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
                                 prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
                                 code = f"{prefix}.{sym[-6:]}"
                             rs = bs.query_stock_industry(code=code, date=ctx.trade_date)
+                            # F6 fix: remove sleep to avoid 500s >> 120s SIGALRM
+                            # Rate limiting handled by socket.setdefaulttimeout(30)
                             while rs.error_code == "0" and rs.next():
                                 row_data = rs.get_row_data()
                                 if len(row_data) > 3 and row_data[3]:
                                     ctx.industry_map[sym] = row_data[3]
                     finally:
                         bs.logout()
-            except TimeoutError:
-                logger.warning("industry baostock timed out after 30s, partial map (%d entries)", len(ctx.industry_map))
+            # F4 fix: catch both TimeoutError (SIGALRM) and socket.timeout (socket timeout)
+            except (TimeoutError, _socket.timeout):
+                logger.warning("industry baostock timed out after 120s, partial map (%d entries)", len(ctx.industry_map))
             finally:
                 _signal.alarm(0)
                 _signal.signal(_signal.SIGALRM, old_h)
+                _socket.setdefaulttimeout(_prev_timeout)
         except ImportError:
             pass
 

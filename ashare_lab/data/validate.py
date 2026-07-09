@@ -6,7 +6,6 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-import baostock as bs
 import numpy as np
 import pandas as pd
 
@@ -54,6 +53,8 @@ def _load_qlib_feature(
 def _fetch_baostock_raw(
     symbol: str, start_date: str, end_date: str
 ) -> pd.DataFrame | None:
+    import baostock as bs  # noqa: PLC0415 -- lazy to avoid import-time TCP hang
+
     bs_code = _qlib_code_to_baostock(symbol)
     lg = bs.login()
     if lg.error_code != "0":

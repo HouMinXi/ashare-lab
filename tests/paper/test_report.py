@@ -87,6 +87,7 @@ def dummy_report_data():
         total_nav=300000.0,
         cash=150000.0,
         daily_return_pct=1.5,
+        daily_pnl=4500.0,
         cumulative_return_pct=10.0,
         max_drawdown_pct=5.0,
         cash_ratio=50.0,
@@ -138,6 +139,19 @@ def test_format_chinese_report_header(dummy_report_data):
 def test_format_chinese_report_risk_normal(dummy_report_data):
     txt = format_chinese_report(dummy_report_data)
     assert "✅" in txt  # checkmark
+
+def test_format_chinese_report_nav_pnl(dummy_report_data):
+    """F14: verify daily_pnl appears in NAV line."""
+    txt = format_chinese_report(dummy_report_data)
+    # daily_pnl=4500.0, daily_return_pct=1.5
+    assert "+1.50%" in txt
+    assert "+4,500元" in txt
+
+def test_format_chinese_report_trade_amount(dummy_report_data):
+    """F15: verify trade amount in yuan appears."""
+    txt = format_chinese_report(dummy_report_data)
+    # qty=100, price=10.0 -> amount=1000
+    assert "1,000元" in txt
 
 @patch("subprocess.run")
 def test_get_secret(mock_run):

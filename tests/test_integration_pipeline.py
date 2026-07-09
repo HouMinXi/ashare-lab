@@ -53,7 +53,7 @@ class TestStockNameCachePreference:
             w.writerow(["code", "code_name"])
             w.writerow(["sz.000001", "OldPingAn"])
 
-        symbols = {"sz000001", "sh600000"}
+        symbols = {"SZ000001", "SH600000"}
 
         p1, p2 = self._patch_roots(tmp_path)
         with p1, p2:
@@ -62,8 +62,8 @@ class TestStockNameCachePreference:
             result = _load_stock_names_cache(symbols)
 
         assert result is not None
-        assert result["sz000001"] == "PingAnBank"
-        assert result["sh600000"] == "PuFaBank"
+        assert result["SZ000001"] == "PingAnBank"
+        assert result["SH600000"] == "PuFaBank"
 
     def test_falls_back_to_baostock(self, tmp_path: Path):
         bs_dir = tmp_path / "data" / "baostock_cache"
@@ -74,7 +74,7 @@ class TestStockNameCachePreference:
             w.writerow(["code", "code_name"])
             w.writerow(["sz.000001", "OldPingAn"])
 
-        symbols = {"sz000001"}
+        symbols = {"SZ000001"}
 
         p1, p2 = self._patch_roots(tmp_path)
         with p1, p2:
@@ -83,7 +83,7 @@ class TestStockNameCachePreference:
             result = _load_stock_names_cache(symbols)
 
         assert result is not None
-        assert result["sz000001"] == "OldPingAn"
+        assert result["SZ000001"] == "OldPingAn"
 
     def test_returns_none_when_no_cache(self, tmp_path: Path):
         (tmp_path / "data").mkdir(parents=True)
@@ -142,6 +142,7 @@ class TestReportChineseFormat:
             total_nav=250000.0,
             cash=80000.0,
             daily_return_pct=0.75,
+            daily_pnl=1875.0,
             cumulative_return_pct=5.0,
             max_drawdown_pct=3.2,
             cash_ratio=32.0,

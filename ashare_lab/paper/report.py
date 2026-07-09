@@ -35,6 +35,7 @@ class ReportData:
     total_nav: float
     cash: float
     daily_return_pct: float
+    daily_pnl: float
     cumulative_return_pct: float
     max_drawdown_pct: float
     cash_ratio: float
@@ -82,6 +83,7 @@ def gather_report_data(
     
     prev_nav = float(row_prev["total_nav"]) if row_prev else total_nav
     daily_return_pct = (total_nav - prev_nav) / prev_nav * 100.0 if prev_nav > 0 else 0.0
+    daily_pnl = total_nav - prev_nav
     
     prev_bench = row_prev["benchmark_csi1000"] if row_prev else None
     if prev_bench is not None and today_bench is not None and float(prev_bench) > 0:
@@ -153,29 +155,40 @@ def gather_report_data(
         ind = industry_map.get(sym, "Unknown")
         ind_dist[ind] = ind_dist.get(ind, 0) + 1
 
-    # Daily change per stock from qlib bin data
+    # Daily change per stock: compare per-share price vs previous trading day.
+    # qlib $change is T+1 delayed (chenditc updates overnight), so we use
+    # positions table which has same-day market_value from pipeline prices.
+    # F2 note: market_value = close * qty. If stock is suspended, close=0
+    # and market_value=0, but qty > 0. Division by zero is prevented by
+    # old_mv > 0 guard. Pipeline always sets market_value = close * qty.
+    # F10 note: adjustfactor handled by step6 before positions are written.
+    # Per-share price comparison remains correct across factor changes.
     daily_changes: dict[str, float] = {}
+    daily_pnls: dict[str, float] = {}
     if positions:
-        try:
-            from qlib.data import D
-            pos_syms = [p["symbol"] for p in positions]
-            df = D.features(
-                instruments=pos_syms,
-                fields=["$change"],
-                start_time=trade_date,
-                end_time=trade_date,
-            )
-            if df is not None and not df.empty:
-                for idx_tuple, row in df.iterrows():
-                    sym = idx_tuple[0] if isinstance(idx_tuple, tuple) else str(idx_tuple)
-                    val = row.iloc[0]
-                    if val == val:  # not NaN
-                        daily_changes[sym] = float(val)
-        except Exception as exc:
-            logger.warning("qlib daily change query failed: %s", exc)
+        prev_rows = conn.execute(
+            "SELECT symbol, market_value, qty FROM positions "
+            "WHERE trade_date = (SELECT MAX(trade_date) FROM positions WHERE trade_date < ?)",
+            (trade_date,),
+        ).fetchall()
+        prev_mv: dict[str, tuple[float, int]] = {}
+        for r in prev_rows:
+            prev_mv[r["symbol"]] = (float(r["market_value"]), int(r["qty"]))
+        for p in positions:
+            sym = p["symbol"]
+            if sym in prev_mv and p["qty"] > 0:
+                old_mv, old_qty = prev_mv[sym]
+                if old_qty > 0 and old_mv > 0:
+                    today_price = p["market_value"] / p["qty"]
+                    prev_price = old_mv / old_qty
+                    daily_changes[sym] = today_price / prev_price - 1  # fractional, e.g. 0.05 = 5%
+                    daily_pnls[sym] = (today_price - prev_price) * p["qty"]
 
     for p in positions:
         p["daily_change_pct"] = daily_changes.get(p["symbol"], 0.0)
+        # F3 note: initial position (no prev day) shows 0 change.
+        # This is correct behavior - no reference price to compare.
+        p["daily_pnl"] = daily_pnls.get(p["symbol"], 0.0)
 
     # Pending orders
     order_rows = conn.execute(
@@ -235,6 +248,7 @@ def gather_report_data(
         total_nav=total_nav,
         cash=cash,
         daily_return_pct=daily_return_pct,
+        daily_pnl=daily_pnl,
         cumulative_return_pct=cumulative_return_pct,
         max_drawdown_pct=max_drawdown_pct,
         cash_ratio=cash_ratio,
@@ -256,6 +270,17 @@ def gather_report_data(
     )
 
 
+def _display_name(name: str, symbol: str) -> str:
+    """Format as '中曼石油(603619)' or fallback to raw symbol."""
+    if name:
+        return f"{name}({symbol[2:]})"
+    return symbol
+
+
+# Maximum positions shown before collapsing to summary.
+_TOP_N = 5
+
+
 def format_chinese_report(
     report_data: ReportData,
     sentiment_section: str | None = None,
@@ -268,9 +293,12 @@ def format_chinese_report(
     lines.append(f"\U0001f4ca ashare-lab {rd.trade_date}")
     lines.append("")
 
-    # NAV + metrics
+    # NAV + daily P&L in yuan
     excess = rd.daily_return_pct - rd.benchmark_return_pct
-    lines.append(f"\U0001f4b0 净值 {rd.total_nav:,.2f} ({rd.daily_return_pct:+.2f}%)")
+    lines.append(
+        f"\U0001f4b0 净值 {rd.total_nav:,.2f} "
+        f"({rd.daily_return_pct:+.2f}% / {rd.daily_pnl:+,.0f}元)"
+    )
     lines.append(
         f"\U0001f4c8 累计 {rd.cumulative_return_pct:+.2f}% | "
         f"回撤 {rd.max_drawdown_pct:.2f}% | "
@@ -278,50 +306,77 @@ def format_chinese_report(
     )
     lines.append(f"\U0001f3af 超额 vs CSI1000 {excess:+.2f}%")
 
-    # Trades
+    # Trades with amount
     if rd.trades:
         lines.append("")
         lines.append(f"{_SEP} 今日交易 {_SEP}")
         for t in rd.trades:
-            name = t["name"] or t["symbol"]
-            if t["side"] == "buy":
-                lines.append(f"\U0001f7e2 买 {name} {t['qty']}股 @{t['price']:.2f}")
-            else:
-                lines.append(f"\U0001f534 卖 {name} {t['qty']}股 @{t['price']:.2f}")
+            name = _display_name(t.get("name", ""), t["symbol"])
+            amount = t["qty"] * t["price"]
+            side_icon = "\U0001f7e2 买" if t["side"] == "buy" else "\U0001f534 卖"
+            lines.append(f"{side_icon} {name} {t['qty']}股 @{t['price']:.2f} ({amount:,.0f}元)")
 
-    # Positions sorted by daily change desc
+    # Positions: top N by abs(daily_change), with P&L yuan
+    # F12 note: sort by abs(daily_change) to show biggest movers regardless
+    # of direction. Intentional design change (user requested "涨跌TOP").
     if rd.positions:
-        sorted_pos = sorted(rd.positions, key=lambda p: p.get("daily_change_pct", 0.0), reverse=True)
+        all_zero = all(p.get("daily_change_pct", 0.0) == 0.0 for p in rd.positions)
+        if all_zero:
+            sorted_pos = sorted(rd.positions, key=lambda p: p.get("weight", 0.0), reverse=True)
+        else:
+            sorted_pos = sorted(
+                rd.positions,
+                key=lambda p: abs(p.get("daily_change_pct", 0.0)),
+                reverse=True,
+            )
+
+        # F13 fix: apply _TOP_N cap even when all_zero to prevent message overflow
+        show_all = len(sorted_pos) <= _TOP_N
+        display_pos = sorted_pos[:_TOP_N]
+        title = f"持仓分布 ({len(sorted_pos)}只)" if show_all else "涨跌TOP"
+
         lines.append("")
-        lines.append(f"{_SEP} 持仓分布 ({len(sorted_pos)}只) {_SEP}")
-        for p in sorted_pos:
-            name = p["name"] or p["symbol"]
+        lines.append(f"{_SEP} {title} {_SEP}")
+        for p in display_pos:
+            name = _display_name(p.get("name", ""), p["symbol"])
             change = p.get("daily_change_pct", 0.0)
-            # $change from qlib is fractional return (e.g. 0.05 = 5%); multiply by 100 for display
+            pnl = p.get("daily_pnl", 0.0)
             display_change = change * 100.0
             if change > 0:
-                indicator = f"\U0001f53a+{display_change:.2f}%"
+                lines.append(
+                    f"\U0001f53a {name} {p['weight']:.1f}% "
+                    f"+{display_change:.2f}% +{pnl:,.0f}元"
+                )
             elif change < 0:
-                indicator = f"\U0001f53b{display_change:.2f}%"
+                lines.append(
+                    f"\U0001f53b {name} {p['weight']:.1f}% "
+                    f"{display_change:.2f}% {pnl:,.0f}元"
+                )
             else:
-                indicator = f" {display_change:.2f}%"
-            lines.append(f"{name}  {p['weight']:.1f}% {indicator}")
+                lines.append(f"{name} {p['weight']:.1f}%")
+
+        if not show_all:
+            remaining = len(sorted_pos) - _TOP_N
+            lines.append(f"...及{remaining}只其他持仓")
 
     # Pending orders
     if rd.pending_orders:
         lines.append("")
         lines.append(f"{_SEP} 明日计划 {_SEP}")
         for o in rd.pending_orders:
-            name = o["name"] or o["symbol"]
-            if o["side"] == "buy":
-                lines.append(f"\U0001f7e2 拟买 {name} {o['qty']}股")
-            else:
-                lines.append(f"\U0001f534 拟卖 {name} {o['qty']}股")
+            name = _display_name(o.get("name", ""), o["symbol"])
+            side_icon = "\U0001f7e2 拟买" if o["side"] == "buy" else "\U0001f534 拟卖"
+            lines.append(f"{side_icon} {name} {o['qty']}股")
 
     # Risk status
     lines.append("")
     rs = rd.risk_status
-    any_risk = rs["buying_halted"] or rs["is_soft_reduced"] or rs.get("drawdown_halted", False) or rs.get("regime_halted", False)
+    any_risk = (
+        rs["buying_halted"]
+        or rs["is_soft_reduced"]
+        or rs.get("drawdown_halted", False)
+        or rs.get("regime_halted", False)
+    )
     if any_risk:
         warnings = []
         if rs.get("drawdown_halted"):
@@ -542,6 +597,9 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     chunks = split_report_text(report_text, max_len)
     sent_upto = 0
 
+    # F1 note: sent_upto intentionally shared across attempts. Retry starts
+    # from where first attempt left off. If retry fails, sent_upto reflects
+    # the last successfully sent chunk (correct for logging/fallback).
     async def _send_chunks() -> None:
         nonlocal sent_upto
         import aiohttp
