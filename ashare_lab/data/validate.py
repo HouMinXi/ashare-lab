@@ -53,7 +53,12 @@ def _load_qlib_feature(
 def _fetch_baostock_raw(
     symbol: str, start_date: str, end_date: str
 ) -> pd.DataFrame | None:
-    import baostock as bs  # noqa: PLC0415 -- lazy to avoid import-time TCP hang
+    # F5 fix: guard lazy import with try-except
+    try:
+        import baostock as bs  # noqa: PLC0415 -- lazy to avoid import-time TCP hang
+    except ImportError:
+        log.warning("baostock not installed, skipping validation for %s", symbol)
+        return None
 
     bs_code = _qlib_code_to_baostock(symbol)
     lg = bs.login()

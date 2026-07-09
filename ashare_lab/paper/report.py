@@ -161,8 +161,10 @@ def gather_report_data(
     # F2 note: market_value = close * qty. If stock is suspended, close=0
     # and market_value=0, but qty > 0. Division by zero is prevented by
     # old_mv > 0 guard. Pipeline always sets market_value = close * qty.
-    # F10 note: adjustfactor handled by step6 before positions are written.
-    # Per-share price comparison remains correct across factor changes.
+    # F4 note: adjustfactor handled by step6 before positions are written.
+    # Per-share price comparison remains correct across factor changes:
+    # step6 adjusts qty (split) and market_value (dividend) simultaneously,
+    # so market_value/qty = adjusted close price for both days.
     daily_changes: dict[str, float] = {}
     daily_pnls: dict[str, float] = {}
     if positions:

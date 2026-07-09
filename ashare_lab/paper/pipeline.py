@@ -130,7 +130,9 @@ def _load_stock_names_cache(symbols: set[str]) -> dict[str, str] | None:
         result: dict[str, str] = {}
         with open(ts_path, newline="") as f:
             for row in csv.DictReader(f):
-                sym = row.get("symbol", "").upper()
+                # F3 fix: handle None from missing CSV cells
+                raw = row.get("symbol") or ""
+                sym = raw.upper()
                 if sym in symbols:
                     result[sym] = row.get("name", "")
         if result:
