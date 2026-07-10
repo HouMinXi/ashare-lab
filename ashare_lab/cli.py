@@ -5,7 +5,7 @@ from __future__ import annotations
 # Global socket timeout: prevents qlib client-mode from hanging indefinitely
 # when no qlib server is running. Must be set BEFORE any qlib import.
 import socket as _socket
-_socket.setdefaulttimeout(30)
+_socket.setdefaulttimeout(120)  # > SIGALRM 60s, so alarm triggers first
 
 import argparse
 import json
