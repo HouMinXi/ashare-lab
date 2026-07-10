@@ -1,20 +1,37 @@
 backends:
-  deepseek:
+  review-route:
+    type: api
+    format: openai
+    base_url: https://192.168.100.10:20128/v1
+    api_key_env: OMNIROUTE_API_KEY
+    model: review-route                # combo: DS-V4-Flash → DS-V4-Pro
+    stream: true                       # MANDATORY: OmniRoute always returns SSE
+    thinking_type: "enabled"
+    reasoning_effort: "high"
+    max_completion_tokens: 32768
+    timeout_s: 600
+    default: true
+  omniroute-dspro:
+    type: api
+    format: openai
+    base_url: https://192.168.100.10:20128/v1
+    api_key_env: OMNIROUTE_API_KEY
+    model: volcengine-std/ep-20260710014557-mhv5q  # DS-V4-Pro, pin
+    stream: true
+    thinking_type: "enabled"
+    reasoning_effort: "high"
+    max_completion_tokens: 32768
+    timeout_s: 600
+  deepseek-direct:
     type: api
     format: openai
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     model: deepseek-v4-flash
-    max_tokens: 32768  # V4 Flash supports 384K; 32K is ample for code review
-    default: true
-  mimo-pro:
-    type: api
-    format: openai
-    base_url: https://token-plan-cn.xiaomimimo.com/v1
-    api_key_env: MIMO_PRO_API_KEY
-    model: mimo-v2.5-pro
-    stream: true
-    timeout_s: 300
+    thinking_type: "enabled"
+    reasoning_effort: "high"
+    max_completion_tokens: 32768
+    timeout_s: 600
 
 test:
   command: [pytest, -q, --timeout=60]
