@@ -1,4 +1,4 @@
-"""Unit tests for ashare_lab.paper.ledger -- 9-table SQLite schema."""
+"""Unit tests for ashare_lab.paper.ledger -- 15-table SQLite schema."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ class TestSchema:
             "SELECT count(*) AS cnt FROM sqlite_master "
             "WHERE type='table' AND name != 'sqlite_sequence'"
         ).fetchone()
-        assert row["cnt"] == 14
+        assert row["cnt"] == 15
 
     def test_idempotent_schema(self, conn: sqlite3.Connection) -> None:
         # calling init_schema a second time must not raise
@@ -69,7 +69,7 @@ class TestSchema:
             "SELECT count(*) AS cnt FROM sqlite_master "
             "WHERE type='table' AND name != 'sqlite_sequence'"
         ).fetchone()
-        assert row["cnt"] == 14
+        assert row["cnt"] == 15
 
     def test_wal_mode(self, conn: sqlite3.Connection) -> None:
         row = conn.execute("PRAGMA journal_mode").fetchone()

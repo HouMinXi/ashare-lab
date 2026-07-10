@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS orders (
                      )),
     carry_day        INTEGER NOT NULL DEFAULT 0,
     created_run_date TEXT    NOT NULL,
+    source           TEXT    NOT NULL DEFAULT 'signal',
     created_at       TEXT    NOT NULL
 );
 
@@ -78,6 +79,8 @@ CREATE TABLE IF NOT EXISTS nav (
     total_nav        REAL NOT NULL,
     pre_trade_nav    REAL,
     post_trade_nav   REAL,
+    hedge_value      REAL DEFAULT 0.0,
+    equity_value     REAL DEFAULT 0.0,
     benchmark_csi300 REAL,
     benchmark_csi1000 REAL
 );
@@ -159,6 +162,17 @@ CREATE TABLE IF NOT EXISTS graduation_status (
     notified_at   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS hedge_state (
+    trade_date        TEXT PRIMARY KEY,
+    active            INTEGER NOT NULL DEFAULT 0,
+    drawdown_pct      REAL NOT NULL DEFAULT 0.0,
+    equity_target_pct REAL NOT NULL DEFAULT 1.0,
+    hedge_target_pct  REAL NOT NULL DEFAULT 0.0,
+    days_in_hedge     INTEGER NOT NULL DEFAULT 0,
+    peak_nav          REAL NOT NULL DEFAULT 0.0,
+    leg_json          TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_orders_date_status
     ON orders (created_run_date, status);
 CREATE INDEX IF NOT EXISTS idx_trades_date
@@ -197,6 +211,24 @@ def init_schema(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO paper_state (key, value) "
         "VALUES ('is_soft_reduced', 'false')"
     )
+
+    # Idempotent migrations for databases created before the hedge sleeve
+    # additions.  SQLite raises OperationalError when a column already exists.
+    try:
+        conn.execute(
+            "ALTER TABLE orders ADD COLUMN source TEXT NOT NULL DEFAULT 'signal'"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+    for col in ("hedge_value", "equity_value"):
+        try:
+            conn.execute(
+                f"ALTER TABLE nav ADD COLUMN {col} REAL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
 
 
@@ -350,6 +382,7 @@ def insert_order(
     status: str,
     carry_day: int,
     created_run_date: str,
+    source: str = "signal",
 ) -> int:
     """Insert an order row; return the new rowid.
 
@@ -359,11 +392,11 @@ def insert_order(
     cur = conn.execute(
         "INSERT INTO orders "
         "(trade_date, symbol, side, target_qty, price, status, "
-        " carry_day, created_run_date, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " carry_day, created_run_date, source, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             trade_date, symbol, side, target_qty, price,
-            status, carry_day, created_run_date, created_at,
+            status, carry_day, created_run_date, source, created_at,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -505,17 +538,19 @@ def record_nav(
     post_trade_nav: float | None,
     benchmark_csi300: float | None,
     benchmark_csi1000: float | None,
+    hedge_value: float = 0.0,
+    equity_value: float = 0.0,
 ) -> None:
     """Write (or overwrite) the daily NAV row."""
     conn.execute(
         "INSERT OR REPLACE INTO nav "
         "(trade_date, cash, market_value, total_nav, "
-        " pre_trade_nav, post_trade_nav, "
+        " pre_trade_nav, post_trade_nav, hedge_value, equity_value, "
         " benchmark_csi300, benchmark_csi1000) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             trade_date, cash, market_value, total_nav,
-            pre_trade_nav, post_trade_nav,
+            pre_trade_nav, post_trade_nav, hedge_value, equity_value,
             benchmark_csi300, benchmark_csi1000,
         ),
     )

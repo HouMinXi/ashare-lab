@@ -89,7 +89,7 @@ paper:
   volume_participation_pct: 0.05
   topk: 15
   n_drop: 1
-  initial_cash: 300000
+  initial_cash: 300000  # [PM-R2] stay 300K until 08-02 gate; flip in dedicated config commit
   backup_retention_days: 7
   slippage: 0.001
   listing_min_days: 60
@@ -109,6 +109,28 @@ paper:
     soft_drawdown_recovery: 0.95
     default_topk: 15
     reduced_topk: 7
+  hedge:
+    enabled: true
+    activate_dd: 0.05
+    max_equity_pct: 0.95
+    min_equity_pct: 0.20
+    anti_whipsaw_days: 10
+    recovery_pct: 0.97
+    max_single_day_rebalance: 0.30
+    equity_ramp:
+      - [0.05, 0.75]
+      - [0.10, 0.50]
+      - [0.15, 0.20]
+    legs:
+      - symbol: "511260"
+        weight: 0.60
+        leg_type: "treasury_etf"
+      - symbol: "518880"
+        weight: 0.25
+        leg_type: "gold_etf"
+      - symbol: "511990"
+        weight: 0.15
+        leg_type: "money_market"
   sentiment:
     enabled: true
     stock_threshold: -2

@@ -18,7 +18,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT, load_config
@@ -33,6 +33,15 @@ from ashare_lab.paper.engine import (
     get_limit_threshold,
     round_lots,
     settle_day,
+)
+from ashare_lab.paper.hedge import (
+    _fetch_hedge_prices,
+    _load_hedge_config,
+    compute_hedge_state,
+    generate_hedge_orders,
+    load_hedge_state,
+    save_hedge_state,
+    update_peak_nav,
 )
 from ashare_lab.paper.ipo import (
     check_ipo_subscription,
@@ -379,9 +388,6 @@ def _resolve_prediction_file(date_str: str) -> Path | None:
 # Main pipeline -- context object + step helpers
 # ------------------------------------------------------------------
 
-from dataclasses import dataclass, field
-import sqlite3 as _sqlite3
-
 
 @dataclass
 class DailyRunContext:
@@ -430,6 +436,10 @@ class DailyRunContext:
     # Step 9 outputs
     total_nav: float = 0.0
     risk_result: "object | None" = None
+
+    # Step 9b outputs
+    hedge_state: "object | None" = None
+    hedge_symbols: set = field(default_factory=set)
 
     # Step 10 output
     signals_raw: dict = field(default_factory=dict)
@@ -598,15 +608,27 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         else:
             logger.warning("no stock name cache available, ST detection skipped")
 
-    # Prices from qlib
+    # Prices from qlib (60s timeout -- qlib client mode hangs if server is down)
     ctx.prices = {}
     if ctx.fetch_symbols:
-        raw = D.features(
-            instruments=list(ctx.fetch_symbols),
-            fields=["$close", "$change", "$volume", "$factor"],
-            start_time=ctx.trade_date,
-            end_time=ctx.trade_date,
-        )
+        import signal as _sig_price
+        def _price_timeout(signum, frame):
+            raise TimeoutError("D.features() timed out after 60s")
+        _old_alarm = _sig_price.signal(_sig_price.SIGALRM, _price_timeout)
+        _sig_price.alarm(60)
+        try:
+            raw = D.features(
+                instruments=list(ctx.fetch_symbols),
+                fields=["$close", "$change", "$volume", "$factor"],
+                start_time=ctx.trade_date,
+                end_time=ctx.trade_date,
+            )
+        except TimeoutError:
+            logger.warning("D.features() timed out, prices unavailable")
+            raw = None
+        finally:
+            _sig_price.alarm(0)
+            _sig_price.signal(_sig_price.SIGALRM, _old_alarm)
         if raw is not None and not raw.empty:
             for idx, row_s in raw.iterrows():
                 inst = idx[0] if isinstance(idx, tuple) else str(idx)
@@ -898,6 +920,9 @@ def _step8_settle(ctx: DailyRunContext) -> None:
     ctx.current_positions = get_latest_positions(ctx.conn)
     ctx.cash = ctx.settle_result.cash
 
+  
+    # populates ctx.hedge_symbols).  At step 8 the set is still empty.
+
 
 def _step9_risk_checks(ctx: DailyRunContext) -> None:
     """Compute NAV and run all risk checks; persist cooldown entries."""
@@ -920,6 +945,91 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
     )
     for symbol, entry in ctx.risk_result.cooldown_entries.items():
         set_cooldown(ctx.conn, symbol, entry["cooldown_until"], entry["holding_high"])
+
+
+def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
+    """Adjust equity/hedge allocation based on drawdown."""
+    hedge_cfg_dict = ctx.config.get("paper", {}).get("hedge", {})
+    if not hedge_cfg_dict.get("enabled", False):
+        return
+
+    hedge_cfg = _load_hedge_config(hedge_cfg_dict)
+    leg_symbols = [leg.symbol for leg in hedge_cfg.legs]
+    _fetch_hedge_prices(ctx, leg_symbols)
+
+    prev_td = previous_trading_day(dt.date.fromisoformat(ctx.trade_date))
+    prev = load_hedge_state(ctx.conn, prev_td.isoformat()) if prev_td else None
+
+    peak = update_peak_nav(ctx.total_nav, prev.peak_nav if prev else 0.0)
+    dd = (peak - ctx.total_nav) / peak if peak > 0 else 0.0
+    prev_active = prev.active if prev else False
+
+    if prev_active:
+        days = prev.days_in_hedge + 1
+    else:
+        days = 1 if dd >= hedge_cfg.activate_dd else 0
+
+    state = compute_hedge_state(
+        ctx.total_nav, peak, days, hedge_cfg, prev_active=prev_active
+    )
+    ctx.hedge_state = state
+    ctx.hedge_symbols = set(leg_symbols)
+
+    save_hedge_state(ctx.conn, ctx.trade_date, state)
+
+    next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+
+  
+    ctx.conn.execute(
+        "DELETE FROM orders WHERE trade_date=? AND source='hedge' AND status='pending'",
+        (next_td_str,),
+    )
+
+    orders = generate_hedge_orders(
+        ctx.current_positions,
+        state,
+        ctx.total_nav,
+        ctx.prices,
+        hedge_cfg,
+        buying_halted=ctx.risk_result.buying_halted if ctx.risk_result else False,
+    )
+    for order in orders:
+        insert_order(
+            ctx.conn,
+            next_td_str,
+            order.symbol,
+            order.side,
+            order.target_qty,
+            None,
+            "pending",
+            0,
+            ctx.trade_date,
+            source=order.source,
+        )
+
+
+def _step9c_nav_hedge_split(ctx: DailyRunContext) -> None:
+    """Overwrite NAV row with hedge/equity split (runs after step 9b)."""
+    if not ctx.hedge_symbols:
+        return
+    hedge_val = sum(
+        ctx.current_positions.get(s, {}).get("market_value") or 0
+        for s in ctx.hedge_symbols
+    )
+    equity_val = ctx.total_nav - ctx.cash - hedge_val
+    record_nav(
+        ctx.conn,
+        ctx.trade_date,
+        ctx.cash,
+        ctx.total_nav - ctx.cash,
+        ctx.total_nav,
+        ctx.total_nav,
+        ctx.total_nav,
+        ctx.benchmarks.get("csi300"),
+        ctx.benchmarks.get("csi1000"),
+        hedge_value=hedge_val,
+        equity_value=equity_val,
+    )
 
 
 def _step10_signal_generation(ctx: DailyRunContext) -> int:
@@ -985,7 +1095,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         if ctx.market_data.get(s, {}).get("listing_days", 999)
         < ctx.paper_cfg.get("listing_min_days", 60)
     }
-    held_set = set(ctx.current_positions.keys()) - ipo_held
+    held_set = set(ctx.current_positions.keys()) - ipo_held - ctx.hedge_symbols
     topk_for_dropout = max(0, effective_topk - len(ipo_held))
     sell_syms, buy_syms = topk_dropout_orders(
         filtered_signals, held_set, topk_for_dropout, ctx.paper_cfg.get("n_drop", 1),
@@ -1027,7 +1137,11 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         target_value = 0.0
         buy_syms = []
     else:
-        target_value = (ctx.total_nav * ctx.config["cost_model"]["risk_degree"]) / effective_topk
+        if ctx.hedge_state and ctx.hedge_state.active:
+            equity_nav = ctx.total_nav * ctx.hedge_state.equity_target_pct
+        else:
+            equity_nav = ctx.total_nav
+        target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"]) / effective_topk
 
     forced_sells = ctx.risk_result.forced_sells
     sell_set = set(sell_syms) | set(forced_sells.keys())
@@ -1156,10 +1270,16 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
             if pos["qty"] > 0
         )
         new_total_nav = market_value + ctx.cash
+        hedge_val = sum(
+            ctx.current_positions.get(s, {}).get("market_value") or 0
+            for s in ctx.hedge_symbols
+        )
+        equity_val = new_total_nav - ctx.cash - hedge_val
         record_nav(
             ctx.conn, ctx.trade_date, ctx.cash, market_value, new_total_nav,
             ctx.settle_result.pre_trade_nav, ctx.settle_result.post_trade_nav,
             ctx.benchmarks["csi300"], ctx.benchmarks["csi1000"],
+            hedge_value=hedge_val, equity_value=equity_val,
         )
 
 
@@ -1295,6 +1415,8 @@ def run_daily(
     _step7_csi1000_exits(ctx)
     _step8_settle(ctx)
     _step9_risk_checks(ctx)
+    _step9b_hedge_sleeve(ctx)
+    _step9c_nav_hedge_split(ctx)
 
     rc = _step10_signal_generation(ctx)
     if rc == 2:

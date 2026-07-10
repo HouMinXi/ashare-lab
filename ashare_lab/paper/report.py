@@ -10,7 +10,7 @@ import secrets
 import struct
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import sqlite3
 
 from ashare_lab.paper.ledger import insert_report
@@ -47,6 +47,10 @@ class ReportData:
     trade_count: int
     risk_status: dict
     industry_distribution: dict[str, int]
+    hedge_active: bool = False
+    hedge_dd: float = 0.0
+    hedge_equity_pct: float = 1.0
+    hedge_allocations: dict[str, float] = field(default_factory=dict)
 
 
 def gather_report_data(
@@ -245,6 +249,22 @@ def gather_report_data(
         
     buying_halted = drawdown_halted or daily_loss_halted or regime_halted
 
+    # Hedge sleeve state
+    hedge_row = conn.execute(
+        "SELECT active, drawdown_pct, equity_target_pct, leg_json "
+        "FROM hedge_state WHERE trade_date = ?",
+        (trade_date,),
+    ).fetchone()
+    hedge_active = False
+    hedge_dd = 0.0
+    hedge_equity_pct = 1.0
+    hedge_allocations: dict[str, float] = {}
+    if hedge_row and hedge_row["active"]:
+        hedge_active = True
+        hedge_dd = hedge_row["drawdown_pct"]
+        hedge_equity_pct = hedge_row["equity_target_pct"]
+        hedge_allocations = json.loads(hedge_row["leg_json"])
+
     return ReportData(
         trade_date=trade_date,
         total_nav=total_nav,
@@ -268,7 +288,11 @@ def gather_report_data(
             "drawdown_halted": drawdown_halted,
             "regime_halted": regime_halted,
         },
-        industry_distribution=ind_dist
+        industry_distribution=ind_dist,
+        hedge_active=hedge_active,
+        hedge_dd=hedge_dd,
+        hedge_equity_pct=hedge_equity_pct,
+        hedge_allocations=hedge_allocations,
     )
 
 
@@ -392,6 +416,13 @@ def format_chinese_report(
         lines.append(f"⚠️ {' | '.join(warnings)}")
     else:
         lines.append("✅ 风控正常")
+
+    if rd.hedge_active:
+        lines.append(
+            f"🛡 对冲: DD {rd.hedge_dd:.1%} → "
+            f"权益 {rd.hedge_equity_pct:.0%} / "
+            f"对冲 {1 - rd.hedge_equity_pct:.0%}"
+        )
 
     # Sentiment section (optional, appended when available)
     if sentiment_section is not None:

@@ -5,7 +5,7 @@ backends:
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
     model: deepseek-v4-flash
-    max_tokens: 8192
+    max_tokens: 32768  # V4 Flash supports 384K; 32K is ample for code review
     default: true
   mimo-pro:
     type: api
