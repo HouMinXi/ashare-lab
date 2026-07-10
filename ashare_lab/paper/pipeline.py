@@ -14,13 +14,11 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import json
-import subprocess
-import sys
 import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT, load_config
@@ -35,15 +33,6 @@ from ashare_lab.paper.engine import (
     get_limit_threshold,
     round_lots,
     settle_day,
-)
-from ashare_lab.paper.hedge import (
-    _fetch_hedge_prices,
-    _load_hedge_config,
-    compute_hedge_state,
-    generate_hedge_orders,
-    load_hedge_state,
-    save_hedge_state,
-    update_peak_nav,
 )
 from ashare_lab.paper.ipo import (
     check_ipo_subscription,
@@ -235,51 +224,6 @@ def _load_industry_cache(
     return result
 
 
-def _save_industry_cache(
-    trade_date: str, industry_map: dict[str, str],
-) -> None:
-    """Append new industry data to cache CSV (idempotent by date)."""
-    path = _BS_CACHE_DIR / "industry.csv"
-    _BS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Load existing to avoid duplicates
-    existing: set[str] = set()
-    if path.exists():
-        with open(path, newline="") as f:
-            for row in csv.DictReader(f):
-                if row["date"] == trade_date:
-                    existing.add(row["code"])
-
-    # Map universe symbols back to baostock codes
-    def _to_bs_code(sym: str) -> str:
-        s = sym.upper()
-        if s.startswith(("SH", "SZ")):
-            return s[:2].lower() + "." + s[2:]
-        num = s[-6:]
-        pfx = "sh" if s.startswith(("SH", "6")) else "sz"
-        return pfx + "." + num
-
-    new_rows = []
-    for sym, ind in industry_map.items():
-        code = _to_bs_code(sym)
-        if code not in existing:
-            new_rows.append({"date": trade_date, "code": code, "industry": ind})
-
-    if not new_rows:
-        return
-
-    try:
-        write_header = not path.exists()
-        with open(path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["date", "code", "industry"])
-            if write_header:
-                writer.writeheader()
-            writer.writerows(new_rows)
-        logger.info("industry cache: saved %d new entries for %s", len(new_rows), trade_date)
-    except OSError as exc:
-        logger.warning("industry cache save failed: %s", exc)
-
-
 # ------------------------------------------------------------------
 # Private helpers
 # ------------------------------------------------------------------
@@ -355,7 +299,7 @@ def _fetch_ipo_calendar(listing_date: str) -> list[dict]:
 
 
 def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
-    """Fetch benchmark closes: cache first, baostock subprocess fallback.
+    """Fetch benchmark closes: cache first, baostock fallback.
 
     Returns {"csi300": float, "csi1000": float}.
     On failure returns zeros with warning log.
@@ -366,42 +310,56 @@ def _fetch_benchmark_closes(trade_date: str) -> dict[str, float]:
         return {"csi300": cached.get("csi300", 0.0),
                 "csi1000": cached.get("csi1000", 0.0)}
 
-    # [R9] subprocess timeout -- baostock hangs cross-Pacific
-    _bench_script = """
-import baostock as bs, json, sys, os
-td = sys.argv[1]
-_orig_stdout = sys.stdout
-sys.stdout = open(os.devnull, 'w')
-bs.login()
-sys.stdout.close()
-sys.stdout = _orig_stdout
-result = {"csi300": 0.0, "csi1000": 0.0}
-for code, key in [("sh.000300","csi300"),("sh.000852","csi1000")]:
-    rs = bs.query_history_k_data_plus(code, "close", start_date=td, end_date=td, frequency="d")
-    while rs.error_code == "0" and rs.next():
-        try: result[key] = float(rs.get_row_data()[0])
-        except: pass
-_null = open(os.devnull, 'w')
-sys.stdout = _null
-bs.logout()
-_null.close()
-sys.stdout = _orig_stdout
-print(json.dumps(result))
-"""
     try:
-        _r = subprocess.run([sys.executable, "-c", _bench_script, trade_date],
-                            capture_output=True, text=True, timeout=30,
-                            cwd=str(PROJECT_ROOT))
-        if _r.returncode == 0 and _r.stdout.strip():
-            result = json.loads(_r.stdout.strip())
-            logger.info("benchmark via subprocess: %s", result)
+        import baostock as bs  # noqa: PLC0415
+    except ImportError:
+        logger.warning("baostock not installed, benchmark unavailable")
+        return {"csi300": 0.0, "csi1000": 0.0}
+
+    result = {"csi300": 0.0, "csi1000": 0.0}
+    indices = [("sh.000300", "csi300"), ("sh.000852", "csi1000")]
+
+    import signal as _signal  # noqa: PLC0415
+
+    def _baostock_timeout_handler(signum, frame):
+        raise TimeoutError("baostock query timed out")
+
+    import socket as _socket  # noqa: PLC0415
+    _prev_timeout = _socket.getdefaulttimeout()
+    _socket.setdefaulttimeout(30)
+    old_handler = _signal.signal(_signal.SIGALRM, _baostock_timeout_handler)
+    _signal.alarm(30)  # 30s ceiling for all baostock calls
+    try:
+        login_result = bs.login()
+        if login_result.error_code != "0":
+            logger.warning("baostock login failed: %s", login_result.error_msg)
             return result
-        logger.warning("benchmark subprocess failed: rc=%d", _r.returncode)
-    except subprocess.TimeoutExpired:
-        logger.warning("benchmark subprocess timed out after 30s")
-    except Exception as e:
-        logger.warning("benchmark subprocess error: %s", e)
-    return {"csi300": 0.0, "csi1000": 0.0}
+
+        try:
+            for code, key in indices:
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    "close",
+                    start_date=trade_date,
+                    end_date=trade_date,
+                    frequency="d",
+                )
+                while rs.error_code == "0" and rs.next():
+                    row = rs.get_row_data()
+                    try:
+                        result[key] = float(row[0])
+                    except (IndexError, ValueError, TypeError):
+                        pass
+        finally:
+            bs.logout()
+    except TimeoutError:
+        logger.warning("baostock timed out after 30s, benchmark unavailable")
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old_handler)
+        _socket.setdefaulttimeout(_prev_timeout)
+
+    return result
 
 
 def _resolve_prediction_file(date_str: str) -> Path | None:
@@ -420,6 +378,9 @@ def _resolve_prediction_file(date_str: str) -> Path | None:
 # ------------------------------------------------------------------
 # Main pipeline -- context object + step helpers
 # ------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+import sqlite3 as _sqlite3
 
 
 @dataclass
@@ -469,10 +430,6 @@ class DailyRunContext:
     # Step 9 outputs
     total_nav: float = 0.0
     risk_result: "object | None" = None
-
-    # Step 9b outputs
-    hedge_state: "object | None" = None
-    hedge_symbols: set = field(default_factory=set)
 
     # Step 10 output
     signals_raw: dict = field(default_factory=dict)
@@ -641,59 +598,42 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         else:
             logger.warning("no stock name cache available, ST detection skipped")
 
-    # Prices from qlib (subprocess with 90s timeout -- qlib client mode
-    # hangs if server is down; SIGALRM gets swallowed by joblib/qlib internals)
+    # Prices from qlib (with 60s timeout to prevent hang on client-mode)
     ctx.prices = {}
     if ctx.fetch_symbols:
-        # subprocess and json imported at module level
-        _fetch_script = """
-import qlib, json, sys
-from pathlib import Path
-from ashare_lab.data.update import DEFAULT_PROVIDER_URI
-qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-from qlib.data import D
-syms = json.loads(sys.argv[1])
-td = sys.argv[2]
-raw = D.features(instruments=syms, fields=["$close","$change","$volume","$factor"],
-                 start_time=td, end_time=td)
-if raw is not None and not raw.empty:
-    out = {}
-    for idx, row in raw.iterrows():
-        inst = idx[0] if isinstance(idx, tuple) else str(idx)
-        out[str(inst)] = {"close": float(row.get("$close",0)), "change": float(row.get("$change",0)),
-                          "volume": float(row.get("$volume",0)), "factor": float(row.get("$factor",1.0))}
-    print(json.dumps(out))
-else:
-    print("{}")
-"""
+        import signal as _sig_price
+        def _price_timeout(signum, frame):
+            raise TimeoutError("D.features() timed out after 60s")
+        _old_alarm = _sig_price.signal(_sig_price.SIGALRM, _price_timeout)
+        _sig_price.alarm(60)
         try:
-            _result = subprocess.run(
-                [sys.executable, "-c", _fetch_script,
-                 json.dumps(list(ctx.fetch_symbols)), ctx.trade_date],
-                capture_output=True, text=True, timeout=90,
-                cwd=str(PROJECT_ROOT),
+            raw = D.features(
+                instruments=list(ctx.fetch_symbols),
+                fields=["$close", "$change", "$volume", "$factor"],
+                start_time=ctx.trade_date,
+                end_time=ctx.trade_date,
             )
-            if _result.returncode == 0 and _result.stdout.strip():
-                _price_data = json.loads(_result.stdout.strip())
-                for sym, pdata in _price_data.items():
-                    # match symbol to fetch_symbols (suffix match)
-                    matched = sym
-                    for fs in ctx.fetch_symbols:
-                        if fs.endswith(sym[-6:]) if len(sym) > 6 else fs == sym:
-                            matched = fs
-                            break
-                    ctx.prices[matched] = {
-                        **pdata,
-                        "threshold": get_limit_threshold(matched, ctx.st_names),
-                    }
-                logger.info("fetched %d prices via subprocess", len(ctx.prices))
-            else:
-                logger.warning("D.features subprocess failed: rc=%d stderr=%s",
-                               _result.returncode, _result.stderr[:200])
-        except subprocess.TimeoutExpired:
-            logger.warning("D.features subprocess timed out after 90s, prices unavailable")
-        except Exception as e:
-            logger.warning("D.features subprocess error: %s", e)
+        except TimeoutError:
+            logger.warning("D.features() timed out, prices unavailable")
+            raw = None
+        finally:
+            _sig_price.alarm(0)
+            _sig_price.signal(_sig_price.SIGALRM, _old_alarm)
+        if raw is not None and not raw.empty:
+            for idx, row_s in raw.iterrows():
+                inst = idx[0] if isinstance(idx, tuple) else str(idx)
+                sym = str(inst)[-6:] if len(str(inst)) > 6 else str(inst)
+                for fs in ctx.fetch_symbols:
+                    if fs.endswith(sym):
+                        sym = fs
+                        break
+                ctx.prices[sym] = {
+                    "close": float(row_s.get("$close", 0)),
+                    "change": float(row_s.get("$change", 0)),
+                    "volume": float(row_s.get("$volume", 0)),
+                    "factor": float(row_s.get("$factor", 1.0)),
+                    "threshold": get_limit_threshold(sym, ctx.st_names),
+                }
 
     # 5d. benchmarks
     ctx.benchmarks = _fetch_benchmark_closes(ctx.trade_date)
@@ -728,110 +668,70 @@ else:
         ctx.csi1000_closes_11d = []
         start_60d = (dt.date.fromisoformat(ctx.trade_date) - dt.timedelta(days=60)).isoformat()
         try:
-            # [R8] subprocess timeout -- same pattern as prices fetch
-            _regime_script = """
-import qlib, json, sys
-from ashare_lab.data.update import DEFAULT_PROVIDER_URI
-qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-from qlib.data import D
-start_d, end_d = sys.argv[1], sys.argv[2]
-raw = D.features(instruments=["SH000852"], fields=["$close"],
-                 start_time=start_d, end_time=end_d)
-if raw is not None and not raw.empty:
-    closes = [float(v) for v in raw["$close"].dropna().values]
-    print(json.dumps(closes[-11:] if len(closes) >= 11 else closes))
-else:
-    print("[]")
-"""
-            _regime_result = subprocess.run(
-                [sys.executable, "-c", _regime_script, start_60d, ctx.trade_date],
-                capture_output=True, text=True, timeout=60,
-                cwd=str(PROJECT_ROOT),
+            _sig_price.alarm(30)  # 30s timeout for regime query (1 instrument)
+            regime_df = D.features(
+                instruments=["SH000852"],
+                fields=["$close"],
+                start_time=start_60d,
+                end_time=ctx.trade_date,
             )
-            if _regime_result.returncode == 0 and _regime_result.stdout.strip():
-                ctx.csi1000_closes_11d = json.loads(_regime_result.stdout.strip())
-                logger.info("regime data fetched via subprocess: %d closes", len(ctx.csi1000_closes_11d))
-        except subprocess.TimeoutExpired:
-            logger.warning("regime subprocess timed out, market regime check disabled")
+            if regime_df is not None and not regime_df.empty:
+                closes = [float(v) for v in regime_df["$close"].dropna().values]
+                ctx.csi1000_closes_11d = closes[-11:] if len(closes) >= 11 else closes
         except Exception as exc:
             logger.warning("CSI1000 regime query failed: %s", exc)
+        finally:
+            _sig_price.alarm(0)
 
-    # 5f. industry map (cache + incremental subprocess)
+    # 5f. industry map (baostock with 30s timeout ceiling)
     ind_cached = _load_industry_cache(ctx.trade_date, ctx.fetch_symbols)
     if ind_cached is not None:
-        ctx.industry_map = dict(ind_cached)
-        logger.debug("industry_map from cache for %s (%d entries)",
-                     ctx.trade_date, len(ctx.industry_map))
+        ctx.industry_map = ind_cached
+        logger.debug("industry_map from cache for %s", ctx.trade_date)
     else:
         ctx.industry_map = {}
-
-    # Query only symbols missing from cache
-    _missing = [s for s in ctx.fetch_symbols if s not in ctx.industry_map]
-    if _missing:
-        _ind_script = """
-import baostock as bs, json, sys, os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-td = sys.argv[1]
-syms = json.loads(sys.argv[2])
-_orig = sys.stdout
-sys.stdout = open(os.devnull, 'w')
-bs.login()
-sys.stdout.close()
-sys.stdout = _orig
-
-def _query_one(sym):
-    code = sym.lower()
-    if len(code) == 6:
-        pfx = "sh" if code.startswith("6") else "sz"
-        code = pfx + "." + code
-    elif not code.startswith(("sh.", "sz.")):
-        pfx = "sh" if sym.startswith(("SH", "6")) else "sz"
-        code = pfx + "." + sym[-6:]
-    rs = bs.query_stock_industry(code=code, date=td)
-    while rs.error_code == "0" and rs.next():
-        row = rs.get_row_data()
-        if len(row) > 3 and row[3]:
-            return (sym, row[3])
-    return None
-
-result = {}
-with ThreadPoolExecutor(max_workers=10) as pool:
-    futs = {pool.submit(_query_one, s): s for s in syms}
-    for fut in as_completed(futs):
-        r = fut.result()
-        if r:
-            result[r[0]] = r[1]
-
-_null = open(os.devnull, 'w')
-sys.stdout = _null
-bs.logout()
-_null.close()
-sys.stdout = _orig
-print(json.dumps(result))
-"""
         try:
-            _r = subprocess.run(
-                [sys.executable, "-c", _ind_script,
-                 ctx.trade_date, json.dumps(_missing)],
-                capture_output=True, text=True, timeout=180,
-                cwd=str(PROJECT_ROOT))
-            if _r.returncode == 0 and _r.stdout.strip():
-                _new = json.loads(_r.stdout.strip())
-                ctx.industry_map.update(_new)
-                _save_industry_cache(ctx.trade_date, _new)
-                logger.info("industry subprocess: %d new entries (%d total)",
-                            len(_new), len(ctx.industry_map))
-            else:
-                logger.warning("industry subprocess failed: rc=%d stderr=%s",
-                               _r.returncode, _r.stderr[:200] if _r.stderr else "")
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "industry subprocess timed out after 180s (%d missing, %d cached)",
-                len(_missing), len(ctx.industry_map))
-        except Exception as e:
-            logger.warning("industry subprocess error: %s", e)
-    else:
-        logger.debug("industry_map fully cached (%d entries)", len(ctx.industry_map))
+            import baostock as bs  # noqa: PLC0415
+            import signal as _signal  # noqa: PLC0415
+
+            def _ind_timeout(signum, frame):
+                raise TimeoutError("industry baostock timed out")
+
+            old_h = _signal.signal(_signal.SIGALRM, _ind_timeout)
+            import socket as _socket  # noqa: PLC0415
+            _prev_timeout = _socket.getdefaulttimeout()
+            _socket.setdefaulttimeout(30)
+            _signal.alarm(120)
+            try:
+                login_r = bs.login()
+                if login_r.error_code == "0":
+                    try:
+                        for sym in ctx.fetch_symbols:
+                            code = sym.lower()
+                            if len(code) == 6:
+                                prefix = "sh" if code.startswith("6") else "sz"
+                                code = f"{prefix}.{code}"
+                            elif not code.startswith(("sh.", "sz.")):
+                                prefix = "sh" if sym.startswith(("SH", "6")) else "sz"
+                                code = f"{prefix}.{sym[-6:]}"
+                            rs = bs.query_stock_industry(code=code, date=ctx.trade_date)
+                            # F6 fix: remove sleep to avoid 500s >> 120s SIGALRM
+                            # Rate limiting handled by socket.setdefaulttimeout(30)
+                            while rs.error_code == "0" and rs.next():
+                                row_data = rs.get_row_data()
+                                if len(row_data) > 3 and row_data[3]:
+                                    ctx.industry_map[sym] = row_data[3]
+                    finally:
+                        bs.logout()
+            # F4 fix: catch both TimeoutError (SIGALRM) and socket.timeout (socket timeout)
+            except (TimeoutError, _socket.timeout):
+                logger.warning("industry baostock timed out after 120s, partial map (%d entries)", len(ctx.industry_map))
+            finally:
+                _signal.alarm(0)
+                _signal.signal(_signal.SIGALRM, old_h)
+                _socket.setdefaulttimeout(_prev_timeout)
+        except ImportError:
+            pass
 
     # 5g. market_data for filter_candidates
     # Batch D.features: 2 calls instead of 2*N per-symbol calls.
@@ -1013,9 +913,6 @@ def _step8_settle(ctx: DailyRunContext) -> None:
     ctx.current_positions = get_latest_positions(ctx.conn)
     ctx.cash = ctx.settle_result.cash
 
-  
-    # populates ctx.hedge_symbols).  At step 8 the set is still empty.
-
 
 def _step9_risk_checks(ctx: DailyRunContext) -> None:
     """Compute NAV and run all risk checks; persist cooldown entries."""
@@ -1038,91 +935,6 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
     )
     for symbol, entry in ctx.risk_result.cooldown_entries.items():
         set_cooldown(ctx.conn, symbol, entry["cooldown_until"], entry["holding_high"])
-
-
-def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
-    """Adjust equity/hedge allocation based on drawdown."""
-    hedge_cfg_dict = ctx.config.get("paper", {}).get("hedge", {})
-    if not hedge_cfg_dict.get("enabled", False):
-        return
-
-    hedge_cfg = _load_hedge_config(hedge_cfg_dict)
-    leg_symbols = [leg.symbol for leg in hedge_cfg.legs]
-    _fetch_hedge_prices(ctx, leg_symbols)
-
-    prev_td = previous_trading_day(dt.date.fromisoformat(ctx.trade_date))
-    prev = load_hedge_state(ctx.conn, prev_td.isoformat()) if prev_td else None
-
-    peak = update_peak_nav(ctx.total_nav, prev.peak_nav if prev else 0.0)
-    dd = (peak - ctx.total_nav) / peak if peak > 0 else 0.0
-    prev_active = prev.active if prev else False
-
-    if prev_active:
-        days = prev.days_in_hedge + 1
-    else:
-        days = 1 if dd >= hedge_cfg.activate_dd else 0
-
-    state = compute_hedge_state(
-        ctx.total_nav, peak, days, hedge_cfg, prev_active=prev_active
-    )
-    ctx.hedge_state = state
-    ctx.hedge_symbols = set(leg_symbols)
-
-    save_hedge_state(ctx.conn, ctx.trade_date, state)
-
-    next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
-
-  
-    ctx.conn.execute(
-        "DELETE FROM orders WHERE trade_date=? AND source='hedge' AND status='pending'",
-        (next_td_str,),
-    )
-
-    orders = generate_hedge_orders(
-        ctx.current_positions,
-        state,
-        ctx.total_nav,
-        ctx.prices,
-        hedge_cfg,
-        buying_halted=ctx.risk_result.buying_halted if ctx.risk_result else False,
-    )
-    for order in orders:
-        insert_order(
-            ctx.conn,
-            next_td_str,
-            order.symbol,
-            order.side,
-            order.target_qty,
-            None,
-            "pending",
-            0,
-            ctx.trade_date,
-            source=order.source,
-        )
-
-
-def _step9c_nav_hedge_split(ctx: DailyRunContext) -> None:
-    """Overwrite NAV row with hedge/equity split (runs after step 9b)."""
-    if not ctx.hedge_symbols:
-        return
-    hedge_val = sum(
-        ctx.current_positions.get(s, {}).get("market_value") or 0
-        for s in ctx.hedge_symbols
-    )
-    equity_val = ctx.total_nav - ctx.cash - hedge_val
-    record_nav(
-        ctx.conn,
-        ctx.trade_date,
-        ctx.cash,
-        ctx.total_nav - ctx.cash,
-        ctx.total_nav,
-        ctx.total_nav,
-        ctx.total_nav,
-        ctx.benchmarks.get("csi300"),
-        ctx.benchmarks.get("csi1000"),
-        hedge_value=hedge_val,
-        equity_value=equity_val,
-    )
 
 
 def _step10_signal_generation(ctx: DailyRunContext) -> int:
@@ -1188,7 +1000,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         if ctx.market_data.get(s, {}).get("listing_days", 999)
         < ctx.paper_cfg.get("listing_min_days", 60)
     }
-    held_set = set(ctx.current_positions.keys()) - ipo_held - ctx.hedge_symbols
+    held_set = set(ctx.current_positions.keys()) - ipo_held
     topk_for_dropout = max(0, effective_topk - len(ipo_held))
     sell_syms, buy_syms = topk_dropout_orders(
         filtered_signals, held_set, topk_for_dropout, ctx.paper_cfg.get("n_drop", 1),
@@ -1230,11 +1042,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         target_value = 0.0
         buy_syms = []
     else:
-        if ctx.hedge_state and ctx.hedge_state.active:
-            equity_nav = ctx.total_nav * ctx.hedge_state.equity_target_pct
-        else:
-            equity_nav = ctx.total_nav
-        target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"]) / effective_topk
+        target_value = (ctx.total_nav * ctx.config["cost_model"]["risk_degree"]) / effective_topk
 
     forced_sells = ctx.risk_result.forced_sells
     sell_set = set(sell_syms) | set(forced_sells.keys())
@@ -1363,16 +1171,10 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
             if pos["qty"] > 0
         )
         new_total_nav = market_value + ctx.cash
-        hedge_val = sum(
-            ctx.current_positions.get(s, {}).get("market_value") or 0
-            for s in ctx.hedge_symbols
-        )
-        equity_val = new_total_nav - ctx.cash - hedge_val
         record_nav(
             ctx.conn, ctx.trade_date, ctx.cash, market_value, new_total_nav,
             ctx.settle_result.pre_trade_nav, ctx.settle_result.post_trade_nav,
             ctx.benchmarks["csi300"], ctx.benchmarks["csi1000"],
-            hedge_value=hedge_val, equity_value=equity_val,
         )
 
 
@@ -1508,8 +1310,6 @@ def run_daily(
     _step7_csi1000_exits(ctx)
     _step8_settle(ctx)
     _step9_risk_checks(ctx)
-    _step9b_hedge_sleeve(ctx)
-    _step9c_nav_hedge_split(ctx)
 
     rc = _step10_signal_generation(ctx)
     if rc == 2:
