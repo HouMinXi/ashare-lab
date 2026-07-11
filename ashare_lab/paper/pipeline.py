@@ -1064,8 +1064,10 @@ def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
     else:
         days = 1 if dd >= hedge_cfg.activate_dd else 0
 
+    prev_recovery = prev.days_in_recovery if prev else 0
     state = compute_hedge_state(
-        ctx.total_nav, peak, days, hedge_cfg, prev_active=prev_active
+        ctx.total_nav, peak, days, hedge_cfg,
+        prev_active=prev_active, prev_days_in_recovery=prev_recovery,
     )
     ctx.hedge_state = state
     ctx.hedge_symbols = set(leg_symbols)

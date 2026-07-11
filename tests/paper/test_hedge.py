@@ -81,7 +81,9 @@ def test_max_protection():
 
 def test_recovery_exit():
     cfg = _default_config()
-    state = compute_hedge_state(485_000, 500_000, 11, cfg, prev_active=True)
+    # dd = (500000 - 485500) / 500000 = 0.029 < recovery_dd 0.03
+    state = compute_hedge_state(485_500, 500_000, 11, cfg, prev_active=True,
+                               prev_days_in_recovery=10)
     assert not state.active
 
 
@@ -131,7 +133,7 @@ def test_max_rebalance_cap():
         drawdown_pct=0.20,
         equity_target_pct=0.20,
         hedge_target_pct=0.80,
-        days_in_hedge=5,
+        days_in_hedge=5, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={
             "511260": 0.48,
@@ -158,7 +160,7 @@ def test_hedge_buy_with_buying_halted():
         drawdown_pct=0.05,
         equity_target_pct=0.75,
         hedge_target_pct=0.25,
-        days_in_hedge=1,
+        days_in_hedge=1, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={"511260": 0.15, "518880": 0.0625, "511990": 0.0375},
     )
@@ -184,7 +186,7 @@ def test_order_source_tagging():
         drawdown_pct=0.05,
         equity_target_pct=0.75,
         hedge_target_pct=0.25,
-        days_in_hedge=1,
+        days_in_hedge=1, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={"511260": 0.15, "518880": 0.0625, "511990": 0.0375},
     )
@@ -204,7 +206,7 @@ def test_generate_orders_skips_missing_price():
         drawdown_pct=0.05,
         equity_target_pct=0.75,
         hedge_target_pct=0.25,
-        days_in_hedge=1,
+        days_in_hedge=1, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={"511260": 0.25},
     )
@@ -220,7 +222,7 @@ def test_generate_orders_inactive_returns_empty():
         drawdown_pct=0.0,
         equity_target_pct=1.0,
         hedge_target_pct=0.0,
-        days_in_hedge=0,
+        days_in_hedge=0, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={},
     )
@@ -311,7 +313,7 @@ def test_save_and_load_hedge_state():
         drawdown_pct=0.05,
         equity_target_pct=0.75,
         hedge_target_pct=0.25,
-        days_in_hedge=1,
+        days_in_hedge=1, days_in_recovery=0,
         peak_nav=500_000,
         leg_allocations={"511260": 0.15},
     )

@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS hedge_state (
     equity_target_pct REAL NOT NULL DEFAULT 1.0,
     hedge_target_pct  REAL NOT NULL DEFAULT 0.0,
     days_in_hedge     INTEGER NOT NULL DEFAULT 0,
+    days_in_recovery  INTEGER NOT NULL DEFAULT 0,
     peak_nav          REAL NOT NULL DEFAULT 0.0,
     leg_json          TEXT NOT NULL DEFAULT '{}'
 );
