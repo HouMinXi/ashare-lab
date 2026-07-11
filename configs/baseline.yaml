@@ -110,7 +110,7 @@ paper:
     default_topk: 15
     reduced_topk: 7
   hedge:
-    enabled: true
+    enabled: false
     activate_dd: 0.03
     max_equity_pct: 0.95
     min_equity_pct: 0.20
