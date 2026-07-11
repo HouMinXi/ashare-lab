@@ -1571,7 +1571,7 @@ def run_backfill(
             )
             had_skip = True
             continue
-        rc = run_daily(date_str, force=False, pred_path=pred_path)
+        rc = run_daily(date_str, force=False, steps={"settle", "signal"}, pred_path=pred_path)
         if rc == 2:
             return 2
         if rc == 1:
