@@ -960,8 +960,8 @@ print(json.dumps(result))
 def _is_normalized_price(close: float, factor: float | None) -> bool:
     """Detect qlib normalized $close (IPO day=1.0) vs real CNY price.
 
-    Normalized prices have close/factor ratio >> 1. Real prices have factor ~1.0.
-    When factor is missing, use close < 0.5 as conservative threshold.
+    Normalized: factor < 0.1 AND close < 1.0 (both required).
+    Missing factor: flag if close < 0.5 (conservative fallback).
     """
     if factor is not None:
         return factor < 0.1 and close < 1.0
@@ -981,8 +981,9 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
         if _is_normalized_price(close, pdata.get("factor")):
             suspicious += 1
             if suspicious <= 3:
+                f = pdata.get("factor")
                 logger.error("Price anomaly: %s close=%.6f factor=%s (likely normalized $close)",
-                             sym, close, pdata.get("factor"))
+                             sym, close, f"{f:.6f}" if f is not None else "MISSING")
     if suspicious > len(ctx.prices) * 0.1:
         raise RuntimeError(
             f"Price sanity gate: {suspicious}/{len(ctx.prices)} suspect prices. "
