@@ -552,6 +552,30 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     return -1
 
 
+def _gate_data_completeness(ctx: DailyRunContext) -> None:
+    """Halt if qlib calendar missing expected trading days since last run."""
+    if ctx.steps == {"signal"}:
+        return
+    last_run = ctx.conn.execute(
+        "SELECT MAX(trade_date) FROM pipeline_runs WHERE status='success'"
+    ).fetchone()[0]
+    if last_run is None or last_run >= ctx.trade_date:
+        return  # first run or backfill
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
+    cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
+    expected = trading_days_between(
+        dt.date.fromisoformat(last_run) + dt.timedelta(days=1),
+        dt.date.fromisoformat(ctx.trade_date),
+    )
+    missing = [d.isoformat() for d in expected if cal_last is None or d.isoformat() > cal_last]
+    if missing:
+        raise RuntimeError(
+            f"Data completeness gate: qlib missing {len(missing)} trading days: {missing[:5]}. "
+            f"Run fetch-today or update qlib data before pipeline."
+        )
+
+
 def _step4_load_state(ctx: DailyRunContext) -> None:
     """Load positions, cash, cooldowns, soft-reduce flag from DB."""
     ctx.current_positions = get_latest_positions(ctx.conn)
@@ -931,6 +955,31 @@ print(json.dumps(result))
         }
 
     return -1  # continue
+
+
+def _gate_price_sanity(ctx: DailyRunContext) -> None:
+    """Halt if prices look like normalized (qlib $close) or wrong-year data."""
+    if ctx.steps == {"signal"}:
+        return
+    import math  # noqa: PLC0415
+    suspicious = 0
+    for sym, pdata in ctx.prices.items():
+        close = pdata.get("close")
+        if close is None or (isinstance(close, float) and (math.isnan(close) or close <= 0)):
+            continue
+        # Normalized price: qlib $close without /factor gives values < 1.0
+        if close < 1.0:
+            suspicious += 1
+            if suspicious <= 3:
+                logger.error("Price anomaly: %s close=%.6f (normalized? factor=%.6f)",
+                             sym, close, pdata.get("factor", 0))
+    if suspicious > len(ctx.prices) * 0.1:
+        raise RuntimeError(
+            f"Price sanity gate: {suspicious}/{len(ctx.prices)} prices < 1.0 yuan. "
+            f"Likely qlib $close not divided by $factor. Halting."
+        )
+    if suspicious > 0:
+        logger.warning("Price sanity: %d prices < 1.0 (below threshold, continuing)", suspicious)
 
 
 def _step6_adjustfactor(ctx: DailyRunContext) -> None:
@@ -1401,6 +1450,23 @@ def _step13_report(ctx: DailyRunContext) -> None:
     if os.environ.get("ASHARE_USE_STALE") == "1":
         logger.info("Skipping report: using stale predictions (GPU inference failed)")
         return
+    # Report quality gate: NAV reasonableness
+    nav_rows = ctx.conn.execute(
+        "SELECT trade_date, total_nav FROM nav ORDER BY trade_date DESC LIMIT 2"
+    ).fetchall()
+    if len(nav_rows) >= 2:
+        today_nav = float(nav_rows[0]["total_nav"])
+        prev_nav = float(nav_rows[1]["total_nav"])
+        if prev_nav > 0 and abs(today_nav - prev_nav) / prev_nav > 0.20:
+            logger.error("Report gate: NAV changed %.0f%% (%.0f -> %.0f), skipping report",
+                         abs(today_nav - prev_nav) / prev_nav * 100, prev_nav, today_nav)
+            return
+    # Report quality gate: normalized price detection
+    for sym, pdata in ctx.prices.items():
+        if pdata.get("close", 0) < 1.0:
+            logger.error("Report gate: normalized price detected (%s=%.4f), skipping report",
+                         sym, pdata["close"])
+            return
     if ctx.steps is not None and "report" not in ctx.steps:
         return
     try:
@@ -1511,11 +1577,15 @@ def run_daily(
     if rc in (1, 2):
         return rc
 
+    _gate_data_completeness(ctx)
+
     _step4_load_state(ctx)
 
     rc = _step5_fetch_prices_and_universe(ctx)
     if rc == 2:
         return 2
+
+    _gate_price_sanity(ctx)
 
     _step6_adjustfactor(ctx)
     _step7_csi1000_exits(ctx)
