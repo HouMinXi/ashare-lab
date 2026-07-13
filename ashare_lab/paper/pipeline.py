@@ -715,6 +715,7 @@ else:
                         "change": pdata["change"],
                         "volume": pdata["volume"],
                         "factor": pdata["factor"],
+                        "adjusted": True,  # price divided by factor
                         "threshold": get_limit_threshold(matched, ctx.st_names),
                     }
                 logger.info("fetched %d prices via subprocess", len(ctx.prices))
@@ -957,14 +958,18 @@ print(json.dumps(result))
     return -1  # continue
 
 
-def _is_normalized_price(close: float, factor: float | None) -> bool:
+def _is_normalized_price(close: float, factor: float | None, adjusted: bool = False) -> bool:
     """Detect qlib normalized $close (IPO day=1.0) vs real CNY price.
 
-    Normalized: factor < 0.1 AND close < 1.0 (both required).
+    If `adjusted` is True, the price was already divided by factor — not normalized.
+    Otherwise: factor < 0.1 indicates high-IPO-price stock where normalized close
+    could be >= 1.0 (e.g., IPO at 500 yuan, now at 600 -> normalized close=1.2).
     Missing factor: flag if close < 0.5 (conservative fallback).
     """
+    if adjusted:
+        return False
     if factor is not None:
-        return factor < 0.1 and close < 1.0
+        return factor < 0.1
     return close < 0.5
 
 
@@ -978,7 +983,7 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
         close = pdata.get("close")
         if close is None or (isinstance(close, float) and (math.isnan(close) or close <= 0)):
             continue
-        if _is_normalized_price(close, pdata.get("factor")):
+        if _is_normalized_price(close, pdata.get("factor"), pdata.get("adjusted", False)):
             suspicious += 1
             if suspicious <= 3:
                 f = pdata.get("factor")
@@ -1477,7 +1482,7 @@ def _step13_report(ctx: DailyRunContext) -> None:
         close = pdata.get("close")
         if close is None or close <= 0:
             continue  # missing data is not a normalized price
-        if _is_normalized_price(close, pdata.get("factor")):
+        if _is_normalized_price(close, pdata.get("factor"), pdata.get("adjusted", False)):
             logger.error("Report gate: normalized price (%s=%.4f factor=%s), skip report",
                          sym, close, pdata.get("factor"))
             return
