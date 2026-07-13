@@ -969,12 +969,18 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
             continue
         # Normalized price: qlib $close without /factor gives values < 1.0
         # Real penny stocks have factor ~1.0; normalized prices have factor << 1.0
-        factor = pdata.get("factor", 1.0)
-        if close < 1.0 and factor < 0.1:
+        # If factor is missing (default 1.0), we can't distinguish — flag if close < 0.5
+        factor = pdata.get("factor")
+        if factor is not None and factor < 0.1 and close < 1.0:
             suspicious += 1
             if suspicious <= 3:
                 logger.error("Price anomaly: %s close=%.6f factor=%.6f (normalized)",
                              sym, close, factor)
+        elif factor is None and close < 0.5:
+            suspicious += 1
+            if suspicious <= 3:
+                logger.error("Price anomaly: %s close=%.6f factor=MISSING (suspect)",
+                             sym, close)
     if suspicious > len(ctx.prices) * 0.1:
         raise RuntimeError(
             f"Price sanity gate: {suspicious}/{len(ctx.prices)} prices < 1.0 yuan. "
@@ -1463,11 +1469,17 @@ def _step13_report(ctx: DailyRunContext) -> None:
             logger.error("Report gate: NAV changed %.0f%% (%.0f -> %.0f), skipping report",
                          abs(today_nav - prev_nav) / prev_nav * 100, prev_nav, today_nav)
             return
-    # Report quality gate: normalized price detection (factor < 0.1 = normalized, not penny stock)
+    # Report quality gate: normalized price detection
     for sym, pdata in ctx.prices.items():
-        if pdata.get("close", 0) < 1.0 and pdata.get("factor", 1.0) < 0.1:
-            logger.error("Report gate: normalized price detected (%s=%.4f factor=%.4f), skipping report",
-                         sym, pdata["close"], pdata["factor"])
+        close = pdata.get("close", 0)
+        factor = pdata.get("factor")
+        if factor is not None and factor < 0.1 and close < 1.0:
+            logger.error("Report gate: normalized price (%s=%.4f factor=%.4f), skip report",
+                         sym, close, factor)
+            return
+        if factor is None and close < 0.5:
+            logger.error("Report gate: suspect price (%s=%.4f factor=MISSING), skip report",
+                         sym, close)
             return
     if ctx.steps is not None and "report" not in ctx.steps:
         return
