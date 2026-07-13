@@ -142,6 +142,18 @@ try_gpu_inference() {
         return 1
     fi
 
+    # W4: detect current GPU consumer before clearing
+    local gpu_restore_target="ollama"
+    local _llama_running
+    _llama_running=$(ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
+        'tasklist /FI "IMAGENAME eq llama-server.exe" /NH 2>NUL | findstr /I llama-server' 2>/dev/null | tr -d '\r')
+    if [ -n "$_llama_running" ]; then
+        gpu_restore_target="llama-server"
+        echo "GPU consumer detected: llama-server"
+    else
+        echo "GPU consumer detected: ollama (default)"
+    fi
+
     # W4: clear GPU for predict (stop ollama + llama-server)
     ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training' || \
         echo "WARNING: gpu-switch training failed (non-fatal)"
@@ -154,9 +166,9 @@ try_gpu_inference() {
         predict_rc=1
     fi
 
-    # W4: restore ollama after predict (always, even on failure)
-    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat ollama' || \
-        echo "WARNING: gpu-switch ollama failed (non-fatal)"
+    # W4: restore previous GPU consumer (always, even on failure)
+    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" "H:\\gpu-switch.bat ${gpu_restore_target}" || \
+        echo "WARNING: gpu-switch ${gpu_restore_target} failed (non-fatal)"
 
     [ $predict_rc -ne 0 ] && return 1
 
