@@ -78,7 +78,7 @@ sync_code_to_gpu() {
 
     # Guard: verify GPU predict.py accepts --provider-uri
     if ! ssh -o ConnectTimeout=5 "${GPU_USER}@${GPU_HOST}" \
-        "cd /d H:\\ashare-lab && python -m ashare_lab.research.predict --help" 2>&1 | grep -q "provider-uri"; then
+        "cd /d H:\\ashare-lab && py -m ashare_lab.research.predict --help" 2>&1 | grep -q "provider-uri"; then
         echo "ERROR: GPU predict.py missing --provider-uri after sync"
         return 1
     fi
@@ -136,7 +136,7 @@ try_gpu_inference() {
     local gpu_has_date
     # qlib INFO logs go to stdout; strip CR (Windows SSH), grep exact yes/no
     gpu_has_date=$(ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
-        "python -c \"import qlib; qlib.init(provider_uri='H:/.qlib/qlib_data/cn_data', region='cn'); from qlib.data import D; cal=D.calendar(start_time='$TRADE_DATE',end_time='$TRADE_DATE'); print('yes' if len(cal)>0 else 'no')\"" 2>/dev/null | tr -d '\r' | grep -x 'yes\|no' | tail -1)
+        "py -c \"import qlib; qlib.init(provider_uri='H:/.qlib/qlib_data/cn_data', region='cn'); from qlib.data import D; cal=D.calendar(start_time='$TRADE_DATE',end_time='$TRADE_DATE'); print('yes' if len(cal)>0 else 'no')\"" 2>/dev/null | tr -d '\r' | grep -x 'yes\|no' | tail -1)
     if [ "$gpu_has_date" != "yes" ]; then
         echo "ERROR: GPU qlib data missing trade date $TRADE_DATE (data sync incomplete)"
         return 1
@@ -161,7 +161,7 @@ try_gpu_inference() {
     # Run predict.py on GPU
     local predict_rc=0
     if ! timeout $GPU_PREDICT_TIMEOUT ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
-        "cd /d H:\\ashare-lab && python -m ashare_lab.research.predict --date $TRADE_DATE --provider-uri H:/.qlib/qlib_data/cn_data"; then
+        "cd /d H:\\ashare-lab && py -m ashare_lab.research.predict --date $TRADE_DATE --provider-uri H:/.qlib/qlib_data/cn_data"; then
         echo "ERROR: GPU predict.py failed or timed out"
         predict_rc=1
     fi
