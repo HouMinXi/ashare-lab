@@ -957,6 +957,17 @@ print(json.dumps(result))
     return -1  # continue
 
 
+def _is_normalized_price(close: float, factor: float | None) -> bool:
+    """Detect qlib normalized $close (IPO day=1.0) vs real CNY price.
+
+    Normalized prices have close/factor ratio >> 1. Real prices have factor ~1.0.
+    When factor is missing, use close < 0.5 as conservative threshold.
+    """
+    if factor is not None:
+        return factor < 0.1 and close < 1.0
+    return close < 0.5
+
+
 def _gate_price_sanity(ctx: DailyRunContext) -> None:
     """Halt if prices look like normalized (qlib $close) or wrong-year data."""
     if ctx.steps == {"signal"}:
@@ -967,23 +978,14 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
         close = pdata.get("close")
         if close is None or (isinstance(close, float) and (math.isnan(close) or close <= 0)):
             continue
-        # Normalized price: qlib $close without /factor gives values < 1.0
-        # Real penny stocks have factor ~1.0; normalized prices have factor << 1.0
-        # If factor is missing (default 1.0), we can't distinguish — flag if close < 0.5
-        factor = pdata.get("factor")
-        if factor is not None and factor < 0.1 and close < 1.0:
+        if _is_normalized_price(close, pdata.get("factor")):
             suspicious += 1
             if suspicious <= 3:
-                logger.error("Price anomaly: %s close=%.6f factor=%.6f (normalized)",
-                             sym, close, factor)
-        elif factor is None and close < 0.5:
-            suspicious += 1
-            if suspicious <= 3:
-                logger.error("Price anomaly: %s close=%.6f factor=MISSING (suspect)",
-                             sym, close)
+                logger.error("Price anomaly: %s close=%.6f factor=%s (likely normalized $close)",
+                             sym, close, pdata.get("factor"))
     if suspicious > len(ctx.prices) * 0.1:
         raise RuntimeError(
-            f"Price sanity gate: {suspicious}/{len(ctx.prices)} prices < 1.0 yuan. "
+            f"Price sanity gate: {suspicious}/{len(ctx.prices)} suspect prices. "
             f"Likely qlib $close not divided by $factor. Halting."
         )
     if suspicious > 0:
@@ -1471,15 +1473,12 @@ def _step13_report(ctx: DailyRunContext) -> None:
             return
     # Report quality gate: normalized price detection
     for sym, pdata in ctx.prices.items():
-        close = pdata.get("close", 0)
-        factor = pdata.get("factor")
-        if factor is not None and factor < 0.1 and close < 1.0:
-            logger.error("Report gate: normalized price (%s=%.4f factor=%.4f), skip report",
-                         sym, close, factor)
-            return
-        if factor is None and close < 0.5:
-            logger.error("Report gate: suspect price (%s=%.4f factor=MISSING), skip report",
-                         sym, close)
+        close = pdata.get("close")
+        if close is None or close <= 0:
+            continue  # missing data is not a normalized price
+        if _is_normalized_price(close, pdata.get("factor")):
+            logger.error("Report gate: normalized price (%s=%.4f factor=%s), skip report",
+                         sym, close, pdata.get("factor"))
             return
     if ctx.steps is not None and "report" not in ctx.steps:
         return
