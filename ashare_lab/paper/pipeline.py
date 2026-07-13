@@ -683,8 +683,14 @@ else:
                         if fs.endswith(sym[-6:]) if len(sym) > 6 else fs == sym:
                             matched = fs
                             break
+                    # qlib $close is normalized (IPO day=1.0); divide by $factor
+                    # to recover actual CNY price for NAV and order sizing.
+                    _factor = max(pdata.get("factor", 1.0), 1e-8)
                     ctx.prices[matched] = {
-                        **pdata,
+                        "close": pdata["close"] / _factor,
+                        "change": pdata["change"],
+                        "volume": pdata["volume"],
+                        "factor": pdata["factor"],
                         "threshold": get_limit_threshold(matched, ctx.st_names),
                     }
                 logger.info("fetched %d prices via subprocess", len(ctx.prices))
