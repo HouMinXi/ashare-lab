@@ -1392,6 +1392,9 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
 def _step13_report(ctx: DailyRunContext) -> None:
     """Deliver WeChat report (non-blocking)."""
+    if os.environ.get("ASHARE_USE_STALE") == "1":
+        logger.info("Skipping report: using stale predictions (GPU inference failed)")
+        return
     if ctx.steps is not None and "report" not in ctx.steps:
         return
     try:
