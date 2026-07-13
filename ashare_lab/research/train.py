@@ -21,6 +21,22 @@ from ashare_lab.config import load_config
 
 log = logging.getLogger(__name__)
 
+
+def _nvidia_smi_mem() -> int | None:
+    """Return board-level GPU memory used in MiB via nvidia-smi, or None on failure."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            timeout=5,
+            text=True,
+        )
+        return int(out.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
 # Alpha158 requires ~1 year of price history before the first train_start.
 # This constant is shared with smoke_test.py; both must use the same value.
 ALPHA158_WARMUP_START = "2017-01-01"
@@ -347,11 +363,22 @@ def train_window(
 
             model.fit = _amp_fit
             log.info("W%d: AMP enabled (bfloat16)", window_id)
+        _cuda_available = torch.cuda.is_available()
+        if _cuda_available:
+            torch.cuda.reset_peak_memory_stats()
+            _smi_before = _nvidia_smi_mem()
         try:
             model.fit(dataset)
         finally:
             if _original_fit_alstm is not None:
                 model.fit = _original_fit_alstm  # restore for pickling
+            if _cuda_available:
+                _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+                _smi_after = _nvidia_smi_mem()
+                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                         window_id, _alloc_mb, _resv_mb,
+                         _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "tra":
         # TRAModel: Temporal Routing Adaptor (KDD 2021).
         # GPU device is auto-detected via torch.cuda.is_available() at module level;
@@ -403,11 +430,22 @@ def train_window(
 
             model.fit = _amp_fit
             log.info("W%d: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
+        _cuda_available = torch.cuda.is_available()
+        if _cuda_available:
+            torch.cuda.reset_peak_memory_stats()
+            _smi_before = _nvidia_smi_mem()
         try:
             model.fit(dataset)
         finally:
             if _original_fit_tra is not None:
                 model.fit = _original_fit_tra  # restore for pickling
+            if _cuda_available:
+                _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+                _smi_after = _nvidia_smi_mem()
+                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                         window_id, _alloc_mb, _resv_mb,
+                         _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "densemble":
         from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415
 
