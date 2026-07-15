@@ -1265,7 +1265,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
                 logger.warning(
                     "Pipeline: model IC is unavailable (nan) for %s. "
                     "Predictions use fixed 60/40 blend, unaffected.",
-                    trade_date,
+                    ctx.trade_date,
                 )
                 # Store flag for report annotation
                 ctx.config["_ic_nan"] = True
