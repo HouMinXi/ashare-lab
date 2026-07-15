@@ -1234,7 +1234,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         ctx.conn.commit()
         return 2
 
-    # Provenance log
+    # Provenance log + model staleness check
     meta_path = PREDICTIONS_DIR / f"{ctx.trade_date}.meta.json"
     if meta_path.exists():
         try:
@@ -1244,6 +1244,13 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
                 "Prediction provenance: model=%s window=%s",
                 meta.get("model"), meta.get("window_id"),
             )
+            model_age = meta.get("model_age_days")
+            if model_age is not None and model_age > 7:
+                logger.warning(
+                    "Pipeline: model %s is %.0f days old (threshold: 7). "
+                    "Consider retraining.",
+                    meta.get("model"), model_age,
+                )
         except Exception:
             pass
 

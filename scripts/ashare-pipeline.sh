@@ -178,6 +178,8 @@ try_gpu_inference() {
         echo "ERROR: SCP predictions failed"
         return 1
     fi
+    # SCP meta.json (non-fatal: parquet is the critical file)
+    scp "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.meta.json" "$PREDICTIONS_DIR/" 2>/dev/null || true
 
     return 0
 }

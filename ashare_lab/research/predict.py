@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
 
 def predict_for_date(
@@ -108,6 +111,15 @@ def predict_for_date(
             "model file %s does not exist "
             "(models are gitignored; train on the GPU host or sync them)"
             % model_path
+        )
+
+    # -- Model freshness check --
+    model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
+    if model_age_days > _MODEL_STALE_DAYS:
+        log.warning(
+            "MODEL STALE: %s is %.0f days old (threshold: %d days). "
+            "Consider retraining.",
+            model_path.name, model_age_days, _MODEL_STALE_DAYS,
         )
 
     log.info(
@@ -225,6 +237,7 @@ def predict_for_date(
         "window_id": window_id,
         "produced_at": datetime.now(timezone.utc).isoformat(),
         "n_instruments": len(df),
+        "model_age_days": round(model_age_days, 1),
     }
     meta_path = PREDICTIONS_DIR / f"{trade_date}.meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
