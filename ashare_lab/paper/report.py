@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import secrets
 import struct
 import subprocess
@@ -568,7 +569,9 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
         return result
 
 
-HERMES_GATEWAY_URL = "http://127.0.0.1:8642/api/weixin/send"
+HERMES_GATEWAY_URL = os.environ.get(
+    "HERMES_GATEWAY_URL", "http://127.0.0.1:8642/api/weixin/send"
+)
 
 
 def send_via_hermes_gateway(chat_id: str, message: str, timeout: int = 15) -> bool:
@@ -584,7 +587,10 @@ def send_via_hermes_gateway(chat_id: str, message: str, timeout: int = 15) -> bo
         data = resp.json()
         ok = data.get("success", False)
         if not ok:
-            logger.warning("hermes-gateway send failed: %s", data.get("error"))
+            logger.warning(
+                "hermes-gateway send failed (HTTP %s): %s",
+                resp.status_code, data.get("error"),
+            )
         return ok
     except Exception as e:
         logger.warning("hermes-gateway send failed: %s", e)
