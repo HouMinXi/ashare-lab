@@ -174,18 +174,18 @@ def _write_verdict_atomic(verdict_dict: dict, out_path: Path) -> None:
 
 
 def finalize_artifacts(models_dir: Path) -> Path:
-    """Copy the highest-numbered main walk-forward model to MODELS_DIR/latest.{ext}.
+    """Symlink MODELS_DIR/latest.{ext} to the highest-numbered walk-forward model.
 
     Handles both LGB (.pkl) and neural-network (.pt) model formats.  Tries .pkl
     first; falls back to .pt for ALSTM / TRA experiments.  Sorts by the integer
-    suffix (not lexicographic) so w10 > w9.  Uses shutil.copy2 (preserves mtime;
-    does NOT delete source -- write_feature_importance reads these files in step 2).
+    suffix (not lexicographic) so w10 > w9.  Creates a symlink (not a copy) so
+    latest.{ext} always points to the most recently trained model.
 
     Args:
         models_dir: Directory containing per-window model files (w1.pkl or w1.pt).
 
     Returns:
-        Path to the copied latest model file (MODELS_DIR/latest.pkl or .pt).
+        Path to the latest model symlink (MODELS_DIR/latest.pkl or .pt).
 
     Raises:
         FileNotFoundError: if no matching w*.pkl or w*.pt files found in models_dir.
@@ -214,9 +214,15 @@ def finalize_artifacts(models_dir: Path) -> Path:
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     dest = MODELS_DIR / f"latest{ext}"
-    shutil.copy2(latest_src, dest)
+    # Compute relative path from dest's parent to the source file.
+    # This works whether MODELS_DIR == models_dir or not.
+    rel_target = os.path.relpath(latest_src, start=dest.parent)
+    # Remove existing file or symlink before creating new one.
+    if dest.is_symlink() or dest.exists():
+        dest.unlink()
+    dest.symlink_to(rel_target)
     log.info(
-        "finalize_artifacts: copied %s -> %s", latest_src.name, dest
+        "finalize_artifacts: symlinked %s -> %s", dest, rel_target
     )
     return dest
 
