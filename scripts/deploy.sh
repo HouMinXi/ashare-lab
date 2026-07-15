@@ -196,10 +196,34 @@ StandardOutput=journal
 StandardError=journal
 UNIT
 
+cat > "$UNIT_DIR/ashare-retrain.timer" << 'UNIT'
+[Unit]
+Description=Monthly ashare model retraining
+
+[Timer]
+OnCalendar=*-*-01 22:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+cat > "$UNIT_DIR/ashare-retrain.service" << UNIT
+[Unit]
+Description=ashare model retraining
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$REPO/scripts/ashare-retrain.sh
+TimeoutStartSec=86400
+UNIT
+
 systemctl --user daemon-reload
 systemctl --user enable --now ashare-data-update.timer
 systemctl --user enable --now ashare-pipeline.timer
 systemctl --user enable --now ashare-chenditc.timer
+systemctl --user enable --now ashare-retrain.timer
 
 # ---- Section 10: Log rotation note ----
 # ponytail: journald user logs auto-rotate via /etc/systemd/journald.conf
