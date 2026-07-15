@@ -41,10 +41,15 @@ CREATE TABLE IF NOT EXISTS orders (
                          'carry','cancelled','lot_skip'
                      )),
     carry_day        INTEGER NOT NULL DEFAULT 0,
+    reset_count      INTEGER NOT NULL DEFAULT 0,
     created_run_date TEXT    NOT NULL,
     source           TEXT    NOT NULL DEFAULT 'signal',
     created_at       TEXT    NOT NULL
 );
+
+-- Migration: add reset_count if missing (idempotent)
+-- SQLite does not support IF NOT EXISTS for ALTER TABLE,
+-- so init_schema() handles this via try/except.
 
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +235,14 @@ def init_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
 
+    # reset_count: tracks limit-down reset attempts per order
+    try:
+        conn.execute(
+            "ALTER TABLE orders ADD COLUMN reset_count INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
 
 
@@ -408,7 +421,7 @@ def update_order(conn: sqlite3.Connection, order_id: int, **fields: object) -> N
 
     Accepted keys: status, filled_qty, carry_day, price.
     """
-    allowed = {"status", "filled_qty", "carry_day", "price"}
+    allowed = {"status", "filled_qty", "carry_day", "price", "reset_count"}
     to_set = {k: v for k, v in fields.items() if k in allowed}
     if not to_set:
         return

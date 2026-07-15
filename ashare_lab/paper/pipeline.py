@@ -1059,7 +1059,7 @@ def _step8_settle(ctx: DailyRunContext) -> None:
 
     pending_orders = [
         dict(r) for r in ctx.conn.execute(
-            "SELECT id, symbol, side, target_qty, carry_day FROM orders "
+            "SELECT id, symbol, side, target_qty, carry_day, reset_count FROM orders "
             "WHERE status IN ('pending','carry') AND trade_date <= ?",
             (ctx.trade_date,),
         ).fetchall()
@@ -1509,10 +1509,23 @@ def _step13_report(ctx: DailyRunContext) -> None:
     if len(nav_rows) >= 2:
         today_nav = float(nav_rows[0]["total_nav"])
         prev_nav = float(nav_rows[1]["total_nav"])
-        if prev_nav > 0 and abs(today_nav - prev_nav) / prev_nav > 0.20:
-            logger.error("Report gate: NAV changed %.0f%% (%.0f -> %.0f), skipping report",
-                         abs(today_nav - prev_nav) / prev_nav * 100, prev_nav, today_nav)
-            return
+        if prev_nav > 0:
+            nav_change = (today_nav - prev_nav) / prev_nav
+            # Suppress report only on suspiciously large GAINS
+            # (likely data error). Large LOSSES must always alert
+            # -- the operator needs to know (2024-02 crash lesson).
+            if nav_change > 0.20:
+                logger.error(
+                    "Report gate: NAV jumped %.0f%% (%.0f -> %.0f), "
+                    "likely data error, skipping report",
+                    nav_change * 100, prev_nav, today_nav)
+                return
+            if nav_change < -0.20:
+                logger.critical(
+                    "CRASH ALERT: NAV dropped %.0f%% (%.0f -> %.0f)!",
+                    abs(nav_change) * 100, prev_nav, today_nav)
+                # Still send the report (operator MUST know), but
+                # log the crash prominently. Do NOT return here.
     # Report quality gate: normalized price detection
     for sym, pdata in ctx.prices.items():
         close = pdata.get("close")

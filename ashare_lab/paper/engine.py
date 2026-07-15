@@ -184,6 +184,7 @@ def settle_day(
     happen inside a single transaction (``with conn:``).
     """
     carry_days_limit = config.get("carry_days", 3)
+    max_resets = config.get("max_limit_down_resets", 5)
     slippage = config.get("slippage", 0.001)
     participation_pct = config.get("volume_participation_pct", 0.05)
 
@@ -247,8 +248,25 @@ def settle_day(
                         {"order_id": oid, "symbol": symbol, "side": "sell"}
                     )
                 else:
-                    update_order(conn, oid, status="cancelled")
-                    result.cancels.append(symbol)
+                    # Reset carry_day so the order retries next time
+                    # the stock opens. Cancelling strands the position
+                    # with no exit (2024-02 CSI1000 crash lesson).
+                    # Track reset count via reset_count column.
+                    # After max_resets, cancel to prevent infinite
+                    # carry on permanently halted stocks.
+                    reset_count = order.get("reset_count", 0) + 1
+                    if reset_count >= max_resets:
+                        update_order(conn, oid, status="cancelled")
+                        result.cancels.append(symbol)
+                    else:
+                        update_order(
+                            conn, oid, status="carry",
+                            carry_day=-1, reset_count=reset_count)
+                        result.carries_to_bump.append(
+                            {"order_id": oid, "symbol": symbol,
+                             "side": "sell",
+                             "reason": f"limit_down_reset_{reset_count}"}
+                        )
                 continue
 
             # Fillable path

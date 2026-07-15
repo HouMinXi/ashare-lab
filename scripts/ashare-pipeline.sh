@@ -5,6 +5,15 @@
 # No set -e: explicit error checks preserve retry/alert flow (R4H1).
 set -uo pipefail
 
+# Pipeline mutex: prevent double execution (no flock = race window
+# where two pipelines run concurrently, corrupting state).
+LOCKFILE="/tmp/ashare-pipeline.lock"
+exec 8<>"$LOCKFILE"
+if ! flock -w 60 8; then
+    echo "ERROR: another pipeline is already running (lock: $LOCKFILE)"
+    exit 1
+fi
+
 REPO="$HOME/code/ashare-lab"
 GPU_HOST="192.168.100.11"
 GPU_MAC="04:7C:16:49:BE:32"

@@ -350,6 +350,18 @@ def run_all_risk_checks(
     # -- Merge halt flags --
     buying_halted = drawdown_halted or daily_loss_halted or regime_halted
 
+    # -- Hard drawdown forced liquidation (emergency override) --
+    # When drawdown_hard fires, force-sell ALL positions (full qty,
+    # overriding any partial sells from concentration or trailing
+    # stop). Previous code only halted buying, leaving portfolio
+    # frozen between 15-20% drawdown with no exit path.
+    if drawdown_halted:
+        for symbol, pos in current_positions.items():
+            forced_sells[symbol] = pos["qty"]
+            logger.warning(
+                "Hard drawdown forced sell: %s x%d",
+                symbol, pos["qty"])
+
     return RiskCheckResult(
         buying_halted=buying_halted,
         forced_sells=forced_sells,
