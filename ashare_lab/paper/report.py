@@ -568,6 +568,29 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
         return result
 
 
+HERMES_GATEWAY_URL = "http://127.0.0.1:8642/api/weixin/send"
+
+
+def send_via_hermes_gateway(chat_id: str, message: str, timeout: int = 15) -> bool:
+    """Send message via hermes-gateway HTTP API (persistent iLink session)."""
+    import requests
+    try:
+        resp = requests.post(
+            HERMES_GATEWAY_URL,
+            headers={"Content-Type": "application/json"},
+            json={"chat_id": chat_id, "message": message},
+            timeout=timeout,
+        )
+        data = resp.json()
+        ok = data.get("success", False)
+        if not ok:
+            logger.warning("hermes-gateway send failed: %s", data.get("error"))
+        return ok
+    except Exception as e:
+        logger.warning("hermes-gateway send failed: %s", e)
+        return False
+
+
 def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bool:
     try:
         import requests
@@ -610,53 +633,47 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     conn.commit()
 
     try:
-        wx_token = _get_secret("ashare/weixin-token")
-        # weixin-account-id: reserved for context_token path (T3 runtime
-        # verification on X500). Not needed for token-less bot send where
-        # from_user_id="" per hermes weixin.py:402.
         wx_chat_id = _get_secret("ashare/weixin-chat-id")
     except Exception:
         insert_report(conn, trade_date, mode, report_text, None, "failed")
         conn.commit()
-        logger.warning("Failed to load iLink secrets, aborting delivery")
+        logger.warning("Failed to load weixin-chat-id secret, aborting delivery")
         return "failed"
 
     rcfg = config["paper"].get("report", {})
     max_len = rcfg.get("ilink_max_message_length", 4000)
     delay = rcfg.get("ilink_chunk_delay", 0.3)
-    ilink_timeout = rcfg.get("ilink_timeout", 15)
-    
+    gw_timeout = rcfg.get("ilink_timeout", 15)
+
     chunks = split_report_text(report_text, max_len)
     sent_upto = 0
 
-    # F1 note: sent_upto intentionally shared across attempts. Retry starts
-    # from where first attempt left off. If retry fails, sent_upto reflects
-    # the last successfully sent chunk (correct for logging/fallback).
-    async def _send_chunks() -> None:
+    # Send chunks via hermes-gateway (persistent iLink session).
+    # Retry once on failure, resuming from the last successfully sent chunk.
+    def _send_via_gateway() -> None:
         nonlocal sent_upto
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            for i in range(sent_upto, len(chunks)):
-                await send_text_ilink(session, wx_token, wx_chat_id, chunks[i], ilink_timeout)
-                sent_upto = i + 1
-                if i < len(chunks) - 1:
-                    await asyncio.sleep(delay)
+        for i in range(sent_upto, len(chunks)):
+            if not send_via_hermes_gateway(wx_chat_id, chunks[i], gw_timeout):
+                raise RuntimeError(f"gateway send failed at chunk {i}")
+            sent_upto = i + 1
+            if i < len(chunks) - 1:
+                time.sleep(delay)
 
     try:
-        asyncio.run(_send_chunks())
+        _send_via_gateway()
         insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
         conn.commit()
         return "sent"
     except Exception as e:
-        logger.warning("iLink first attempt failed (sent %d/%d): %s", sent_upto, len(chunks), e)
+        logger.warning("hermes-gateway first attempt failed (sent %d/%d): %s", sent_upto, len(chunks), e)
         time.sleep(5)
         try:
-            asyncio.run(_send_chunks())
+            _send_via_gateway()
             insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
             conn.commit()
             return "sent"
         except Exception as e2:
-            logger.warning("iLink second attempt failed: %s", e2)
+            logger.warning("hermes-gateway second attempt failed: %s", e2)
 
     fb_name = rcfg.get("fallback_service", "serverchan")
     fb_entry = _FALLBACK_PUSH.get(fb_name)
