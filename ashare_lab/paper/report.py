@@ -569,8 +569,9 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
         return result
 
 
-HERMES_GATEWAY_URL = os.environ.get(
-    "HERMES_GATEWAY_URL", "http://127.0.0.1:8642/api/weixin/send"
+HERMES_GATEWAY_URL = (
+    os.environ.get("HERMES_GATEWAY_URL")
+    or "http://127.0.0.1:8642/api/weixin/send"
 )
 
 
