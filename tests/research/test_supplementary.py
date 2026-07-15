@@ -8,6 +8,7 @@ effects on the real filesystem.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -262,7 +263,9 @@ class TestFinalizeArtifacts:
             dest = finalize_artifacts(models_dir)
 
         assert dest == fake_models_dir / "latest.pkl"
-        assert dest.exists()
+        assert dest.is_symlink()
+        # Symlink should resolve to w7.pkl (highest numbered).
+        assert os.path.realpath(dest) == str(models_dir / "w7.pkl")
         # Content should match w7.pkl (b"dummy7"), not w3 or backup.
         assert dest.read_bytes() == b"dummy7"
 
