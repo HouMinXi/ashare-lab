@@ -23,15 +23,26 @@ log = logging.getLogger(__name__)
 
 
 def _nvidia_smi_mem() -> int | None:
-    """Return board-level GPU memory used in MiB via nvidia-smi, or None on failure."""
+    """Return board-level GPU memory used in MiB via nvidia-smi, or None on failure.
+
+    Respects CUDA_VISIBLE_DEVICES: when set, queries the corresponding
+    physical GPU instead of always reading GPU 0.
+    """
     import subprocess  # noqa: PLC0415
 
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            timeout=5,
-            text=True,
-        )
+        cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+        cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if cuda_dev:
+            # CUDA_VISIBLE_DEVICES is a comma-separated list of physical
+            # GPU indices.  PyTorch maps the FIRST entry to logical cuda:0.
+            # nvidia-smi needs the physical index.
+            first_phys = cuda_dev.split(",")[0].strip()
+            if first_phys.isdigit():
+                cmd = ["nvidia-smi", f"--id={first_phys}",
+                       "--query-gpu=memory.used",
+                       "--format=csv,noheader,nounits"]
+        out = subprocess.check_output(cmd, timeout=5, text=True)
         return int(out.strip().splitlines()[0])
     except Exception:
         return None
@@ -352,6 +363,7 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_alstm = None
+        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
         if cfg_model.get("use_amp", False):
             import torch as _torch  # noqa: PLC0415
 
@@ -408,6 +420,7 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_tra = None
+        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
         if cfg_model.get("use_amp", False):
             import torch as _torch  # noqa: PLC0415
 

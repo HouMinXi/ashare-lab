@@ -356,10 +356,8 @@ def format_chinese_report(
                 reverse=True,
             )
 
-        # F13 fix: apply _TOP_N cap even when all_zero to prevent message overflow
-        show_all = len(sorted_pos) <= _TOP_N
-        display_pos = sorted_pos[:_TOP_N]
-        title = f"持仓分布 ({len(sorted_pos)}只)" if show_all else "涨跌TOP"
+        display_pos = sorted_pos
+        title = f"涨跌TOP ({len(sorted_pos)}只)"
 
         lines.append("")
         lines.append(f"{_SEP} {title} {_SEP}")
@@ -370,20 +368,17 @@ def format_chinese_report(
             display_change = change * 100.0
             if change > 0:
                 lines.append(
-                    f"\U0001f53a {name} {p['weight']:.1f}% "
+                    f"\U0001f4c8 {name} {p['weight']:.1f}% "
                     f"+{display_change:.2f}% +{pnl:,.0f}元"
                 )
             elif change < 0:
                 lines.append(
-                    f"\U0001f53b {name} {p['weight']:.1f}% "
+                    f"\U0001f4c9 {name} {p['weight']:.1f}% "
                     f"{display_change:.2f}% {pnl:,.0f}元"
                 )
             else:
                 lines.append(f"{name} {p['weight']:.1f}%")
 
-        if not show_all:
-            remaining = len(sorted_pos) - _TOP_N
-            lines.append(f"...及{remaining}只其他持仓")
 
     # Pending orders
     if rd.pending_orders:

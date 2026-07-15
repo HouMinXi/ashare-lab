@@ -19,6 +19,7 @@ Three machines, three distinct roles:
 - **Local dev machine**: write code, run forge review, unit tests. NOT for archiving -- reboots unpredictably, no persistent storage guarantee.
 - **GPU (admin@192.168.100.11, Windows)**: multi-tenant training host.
     Repo and all data live on **H: drive** (`H:\ashare-lab\`, `H:\.qlib\`).
+    **All files on win-gpu must go to H: drive.** Never create files on C:\Users\admin\Desktop\, C:\Users\admin\AppData\, or any C: drive path. Temp files go to `H:\tmp\`. This applies to subagents too — include "禁止在桌面或C盘创建文件" in all subagent prompts that SSH to win-gpu.
     C: drive has NO ashare artifacts -- cleared during Phase 6 deploy.
     Python 3.12 is global (`C:\...\Python312\python.exe`), no .venv.
   - **ashare TRA training** (this project): `run_*.py` + `*.log` are
@@ -126,3 +127,15 @@ Every commit that changes code or closes a task MUST complete ALL of these befor
 5. **Non-ASCII check**: all changed files including CLAUDE.md and memory.
 
 Origin: main session flagged the same "memory stale / GSD counters wrong / SUMMARY missing" pattern 4 times across 3 review rounds in Phase 3.
+
+
+## Pipeline Data Quality Rules (2026-07-13 incident)
+
+Incidence evidence: project memory `feedback_pipeline_incident_20260713.md`.
+
+- **qlib $close is normalized (IPO day=1.0), not actual CNY.** Always divide by `$factor`: `actual_price = $close / $factor`. The `adjusted` flag in `ctx.prices` marks prices that have been divided. This is the #1 rule — violating it causes 30x NAV inflation.
+- **Three data quality gates before settle are mandatory.** (1) Data completeness: halt if qlib calendar missing expected trading days. (2) Price sanity: halt if >10% prices look normalized (`factor < 0.1` without `adjusted` flag). (3) Report quality: skip WeChat report if NAV changed >20% or normalized prices detected. All three implemented in `pipeline.py`.
+- **Never blame a data source without proof.** Subagent investigation proved chenditc was correct — the bug was in pipeline code. Run the actual query before accusing.
+- **SSH environment != interactive environment.** Windows SSH sessions only have `py.exe`, not `python`. Verify commands in the actual execution context.
+- **No report > wrong report.** Skip WeChat report when data quality is suspect. The user received "+3647% return" because the pipeline sent reports with garbage data.
+- **`_is_normalized_price()` is the single source of truth.** Checks `adjusted` flag first (if True, price is real). Otherwise checks `factor < 0.1`. Used in both `_gate_price_sanity` and `_step13_report`.
