@@ -1278,6 +1278,11 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             ctx.pred_path,
         )
 
+    # Track IC history for event-driven retraining (outside the
+    # meta.json try-block so failures log their own message, not
+    # the misleading "Failed to read meta.json").
+    append_ic_history(ctx.pred_path, ctx.trade_date)
+
     candidate_syms = [s for s in ctx.signals_raw if s in ctx.market_data]
     filtered_syms = filter_candidates(
         candidate_syms, ctx.market_data,
@@ -1708,6 +1713,76 @@ def run_backfill(
         logger.info("Backfill %s: rc=%d", date_str, rc)
 
     return 1 if had_skip else 0
+
+
+# ------------------------------------------------------------------
+# IC history tracking (for event-driven retraining)
+# ------------------------------------------------------------------
+
+
+def append_ic_history(pred_path: Path, trade_date: str) -> None:
+    """Append today's IC value to data/ic_history.tsv.
+
+    Reads meta.json next to the prediction file, extracts the ``ic``
+    field (may be ``None``), and appends ``{date}\\t{ic}`` to the
+    TSV file.  Deduplicates by date and keeps only the last 30 rows.
+    """
+    meta_path = pred_path.with_suffix(".meta.json")
+    if not meta_path.exists():
+        logger.debug("IC history: no meta.json at %s, skipping", meta_path)
+        return
+
+    try:
+        with meta_path.open() as f:
+            meta = json.load(f)
+    except Exception:
+        logger.debug("IC history: failed to read %s", meta_path)
+        return
+
+    ic_val = meta.get("ic")
+    # Normalize NaN to empty string for the TSV
+    import math as _math  # noqa: PLC0415
+    if ic_val is not None and isinstance(ic_val, float) and _math.isnan(ic_val):
+        ic_val = None
+
+    history_path = PROJECT_ROOT / "data" / "ic_history.tsv"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read existing entries
+    entries: list[tuple[str, str]] = []
+    if history_path.exists():
+        with history_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    entries.append((parts[0], parts[1]))
+
+    # Skip if today already recorded
+    for d, _ in entries:
+        if d == trade_date:
+            logger.debug("IC history: %s already recorded, skipping", trade_date)
+            return
+
+    ic_str = str(ic_val) if ic_val is not None else ""
+    entries.append((trade_date, ic_str))
+
+    # Sort by date to handle backfills correctly
+    entries.sort(key=lambda e: e[0])
+
+    # Keep only last 30 entries (by date, not file order)
+    entries = entries[-30:]
+
+    # Atomic write: write to temp file then rename
+    tmp_path = history_path.with_suffix(".tsv.tmp")
+    with tmp_path.open("w") as f:
+        for d, v in entries:
+            f.write(f"{d}\t{v}\n")
+    tmp_path.rename(history_path)
+
+    logger.info("IC history: recorded %s -> %s", trade_date, ic_str or "null")
 
 
 # ------------------------------------------------------------------

@@ -198,10 +198,11 @@ UNIT
 
 cat > "$UNIT_DIR/ashare-retrain.timer" << 'UNIT'
 [Unit]
-Description=Monthly ashare model retraining
+Description=IC-driven ashare model retraining (daily check at 22:00)
 
 [Timer]
-OnCalendar=*-*-01 22:00:00
+OnCalendar=*-*-* 22:00:00
+RandomizedDelaySec=600
 Persistent=true
 
 [Install]
