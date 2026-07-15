@@ -1235,9 +1235,9 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         return 2
 
     # Provenance log + model staleness check
-    # Derive meta.json path from the actual prediction file, not
-    # trade_date, so staleness info is read even when using a stale
-    # prediction from a different date.
+    # Derive meta.json path from pred_path (which may have been
+    # overridden by the caller) so the companion .meta.json stays
+    # paired with the actual prediction file used.
     meta_path = ctx.pred_path.with_suffix(".meta.json")
     if meta_path.exists():
         try:
@@ -1257,7 +1257,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         except Exception:
             logger.warning("Failed to read meta.json: %s", meta_path)
     else:
-        logger.warning(
+        logger.debug(
             "No meta.json found for prediction file: %s "
             "(staleness info unavailable)",
             ctx.pred_path,
