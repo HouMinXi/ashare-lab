@@ -1,0 +1,11 @@
+[Unit]
+Description=ashare model retraining
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/ashare-lab/scripts/ashare-retrain.sh
+TimeoutStartSec=86400
+
+[Install]
+WantedBy=multi-user.target
