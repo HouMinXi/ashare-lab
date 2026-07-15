@@ -1524,8 +1524,19 @@ def _step13_report(ctx: DailyRunContext) -> None:
                 logger.critical(
                     "CRASH ALERT: NAV dropped %.0f%% (%.0f -> %.0f)!",
                     abs(nav_change) * 100, prev_nav, today_nav)
-                # Still send the report (operator MUST know), but
-                # log the crash prominently. Do NOT return here.
+                # Immediate out-of-band alert via alert.py so the
+                # operator sees it even if the report delivery fails.
+                try:
+                    subprocess.Popen(
+                        [sys.executable,
+                         str(PROJECT_ROOT / "scripts" / "alert.py"),
+                         "1", "crash_alert", "0"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass  # alert is best-effort
+                # Still send the report (operator MUST know).
     # Report quality gate: normalized price detection
     for sym, pdata in ctx.prices.items():
         close = pdata.get("close")
