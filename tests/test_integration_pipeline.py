@@ -197,7 +197,7 @@ class TestReportChineseFormat:
     def test_contains_section_headers(self, sample_report):
         text = format_chinese_report(sample_report)
         assert "今日交易" in text
-        assert "持仓分布" in text
+        assert "涨跌TOP" in text
         assert "明日计划" in text
 
     def test_stock_names_in_output(self, sample_report):
