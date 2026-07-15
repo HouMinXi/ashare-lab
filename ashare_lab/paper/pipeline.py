@@ -1234,7 +1234,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         ctx.conn.commit()
         return 2
 
-    # Provenance log + model staleness check
+    # Provenance log + model staleness + IC check
     # Derive meta.json path from pred_path (which may have been
     # overridden by the caller) so the companion .meta.json stays
     # paired with the actual prediction file used.
@@ -1254,6 +1254,21 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
                     "Consider retraining.",
                     meta.get("model"), model_age,
                 )
+            # IC=nan detection: the TRA model's internal IC metric is
+            # NaN when predicting beyond the training window (no labels
+            # to compare).  The blend uses a fixed 60/40 ratio so
+            # predictions are unaffected, but we log and flag it for
+            # the report.
+            ic_val = meta.get("ic")
+            import math as _math  # noqa: PLC0415
+            if ic_val is None or (isinstance(ic_val, float) and _math.isnan(ic_val)):
+                logger.warning(
+                    "Pipeline: model IC is unavailable (nan) for %s. "
+                    "Predictions use fixed 60/40 blend, unaffected.",
+                    trade_date,
+                )
+                # Store flag for report annotation
+                ctx.config["_ic_nan"] = True
         except Exception:
             logger.warning("Failed to read meta.json: %s", meta_path)
     else:

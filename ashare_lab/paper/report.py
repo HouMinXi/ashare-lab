@@ -310,6 +310,7 @@ _TOP_N = 5
 def format_chinese_report(
     report_data: ReportData,
     sentiment_section: str | None = None,
+    ic_nan: bool = False,
 ) -> str:
     """Format report as Chinese mobile-first template."""
     rd = report_data
@@ -411,6 +412,9 @@ def format_chinese_report(
         lines.append(f"⚠️ {' | '.join(warnings)}")
     else:
         lines.append("✅ 风控正常")
+
+    if ic_nan:
+        lines.append("⚠️ 模型自评指标不可用 (IC=nan)")
 
     if rd.hedge_active:
         lines.append(
@@ -703,7 +707,8 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
         pass
 
     mode = "chinese"
-    report_text = format_chinese_report(report_data, sentiment_section=sentiment_text)
+    ic_nan = config.get("_ic_nan", False)
+    report_text = format_chinese_report(report_data, sentiment_section=sentiment_text, ic_nan=ic_nan)
 
     if dry_run:
         insert_report(conn, trade_date, mode, report_text, None, "dry_run")

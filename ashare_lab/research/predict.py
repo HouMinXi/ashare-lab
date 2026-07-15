@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,6 +227,36 @@ def predict_for_date(
         }
     )
 
+    # -- 9b. Capture IC from TRA model internal state ----------------------
+    # The TRA model computes RankIC during test_epoch.  When predicting
+    # beyond the training window (live / out-of-sample), no labels exist
+    # so the internal IC is NaN.  We surface this in meta.json so the
+    # pipeline and report can warn the operator.
+    ic_value = None
+    try:
+        # TRAModel stores per-epoch IC in _ic_list or similar attributes
+        # depending on qlib version.  Try the common patterns.
+        ic_attr = getattr(model, "_ic_list", None)
+        if ic_attr and len(ic_attr) > 0:
+            last_ic = ic_attr[-1]
+            ic_value = float(last_ic) if np.isfinite(last_ic) else None
+        else:
+            # Fallback: check if model has a rank_ic or ic attribute
+            for attr_name in ("rank_ic", "_rank_ic", "ic"):
+                val = getattr(model, attr_name, None)
+                if val is not None:
+                    try:
+                        fval = float(val)
+                        ic_value = fval if np.isfinite(fval) else None
+                    except (TypeError, ValueError):
+                        pass
+                    break
+    except Exception:
+        pass  # best-effort; IC capture never blocks prediction
+
+    if ic_value is not None and math.isnan(ic_value):
+        ic_value = None
+
     # -- 10. Write parquet + provenance sidecar ----------------------------
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     out = PREDICTIONS_DIR / f"{trade_date}.parquet"
@@ -238,6 +269,7 @@ def predict_for_date(
         "produced_at": datetime.now(timezone.utc).isoformat(),
         "n_instruments": len(df),
         "model_age_days": round(model_age_days, 1),
+        "ic": ic_value,
     }
     meta_path = PREDICTIONS_DIR / f"{trade_date}.meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
