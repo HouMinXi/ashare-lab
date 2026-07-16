@@ -109,6 +109,7 @@ paper:
     soft_drawdown_recovery: 0.95
     default_topk: 15
     reduced_topk: 7
+  max_stale_trading_days: 3    # reject predictions older than this many trading days
   hedge:
     enabled: false
     activate_dd: 0.03

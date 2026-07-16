@@ -8,16 +8,22 @@ from pathlib import Path
 import pytest
 
 from ashare_lab.paper.ledger import (
+    IntegrityResult,
+    BackupResult,
     bump_carry_days,
+    check_db_integrity,
     cleanup_old_backups,
     compute_nav,
+    create_golden_backup,
     delete_expired_cooldowns,
+    find_best_backup,
     force_reset_day,
     get_connection,
     get_cooldowns,
     get_latest_cash,
     get_latest_positions,
     hot_backup,
+    hot_backup_with_integrity,
     init_schema,
     insert_order,
     insert_signals,
@@ -26,6 +32,7 @@ from ashare_lab.paper.ledger import (
     log_settle_change,
     record_nav,
     record_run,
+    restore_from_backup,
     set_cooldown,
     snapshot_positions,
     update_order,
@@ -540,3 +547,212 @@ class TestComputeNav:
         }
         nav = compute_nav(positions, {}, 50000.0)
         assert nav == pytest.approx(50000.0)
+
+
+# ---------------------------------------------------------------------------
+# DB Integrity check (Phase 9 -- 09-01)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckDbIntegrity:
+    def test_healthy_db(self, db_path: Path) -> None:
+        """Healthy DB returns is_healthy=True."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        conn.close()
+
+        result = check_db_integrity(db_path)
+        assert result.is_healthy is True
+        assert result.detail == "ok"
+        assert result.check_duration_ms > 0
+
+    def test_corrupted_db(self, tmp_path: Path) -> None:
+        """Corrupted DB (zero bytes) returns is_healthy=False."""
+        corrupt = tmp_path / "corrupt.db"
+        corrupt.write_bytes(b"\x00" * 100)
+
+        result = check_db_integrity(corrupt)
+        assert result.is_healthy is False
+        assert "ok" not in result.detail
+
+
+# ---------------------------------------------------------------------------
+# hot_backup_with_integrity (Phase 9 -- 09-01)
+# ---------------------------------------------------------------------------
+
+
+class TestHotBackupWithIntegrity:
+    def test_healthy_backup(self, db_path: Path, tmp_path: Path) -> None:
+        """Healthy DB produces backup with SHA-256 verification."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        record_run(conn, "2025-01-02", "settled")
+        conn.close()
+
+        backup_dest = tmp_path / "backups" / "paper_2025-01-02.db"
+        result = hot_backup_with_integrity(db_path, backup_dest)
+
+        assert result.success is True
+        assert result.integrity_verified is True
+        assert result.sha256 is not None
+        assert len(result.sha256) == 64  # SHA-256 hex length
+        assert result.size_bytes > 0
+        assert backup_dest.exists()
+
+    def test_corrupted_db_skips_backup(self, tmp_path: Path) -> None:
+        """Corrupted DB skips backup entirely."""
+        corrupt = tmp_path / "corrupt.db"
+        corrupt.write_bytes(b"\x00" * 100)
+
+        backup_dest = tmp_path / "backups" / "paper_2025-01-02.db"
+        result = hot_backup_with_integrity(corrupt, backup_dest)
+
+        assert result.success is False
+        assert result.integrity_verified is False
+        assert not backup_dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# create_golden_backup (Phase 9 -- 09-01)
+# ---------------------------------------------------------------------------
+
+
+class TestGoldenBackup:
+    def test_golden_backup_created_with_444(self, db_path: Path, tmp_path: Path) -> None:
+        """Golden backup is created with chmod 444."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        result = create_golden_backup(db_path, backup_dir)
+
+        assert result is not None
+        assert result.exists()
+        assert oct(result.stat().st_mode & 0o777) == "0o444"
+
+    def test_golden_backup_not_overwritten(self, db_path: Path, tmp_path: Path) -> None:
+        """Existing golden backup is never overwritten."""
+        import datetime as dt
+
+        conn = get_connection(db_path)
+        init_schema(conn)
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        golden_dir = backup_dir / "golden"
+        golden_dir.mkdir(parents=True)
+        existing = golden_dir / f"{dt.date.today().strftime('%Y-%m')}.db"
+        existing.write_bytes(b"original")
+        existing.chmod(0o444)
+
+        result = create_golden_backup(db_path, backup_dir)
+        assert result is None
+        assert existing.read_bytes() == b"original"
+
+
+# ---------------------------------------------------------------------------
+# cleanup_old_backups preserves golden (Phase 9 -- 09-01)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupPreservesGolden:
+    def test_golden_not_cleaned(self, tmp_path: Path) -> None:
+        """cleanup_old_backups preserves backups/golden/ directory."""
+        from datetime import date, timedelta
+
+        backup_dir = tmp_path / "backups"
+        golden_dir = backup_dir / "golden"
+        golden_dir.mkdir(parents=True)
+
+        # Create an old golden backup
+        old_golden = golden_dir / "2020-01.db"
+        old_golden.write_bytes(b"golden")
+
+        # Create an old daily backup (should be cleaned)
+        old_daily = backup_dir / f"paper_{(date.today() - timedelta(days=30)).isoformat()}.db"
+        old_daily.write_bytes(b"daily")
+
+        cleanup_old_backups(backup_dir, retention_days=7)
+
+        assert old_golden.exists()
+        assert not old_daily.exists()
+
+
+# ---------------------------------------------------------------------------
+# find_best_backup + restore_from_backup (Phase 9 -- 09-01)
+# ---------------------------------------------------------------------------
+
+
+class TestFindAndRestoreBackup:
+    def test_finds_exact_date_backup(self, db_path: Path, tmp_path: Path) -> None:
+        """find_best_backup returns exact date match first."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        record_run(conn, "2025-01-02", "settled")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backup_dest = backup_dir / "paper_2025-01-02.db"
+        hot_backup(db_path, backup_dest)
+
+        result = find_best_backup(backup_dir, target_date="2025-01-02")
+        assert result is not None
+        assert "2025-01-02" in result.name
+
+    def test_falls_back_to_golden(self, db_path: Path, tmp_path: Path) -> None:
+        """find_best_backup falls back to golden when no daily found."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        golden_dir = backup_dir / "golden"
+        golden_dir.mkdir(parents=True)
+        golden_path = golden_dir / "2025-01.db"
+
+        # Create golden backup
+        src = sqlite3.connect(str(db_path))
+        dst = sqlite3.connect(str(golden_path))
+        src.backup(dst)
+        dst.close()
+        src.close()
+
+        result = find_best_backup(backup_dir)
+        assert result is not None
+        assert "golden" in str(result)
+
+    def test_restore_from_backup(self, db_path: Path, tmp_path: Path) -> None:
+        """restore_from_backup restores data from backup."""
+        conn = get_connection(db_path)
+        init_schema(conn)
+        record_run(conn, "2025-01-02", "settled")
+        conn.commit()
+        conn.close()
+
+        backup_dir = tmp_path / "backups"
+        backup_dest = backup_dir / "paper_2025-01-02.db"
+        hot_backup(db_path, backup_dest)
+
+        # Delete original DB
+        db_path.unlink()
+
+        assert restore_from_backup(db_path, backup_dir) is True
+        assert db_path.exists()
+
+        # Verify restored data
+        conn2 = get_connection(db_path)
+        row = conn2.execute(
+            "SELECT status FROM runs WHERE trade_date = '2025-01-02'"
+        ).fetchone()
+        conn2.close()
+        assert row["status"] == "settled"
+
+    def test_restore_no_backups_returns_false(self, tmp_path: Path) -> None:
+        """restore_from_backup returns False when no backups exist."""
+        db_path = tmp_path / "empty.db"
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+
+        assert restore_from_backup(db_path, backup_dir) is False

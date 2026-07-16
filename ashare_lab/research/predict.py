@@ -18,12 +18,241 @@ import json
 import logging
 import math
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
+
+
+# ---------------------------------------------------------------------------
+# Score diversity / collapse detection (Phase 9 -- 09-04)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiversityResult:
+    """Outcome of score diversity check (3-tier gate).
+
+    Attributes:
+        tier1_failed: True if any Tier 1 metric breached threshold.
+        tier1_detail: Human-readable description of which Tier 1 metric failed.
+        tier2_metrics: Diagnostic metrics for meta.json (kurtosis, entropy, gini).
+        tier3_drift: Drift detection result (std_ratio, kurtosis_ratio, alerted).
+    """
+
+    tier1_failed: bool = False
+    tier1_detail: str = ""
+    tier2_metrics: dict = field(default_factory=dict)
+    tier3_drift: dict = field(default_factory=dict)
+
+
+def check_score_diversity(
+    scores: np.ndarray,
+    history_path: Path | None = None,
+) -> DiversityResult:
+    """Three-tier collapse detection gate.
+
+    Tier 1 -- Fail-fast (refuse parquet write):
+        score_std < 0.001: zero variance = all identical
+        unique_ratio < 0.10: <10% unique bins at 4dp precision
+        iqr_range < 0.005: robust narrow-spread detection
+
+    Tier 2 -- Diagnostic logging (written to meta.json):
+        kurtosis: tail heaviness (Fisher/excess; -1.2 for uniform)
+        entropy_normalized: Shannon entropy / log(n), 0=collapsed, 1=uniform
+        gini: Gini coefficient on abs(scores), 0=equal, 1=concentrated
+
+    Tier 3 -- Drift detection (rolling 30-day):
+        Compare today's std/kurtosis against rolling median of last 30 days.
+        Alert if today's value < 0.5 * baseline_median.
+        Requires 2 consecutive failures OR 1 failure + Tier 1 same day.
+        Skip if < 5 days of history (cold start).
+    """
+    import numpy as np  # noqa: PLC0415
+
+    result = DiversityResult()
+    n = len(scores)
+
+    if n < 3:
+        # Too few scores to assess diversity meaningfully.
+        # Skip the gate (pass-through) rather than failing -- a tiny
+        # universe is unusual but not a collapse signal.
+        log.debug("Score diversity: only %d scores, skipping gate", n)
+        return result
+
+    # -- Tier 1 metrics --
+    score_std = float(np.std(scores))
+    unique_vals = len(set(np.round(scores, 4)))
+    unique_ratio = unique_vals / n
+    q1 = float(np.percentile(scores, 25))
+    q3 = float(np.percentile(scores, 75))
+    iqr_range = q3 - q1
+
+    tier1_failures = []
+    if score_std < 0.001:
+        tier1_failures.append(f"score_std={score_std:.6f} < 0.001")
+    if unique_ratio < 0.10:
+        tier1_failures.append(f"unique_ratio={unique_ratio:.4f} < 0.10")
+    if iqr_range < 0.005:
+        tier1_failures.append(f"iqr_range={iqr_range:.6f} < 0.005")
+
+    if tier1_failures:
+        result.tier1_failed = True
+        result.tier1_detail = "; ".join(tier1_failures)
+
+    # -- Tier 2 metrics --
+    # Kurtosis (Fisher/excess): -1.2 for uniform, 0 for normal, >0 for heavy tails
+    try:
+        from scipy.stats import kurtosis as sp_kurtosis  # noqa: PLC0415
+        kurt = float(sp_kurtosis(scores, fisher=True))
+        if not np.isfinite(kurt):
+            kurt = 0.0
+    except ImportError:
+        # Fallback: manual excess kurtosis
+        mean = np.mean(scores)
+        std = score_std if score_std > 0 else 1e-10
+        kurt = float(np.mean(((scores - mean) / std) ** 4) - 3.0)
+        if not np.isfinite(kurt):
+            kurt = 0.0
+
+    # Shannon entropy normalized
+    # Bin scores into 50 bins for entropy calculation
+    hist, _ = np.histogram(scores, bins=50, density=True)
+    hist = hist[hist > 0]
+    if len(hist) > 0:
+        probs = hist / hist.sum()
+        entropy = -np.sum(probs * np.log(probs + 1e-10))
+        max_entropy = np.log(len(probs)) if len(probs) > 1 else 1.0
+        entropy_norm = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+    else:
+        entropy_norm = 0.0
+
+    # Gini coefficient on absolute values
+    abs_scores = np.abs(scores)
+    abs_sorted = np.sort(abs_scores)
+    n_float = float(n)
+    cumsum = np.cumsum(abs_sorted)
+    gini = float(
+        (n_float + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n_float
+    ) if cumsum[-1] > 0 else 0.0
+
+    result.tier2_metrics = {
+        "score_std": round(score_std, 6),
+        "kurtosis": round(kurt, 4),
+        "entropy_normalized": round(entropy_norm, 4),
+        "gini": round(gini, 4),
+        "unique_ratio": round(unique_ratio, 4),
+        "iqr_range": round(iqr_range, 6),
+    }
+
+    # -- Tier 3: drift detection (rolling 30-day) --
+    result.tier3_drift = {"alerted": False}
+    if history_path is not None and history_path.exists():
+        try:
+            with history_path.open() as f:
+                history_meta = json.load(f)
+            diversity_history = history_meta.get("diversity_history", [])
+            if len(diversity_history) >= 5:
+                # Extract rolling baseline (median of last 30 days)
+                recent = diversity_history[-30:]
+                stds = [d["score_std"] for d in recent if "score_std" in d]
+                kurts = [d["kurtosis"] for d in recent if "kurtosis" in d]
+
+                if stds and kurts:
+                    baseline_std = float(np.median(stds))
+                    baseline_kurt = float(np.median(kurts))
+
+                    std_ratio = score_std / baseline_std if baseline_std > 0 else 1.0
+                    kurt_ratio = kurt / baseline_kurt if abs(baseline_kurt) > 1e-6 else 1.0
+
+                    std_alert = std_ratio < 0.5
+                    kurt_alert = kurt_ratio < 0.5
+
+                    # Require 2 consecutive failures OR 1 failure + Tier 1.
+                    # Evaluate previous alerts from stored metrics (not
+                    # the std_alert field which is always False on write).
+                    consecutive = len(diversity_history) >= 2
+                    if consecutive:
+                        prev = diversity_history[-1]
+                        prev_std = prev.get("score_std", 0)
+                        prev_kurt = prev.get("kurtosis", 0)
+                        prev_std_ratio = (
+                            prev_std / baseline_std
+                            if baseline_std > 0 else 1.0
+                        )
+                        prev_kurt_ratio = (
+                            prev_kurt / baseline_kurt
+                            if abs(baseline_kurt) > 1e-6 else 1.0
+                        )
+                        prev_std_alert = prev_std_ratio < 0.5
+                        prev_kurt_alert = prev_kurt_ratio < 0.5
+                        two_consecutive = (
+                            (std_alert and prev_std_alert)
+                            or (kurt_alert and prev_kurt_alert)
+                        )
+                    else:
+                        two_consecutive = False
+
+                    one_plus_tier1 = (std_alert or kurt_alert) and result.tier1_failed
+
+                    if two_consecutive or one_plus_tier1:
+                        result.tier3_drift = {
+                            "alerted": True,
+                            "std_ratio": round(std_ratio, 4),
+                            "kurtosis_ratio": round(kurt_ratio, 4),
+                            "baseline_std": round(baseline_std, 6),
+                            "baseline_kurtosis": round(baseline_kurt, 4),
+                        }
+        except Exception:
+            log.debug("Tier 3 drift check failed", exc_info=True)
+
+    return result
+
+
+def _update_diversity_history(
+    history_path: Path,
+    trade_date: str,
+    tier2_metrics: dict,
+    drift_alerted: bool,
+) -> None:
+    """Append today's diversity metrics to the rolling history file.
+
+    Keeps last 60 days. Written as JSON with key "diversity_history".
+    Each entry: {date, score_std, kurtosis, std_alert, kurtosis_alert}.
+    """
+    try:
+        if history_path.exists():
+            with history_path.open() as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        entries = data.get("diversity_history", [])
+
+        # Deduplicate by date
+        entries = [e for e in entries if e.get("date") != trade_date]
+
+        entries.append({
+            "date": trade_date,
+            "score_std": tier2_metrics.get("score_std", 0),
+            "kurtosis": tier2_metrics.get("kurtosis", 0),
+            "std_alert": False,  # populated on next run's Tier 3 check
+            "kurtosis_alert": False,
+        })
+
+        # Keep last 60 days
+        entries = entries[-60:]
+        data["diversity_history"] = entries
+
+        tmp = history_path.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f, indent=2)
+        tmp.rename(history_path)
+    except Exception:
+        log.debug("Failed to update diversity history", exc_info=True)
 
 
 def predict_for_date(
@@ -219,6 +448,47 @@ def predict_for_date(
             "refusing to write empty prediction file" % trade_date
         )
 
+    # -- 8b. Score diversity gate (Phase 9 -- 09-04) ------------------------
+    # Check for model collapse: all-identical or near-zero variance scores.
+    # Tier 1 failure refuses parquet write entirely.
+    diversity_history_path = PREDICTIONS_DIR / "diversity_history.json"
+    diversity = check_score_diversity(
+        day.to_numpy(dtype=float), diversity_history_path,
+    )
+    if diversity.tier1_failed:
+        raise ValueError(
+            "Prediction collapse detected for %s: %s" % (
+                trade_date, diversity.tier1_detail,
+            )
+        )
+
+    # Log Tier 2 diagnostics
+    if diversity.tier2_metrics:
+        log.info(
+            "Score diversity: std=%.6f kurt=%.4f entropy=%.4f gini=%.4f",
+            diversity.tier2_metrics.get("score_std", 0),
+            diversity.tier2_metrics.get("kurtosis", 0),
+            diversity.tier2_metrics.get("entropy_normalized", 0),
+            diversity.tier2_metrics.get("gini", 0),
+        )
+
+    # Log Tier 3 drift alert
+    if diversity.tier3_drift.get("alerted"):
+        log.warning(
+            "DIVERSITY DRIFT ALERT: std_ratio=%.4f kurtosis_ratio=%.4f "
+            "(baseline: std=%.6f kurt=%.4f)",
+            diversity.tier3_drift.get("std_ratio", 0),
+            diversity.tier3_drift.get("kurtosis_ratio", 0),
+            diversity.tier3_drift.get("baseline_std", 0),
+            diversity.tier3_drift.get("baseline_kurtosis", 0),
+        )
+
+    # Update diversity history for Tier 3 drift detection
+    _update_diversity_history(
+        diversity_history_path, trade_date, diversity.tier2_metrics,
+        diversity.tier3_drift.get("alerted", False),
+    )
+
     # -- 9. Build output DataFrame -----------------------------------------
     df = pd.DataFrame(
         {
@@ -270,6 +540,7 @@ def predict_for_date(
         "n_instruments": len(df),
         "model_age_days": round(model_age_days, 1),
         "ic": ic_value,
+        "diversity": diversity.tier2_metrics,
     }
     meta_path = PREDICTIONS_DIR / f"{trade_date}.meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))

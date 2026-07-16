@@ -21,7 +21,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from ashare_lab.data.calendar import next_trading_day
+from ashare_lab.data.calendar import next_trading_day, trading_days_between
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ __all__ = [
     "manage_trailing_cooldown",
     "check_industry_concentration",
     "check_soft_drawdown",
+    "check_prediction_staleness",
+    "check_suspension_risk",
     "run_all_risk_checks",
 ]
 
@@ -211,6 +213,140 @@ def check_soft_drawdown(
 
 
 # ---------------------------------------------------------------------------
+# Dimension 8: Prediction staleness (Phase 9 -- 09-02)
+# ---------------------------------------------------------------------------
+
+
+def check_prediction_staleness(
+    trade_date: str, pred_date: str, max_stale_days: int,
+) -> tuple[bool, dict]:
+    """Check prediction staleness using TRADING DAY count.
+
+    Returns (should_halt_buying, detail_dict).
+
+    Tiers:
+        FRESH (age 0): no action
+        STALE_WARN (age 1-2): log warning, no auto-action
+        STALE_REJECT (age >= max_stale_days): halt buying
+
+    Uses qlib trading day calendar for accurate counting.
+    Falls back to calendar-day arithmetic (conservative) if qlib
+    unavailable.
+    """
+    age_days = 0
+    try:
+        from datetime import date as _date  # noqa: PLC0415
+        td = _date.fromisoformat(trade_date)
+        pd = _date.fromisoformat(pred_date)
+        trading_days = trading_days_between(pd, td)
+        # trading_days_between returns days in [start, end) so subtract 1
+        # to get the gap (pred_date itself is day 0).
+        age_days = max(0, len(trading_days) - 1)
+    except Exception:
+        # Conservative fallback: calendar days
+        from datetime import date as _date  # noqa: PLC0415
+        td = _date.fromisoformat(trade_date)
+        pd = _date.fromisoformat(pred_date)
+        cal_days = (td - pd).days
+        # Trading days ~ calendar days * 5/7 (conservative: round up)
+        age_days = max(0, cal_days)
+
+    if age_days == 0:
+        tier = "FRESH"
+    elif age_days < max_stale_days:
+        tier = "STALE_WARN"
+    else:
+        tier = "STALE_REJECT"
+
+    should_halt = tier == "STALE_REJECT"
+
+    detail = {
+        "age_days": age_days,
+        "tier": tier,
+        "threshold": max_stale_days,
+        "pred_date": pred_date,
+    }
+
+    if tier == "STALE_WARN":
+        logger.warning(
+            "Prediction staleness: %s is %d trading days old "
+            "(threshold: %d). Tier: %s",
+            pred_date, age_days, max_stale_days, tier,
+        )
+    elif tier == "STALE_REJECT":
+        logger.error(
+            "Prediction staleness REJECT: %s is %d trading days old "
+            "(threshold: %d). Buying halted.",
+            pred_date, age_days, max_stale_days,
+        )
+
+    return should_halt, detail
+
+
+# ---------------------------------------------------------------------------
+# Dimension 9: Suspension risk awareness (Phase 9 -- 09-03, alert-only)
+# ---------------------------------------------------------------------------
+
+
+def check_suspension_risk(
+    positions: dict[str, dict],
+    prices: dict[str, dict],
+    trade_date: str,
+) -> dict[str, float]:
+    """Score suspension risk for held positions (alert-only, no auto-action).
+
+    Scores 6 dimensions per symbol:
+    1. ST status (5% limit = higher suspension risk)
+    2. Zero volume (currently suspended)
+    3. Near zero volume (< 10% of normal)
+    4. Large position (> 10% NAV concentration)
+    5. Low market cap proxy (price < 5 CNY)
+    6. Extreme price change (|change| > 8%)
+
+    Returns dict of symbol -> risk_score (0.0-1.0).
+    Only logged to daily report, zero decision power.
+    """
+    scores: dict[str, float] = {}
+    for symbol, pos in positions.items():
+        pdata = prices.get(symbol, {})
+        score = 0.0
+
+        # Dimension 1: ST status (from limit threshold)
+        threshold = pdata.get("threshold", 0.099)
+        if threshold <= 0.05:
+            score += 0.2
+
+        # Dimension 2: currently suspended
+        volume = pdata.get("volume", 0.0)
+        if volume == 0.0 or (isinstance(volume, float) and volume != volume):
+            score += 0.3
+
+        # Dimension 3: near-zero volume
+        elif volume < 1_000_000:
+            score += 0.1
+
+        # Dimension 4: large position concentration
+        # (approximate: market_value > 50000 CNY)
+        if pos.get("market_value", 0) > 50_000:
+            score += 0.1
+
+        # Dimension 5: low price proxy for small-cap risk
+        close = pdata.get("close")
+        if close is not None and close < 5.0:
+            score += 0.1
+
+        # Dimension 6: extreme price change
+        change = pdata.get("change", 0.0)
+        if abs(change) > 0.08:
+            score += 0.2
+
+        if score > 0:
+            scores[symbol] = round(min(score, 1.0), 2)
+
+    return scores
+
+
+# ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
 
@@ -227,13 +363,15 @@ def run_all_risk_checks(
     is_soft_reduced: bool,
     config: dict,
     trade_date: str,
+    pred_date: str | None = None,
 ) -> RiskCheckResult:
-    """Aggregate all 7 risk dimensions into a single result.
+    """Aggregate all 8 risk dimensions into a single result.
 
     All thresholds are read from *config* (paper.risk section).
     *yesterday_nav* is passed explicitly by the pipeline to avoid
     mis-deriving it after record_nav has already written today's row.
     *trade_date* is required to compute cooldown_until dates.
+    *pred_date* is the prediction file date for staleness check.
     """
     # -- Compute total/current NAV --
     total_nav = (
@@ -340,6 +478,23 @@ def run_all_risk_checks(
         config["reduced_topk"],
     )
 
+    # -- 8. Prediction staleness --
+    # Skip when pred_date is None (step 10 hasn't run yet).
+    staleness_halted = False
+    if pred_date is not None:
+        max_stale = config.get("max_stale_trading_days", 3)
+        staleness_halted, staleness_detail = check_prediction_staleness(
+            trade_date, pred_date, max_stale,
+        )
+        if staleness_detail.get("tier") != "FRESH":
+            logger.info(
+                "Staleness check: pred_date=%s age=%d tier=%s halted=%s",
+                pred_date,
+                staleness_detail["age_days"],
+                staleness_detail["tier"],
+                staleness_halted,
+            )
+
     # -- blocked_rebuys from cooldown_dict (>= for full N-day) --
     blocked_rebuys = {
         s
@@ -348,7 +503,10 @@ def run_all_risk_checks(
     }
 
     # -- Merge halt flags --
-    buying_halted = drawdown_halted or daily_loss_halted or regime_halted
+    buying_halted = (
+        drawdown_halted or daily_loss_halted
+        or regime_halted or staleness_halted
+    )
 
     # -- Hard drawdown forced liquidation (emergency override) --
     # When drawdown_hard fires, force-sell ALL positions (full qty,

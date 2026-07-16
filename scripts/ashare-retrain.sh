@@ -31,9 +31,10 @@ if [ -f "$SENTINEL" ]; then
     last_retrain=$(cat "$SENTINEL")
     last_epoch=$(date -d "$last_retrain" +%s 2>/dev/null || echo 0)
     now_epoch=$(date +%s)
-    days_since=$(( (now_epoch - last_epoch) / 86400 ))
-    if [ "$days_since" -lt "$COOLDOWN_DAYS" ]; then
-        log "Cooldown: last retrain was $days_since days ago (need $COOLDOWN_DAYS), skipping"
+    elapsed=$(( now_epoch - last_epoch ))
+    min_gap=$(( COOLDOWN_DAYS * 86400 ))
+    if [ "$elapsed" -lt "$min_gap" ]; then
+        log "Cooldown: last retrain was ${elapsed}s ago (need ${min_gap}s), skipping"
         exit 0
     fi
 fi

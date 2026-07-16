@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from ashare_lab.paper.fees import calculate_fees
 from ashare_lab.paper.ledger import (
+    bump_suspension_carry_days,
     compute_nav,
     insert_order,
     insert_trade,
@@ -184,7 +185,6 @@ def settle_day(
     happen inside a single transaction (``with conn:``).
     """
     carry_days_limit = config.get("carry_days", 3)
-    max_resets = config.get("max_limit_down_resets", 5)
     slippage = config.get("slippage", 0.001)
     participation_pct = config.get("volume_participation_pct", 0.05)
 
@@ -232,12 +232,25 @@ def settle_day(
                     continue
                 close = pos["avg_cost"]
 
-            # Suspension check (D-32)
+            # Suspension check (D-32) with 25-day timeout (Phase 9 -- 09-03)
             if is_suspended(volume):
-                update_order(conn, oid, status="carry")
-                result.carries_suspended.append(
-                    {"order_id": oid, "symbol": symbol, "side": "sell"}
-                )
+                suspension_carry = order.get("suspension_carry_day", 0)
+                if suspension_carry >= 25:
+                    # Suspension timeout: cancel with reason
+                    update_order(
+                        conn, oid, status="cancelled",
+                        cancel_reason="suspension_timeout",
+                    )
+                    result.cancels.append(symbol)
+                    logger.warning(
+                        "Suspension timeout: %s cancelled after %d days",
+                        symbol, suspension_carry,
+                    )
+                else:
+                    update_order(conn, oid, status="carry")
+                    result.carries_suspended.append(
+                        {"order_id": oid, "symbol": symbol, "side": "sell"}
+                    )
                 continue
 
             # Limit-down block
@@ -248,25 +261,20 @@ def settle_day(
                         {"order_id": oid, "symbol": symbol, "side": "sell"}
                     )
                 else:
-                    # Reset carry_day so the order retries next time
-                    # the stock opens. Cancelling strands the position
-                    # with no exit (2024-02 CSI1000 crash lesson).
-                    # Track reset count via reset_count column.
-                    # After max_resets, cancel to prevent infinite
-                    # carry on permanently halted stocks.
+                    # NEVER cancel limit-down orders -- cancelling
+                    # strands the position with no exit (2024-02
+                    # CSI1000 crash lesson). Reset carry_day so the
+                    # order retries next time the stock opens.
+                    # reset_count increments for monitoring only.
                     reset_count = order.get("reset_count", 0) + 1
-                    if reset_count >= max_resets:
-                        update_order(conn, oid, status="cancelled")
-                        result.cancels.append(symbol)
-                    else:
-                        update_order(
-                            conn, oid, status="carry",
-                            carry_day=-1, reset_count=reset_count)
-                        result.carries_to_bump.append(
-                            {"order_id": oid, "symbol": symbol,
-                             "side": "sell",
-                             "reason": f"limit_down_reset_{reset_count}"}
-                        )
+                    update_order(
+                        conn, oid, status="carry",
+                        carry_day=0, reset_count=reset_count)
+                    result.carries_to_bump.append(
+                        {"order_id": oid, "symbol": symbol,
+                         "side": "sell",
+                         "reason": f"limit_down_reset_{reset_count}"}
+                    )
                 continue
 
             # Fillable path
@@ -384,12 +392,24 @@ def settle_day(
                     continue
                 close = pos["avg_cost"]
 
-            # Suspension check (D-32)
+            # Suspension check (D-32) with 25-day timeout (Phase 9 -- 09-03)
             if is_suspended(volume):
-                update_order(conn, oid, status="carry")
-                result.carries_suspended.append(
-                    {"order_id": oid, "symbol": symbol, "side": "buy"}
-                )
+                suspension_carry = order.get("suspension_carry_day", 0)
+                if suspension_carry >= 25:
+                    update_order(
+                        conn, oid, status="cancelled",
+                        cancel_reason="suspension_timeout",
+                    )
+                    result.cancels.append(symbol)
+                    logger.warning(
+                        "Suspension timeout: %s buy cancelled after %d days",
+                        symbol, suspension_carry,
+                    )
+                else:
+                    update_order(conn, oid, status="carry")
+                    result.carries_suspended.append(
+                        {"order_id": oid, "symbol": symbol, "side": "buy"}
+                    )
                 continue
 
             # Limit-up block
@@ -536,6 +556,59 @@ def settle_day(
                     "fill_price": fill_price,
                     "fees": fees.total,
                 }
+            )
+
+        # ---------------------------------------------------------------
+        # Step 4b: Suspension resume detection (Phase 9 -- 09-03)
+        # Check for cancelled suspension_timeout orders where the stock
+        # now has non-zero volume (resumed trading). Create forced sell.
+        # ---------------------------------------------------------------
+        cancelled_suspended = conn.execute(
+            "SELECT id, symbol, side, target_qty FROM orders "
+            "WHERE cancel_reason = 'suspension_timeout' "
+            "AND trade_date <= ?",
+            (trade_date,),
+        ).fetchall()
+        for crow in cancelled_suspended:
+            csym = crow["symbol"]
+            # Only re-create SELL orders (not buys cancelled for other reasons)
+            if crow["side"] != "sell":
+                continue
+            pdata = prices.get(csym, {})
+            cvol = pdata.get("volume", 0.0)
+            if is_suspended(cvol):
+                continue  # still suspended
+            # Check position still exists
+            pos = current_positions.get(csym)
+            if pos is None or pos.get("qty", 0) <= 0:
+                continue
+            # Idempotency: check for existing pending sell
+            existing = conn.execute(
+                "SELECT 1 FROM orders "
+                "WHERE symbol = ? AND side = 'sell' "
+                "AND status IN ('pending', 'carry') "
+                "AND cancel_reason IS NULL",
+                (csym,),
+            ).fetchone()
+            if existing is not None:
+                continue
+            # Create forced sell order for full position
+            target_qty = pos["qty"]
+            new_id = insert_order(
+                conn,
+                trade_date=trade_date,
+                symbol=csym,
+                side="sell",
+                target_qty=target_qty,
+                price=None,
+                status="pending",
+                carry_day=0,
+                created_run_date=trade_date,
+                source="forced_liquidation",
+            )
+            logger.info(
+                "Suspension resume: forced sell %s x%d (order %d)",
+                csym, target_qty, new_id,
             )
 
         # ---------------------------------------------------------------

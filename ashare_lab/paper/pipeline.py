@@ -52,8 +52,10 @@ from ashare_lab.paper.ipo import (
 )
 from ashare_lab.paper.ledger import (
     bump_carry_days,
+    check_db_integrity,
     cleanup_old_backups,
     compute_nav,
+    create_golden_backup,
     delete_expired_cooldowns,
     force_reset_day,
     get_connection,
@@ -61,6 +63,7 @@ from ashare_lab.paper.ledger import (
     get_latest_cash,
     get_latest_positions,
     hot_backup,
+    hot_backup_with_integrity,
     init_schema,
     insert_order,
     is_day_settled,
@@ -1059,7 +1062,8 @@ def _step8_settle(ctx: DailyRunContext) -> None:
 
     pending_orders = [
         dict(r) for r in ctx.conn.execute(
-            "SELECT id, symbol, side, target_qty, carry_day, reset_count FROM orders "
+            "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
+            "suspension_carry_day FROM orders "
             "WHERE status IN ('pending','carry') AND trade_date <= ?",
             (ctx.trade_date,),
         ).fetchall()
@@ -1083,6 +1087,7 @@ def _step8_settle(ctx: DailyRunContext) -> None:
         ctx.current_positions, ctx.cash, topk_symbols, ctx.benchmarks, ctx.paper_cfg,
     )
     bump_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_to_bump])
+    bump_suspension_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_suspended])
     ctx.current_positions = get_latest_positions(ctx.conn)
     ctx.cash = ctx.settle_result.cash
 
@@ -1103,6 +1108,7 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
         nav_history, yesterday_nav, ctx.current_positions, ctx.prices,
         ctx.csi1000_closes_11d, ctx.industry_map, ctx.cooldown_state, ctx.cash,
         ctx.is_soft_reduced, ctx.risk_cfg, ctx.trade_date,
+        pred_date=ctx.predictions_date_str,
     )
     ctx.is_soft_reduced = ctx.risk_result.topk_override is not None
     ctx.conn.execute(
@@ -1488,11 +1494,27 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
 
 
 def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
-    """Commit, hot-backup, cleanup old backups, record settled run."""
+    """Commit, integrity-gated backup, golden monthly backup, cleanup, record settled."""
     ctx.conn.commit()
-    backup_path = PROJECT_ROOT / "backups" / f"paper_{ctx.trade_date}.db"
-    hot_backup(ctx.db_path, backup_path)
-    cleanup_old_backups(PROJECT_ROOT / "backups", ctx.paper_cfg["backup_retention_days"])
+
+    # Integrity gate: check DB health before backup
+    backup_dir = PROJECT_ROOT / "backups"
+    backup_path = backup_dir / f"paper_{ctx.trade_date}.db"
+
+    backup_result = hot_backup_with_integrity(ctx.db_path, backup_path)
+    if not backup_result.success:
+        logger.critical(
+            "Backup failed integrity check for %s -- no backup created. "
+            "Operator must investigate database health before next run. "
+            "Pipeline result still recorded (pipeline did execute).",
+            ctx.trade_date,
+        )
+
+    cleanup_old_backups(backup_dir, ctx.paper_cfg["backup_retention_days"])
+
+    # Monthly golden backup (immutable, never cleaned up)
+    create_golden_backup(ctx.db_path, backup_dir)
+
     record_run(ctx.conn, ctx.trade_date, "settled")
     ctx.conn.commit()
 
@@ -1527,6 +1549,9 @@ def _step13_report(ctx: DailyRunContext) -> None:
                 # Immediate out-of-band alert via alert.py so the
                 # operator sees it even if the report delivery fails.
                 try:
+                    # alert.py contract: EXIT_CODE STAGE ELAPSED_S
+                    # exit_code=1 (failure signal), stage="crash_alert",
+                    # elapsed=0 (immediate, not a timed operation).
                     subprocess.Popen(
                         [sys.executable,
                          str(PROJECT_ROOT / "scripts" / "alert.py"),

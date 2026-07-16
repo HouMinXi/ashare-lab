@@ -46,6 +46,7 @@ def _install_fake_modules():
     # torch
     torch_mod = _ensure("torch")
     torch_mod.load = MagicMock()
+    torch_mod.Tensor = type("Tensor", (), {})  # scipy checks torch.Tensor via issubclass
 
     # qlib chain
     _ensure("qlib")
@@ -578,3 +579,178 @@ class TestBlendExceptionPropagates:
         # No prediction file should have been written.
         preds_dir = tmp_path / "predictions"
         assert not (preds_dir / f"{trade_date}.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# Score diversity / collapse detection (Phase 9 -- 09-04)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckScoreDiversity:
+    """Three-tier collapse detection gate."""
+
+    def test_normal_distribution_passes(self):
+        """Normal distribution with decent spread: all tiers pass."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.random.normal(0.5, 0.3, 500)
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is False
+        assert result.tier2_metrics["score_std"] > 0.001
+        assert result.tier2_metrics["unique_ratio"] > 0.10
+        assert result.tier2_metrics["iqr_range"] > 0.005
+
+    def test_all_identical_fails_tier1(self):
+        """All-identical scores: score_std=0, fails Tier 1."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.full(100, 0.5)
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is True
+        assert "score_std" in result.tier1_detail
+
+    def test_near_zero_std_fails_tier1(self):
+        """Near-zero std (< 0.001): fails Tier 1."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.full(100, 0.5) + np.random.uniform(-0.0001, 0.0001, 100)
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is True
+        assert "score_std" in result.tier1_detail
+
+    def test_low_unique_ratio_fails_tier1(self):
+        """Fewer than 10% unique values at 4dp: fails Tier 1."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        # 100 scores but only 3 unique values at 4dp
+        scores = np.array([0.1000] * 40 + [0.2000] * 30 + [0.3000] * 30)
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is True
+        assert "unique_ratio" in result.tier1_detail
+
+    def test_narrow_iqr_fails_tier1(self):
+        """IQR < 0.005: fails Tier 1 (robust to outliers)."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        # 90 values clustered at 0.5, 10 outliers at 0.0 and 1.0
+        scores = np.concatenate([
+            np.full(90, 0.5001),
+            np.array([0.0] * 5 + [1.0] * 5),
+        ])
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is True
+        assert "iqr_range" in result.tier1_detail
+
+    def test_too_few_scores_passes_through(self):
+        """Fewer than 3 scores: skip gate (pass-through, not a collapse)."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.array([0.1, 0.2])
+        result = check_score_diversity(scores)
+
+        assert result.tier1_failed is False
+
+    def test_tier2_metrics_populated(self):
+        """Tier 2 metrics are computed and returned."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.random.normal(0.5, 0.3, 500)
+        result = check_score_diversity(scores)
+
+        assert "kurtosis" in result.tier2_metrics
+        assert "entropy_normalized" in result.tier2_metrics
+        assert "gini" in result.tier2_metrics
+        assert 0.0 <= result.tier2_metrics["entropy_normalized"] <= 1.1  # allow small float error
+
+    def test_tier3_cold_start_no_alert(self):
+        """Tier 3 with < 5 days history: no alert (cold start)."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        scores = np.random.normal(0.5, 0.3, 500)
+        # Empty history file
+        result = check_score_diversity(scores, history_path=None)
+
+        assert result.tier3_drift.get("alerted", False) is False
+
+    def test_tier3_drift_alert_on_drop(self, tmp_path):
+        """Tier 3 alerts when std drops >50% from baseline + Tier 1 breach."""
+        from ashare_lab.research.predict import check_score_diversity
+
+        # Create history with high std baseline
+        history_path = tmp_path / "diversity_history.json"
+        history_data = {
+            "diversity_history": [
+                {"date": f"2025-01-{d:02d}", "score_std": 0.5, "kurtosis": 0.0,
+                 "std_alert": False, "kurtosis_alert": False}
+                for d in range(1, 20)
+            ]
+        }
+        history_path.write_text(json.dumps(history_data))
+
+        # Current scores that ALSO breach Tier 1 (near-zero std)
+        # This triggers one_plus_tier1 path in Tier 3
+        scores = np.full(200, 0.5) + np.random.uniform(-0.0001, 0.0001, 200)
+        result = check_score_diversity(scores, history_path)
+
+        # Should alert: std dropped >50% AND Tier 1 failed
+        assert result.tier1_failed is True
+        assert result.tier3_drift.get("alerted", False) is True
+
+
+class TestDiversityIntegration:
+    """Integration: predict_for_date refuses parquet on collapse."""
+
+    def test_collapse_raises_valueerror(self, monkeypatch, tmp_path):
+        """All-identical scores in predict_for_date raise ValueError."""
+        trade_date = "2021-12-01"
+        instruments = ["SH600000", "SH600001", "SH600002"]
+
+        # Build pred_df with all-identical scores
+        dates = [pd.Timestamp("2021-11-29"), pd.Timestamp(trade_date)]
+        idx = pd.MultiIndex.from_product(
+            [dates, instruments], names=["datetime", "instrument"]
+        )
+        scores = np.array([0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+        pred_df = pd.DataFrame(
+            {"score": scores, "label": np.zeros(6)}, index=idx,
+        )
+
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        from ashare_lab.research.predict import predict_for_date
+
+        with pytest.raises(ValueError, match="collapse"):
+            predict_for_date(trade_date)
+
+    def test_normal_scores_write_parquet(self, monkeypatch, tmp_path):
+        """Normal-diversity scores produce parquet successfully."""
+        trade_date = "2021-12-01"
+        instruments = ["SH600000", "SH600001", "SH600002"]
+
+        # Build pred_df with diverse scores
+        dates = [pd.Timestamp("2021-11-29"), pd.Timestamp(trade_date)]
+        idx = pd.MultiIndex.from_product(
+            [dates, instruments], names=["datetime", "instrument"]
+        )
+        scores = np.array([0.1, 0.5, 0.9, 0.2, 0.7, 0.4])
+        pred_df = pd.DataFrame(
+            {"score": scores, "label": np.zeros(6)}, index=idx,
+        )
+
+        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+        from ashare_lab.research.predict import predict_for_date
+
+        out = predict_for_date(trade_date)
+        assert out.exists()
+
+        # Verify diversity metrics in meta.json
+        meta_path = tmp_path / "predictions" / f"{trade_date}.meta.json"
+        meta = json.loads(meta_path.read_text())
+        assert "diversity" in meta
+        assert "score_std" in meta["diversity"]

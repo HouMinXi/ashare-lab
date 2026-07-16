@@ -18,7 +18,9 @@ from ashare_lab.paper.risk import (
     check_drawdown_breaker,
     check_industry_concentration,
     check_market_regime,
+    check_prediction_staleness,
     check_soft_drawdown,
+    check_suspension_risk,
     check_trailing_stop,
     manage_trailing_cooldown,
     run_all_risk_checks,
@@ -474,3 +476,139 @@ class TestRunAllRiskChecks:
         )
         with pytest.raises(AttributeError):
             result.buying_halted = True
+
+
+# -----------------------------------------------------------------------
+# check_prediction_staleness (Phase 9 -- 09-02)
+# -----------------------------------------------------------------------
+
+
+class TestPredictionStaleness:
+    """Dimension 8: prediction staleness check."""
+
+    def test_fresh_same_day(self):
+        """Same-day prediction: age=0, FRESH, no halt."""
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-15", "2025-01-15", 3,
+        )
+        assert should_halt is False
+        assert detail["tier"] == "FRESH"
+        assert detail["age_days"] == 0
+
+    def test_stale_warn_one_day(self):
+        """1 trading day old: STALE_WARN, no halt."""
+        # 2025-01-14 -> 2025-01-15: 1 trading day gap
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-15", "2025-01-14", 3,
+        )
+        assert should_halt is False
+        assert detail["tier"] == "STALE_WARN"
+        assert detail["age_days"] >= 1
+
+    def test_stale_reject_at_threshold(self):
+        """3+ trading days old: STALE_REJECT, halt buying."""
+        # 2025-01-10 -> 2025-01-15: ~3 trading days
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-15", "2025-01-10", 3,
+        )
+        assert should_halt is True
+        assert detail["tier"] == "STALE_REJECT"
+        assert detail["age_days"] >= 3
+
+    def test_stale_reject_old_prediction(self):
+        """10-day-old prediction: definitely STALE_REJECT."""
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-15", "2025-01-02", 3,
+        )
+        assert should_halt is True
+        assert detail["tier"] == "STALE_REJECT"
+
+    def test_weekend_gap_still_warn(self):
+        """Friday->Monday gap: 1 trading day, STALE_WARN."""
+        # 2025-01-10 (Fri) -> 2025-01-13 (Mon)
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-13", "2025-01-10", 3,
+        )
+        assert should_halt is False
+        assert detail["tier"] == "STALE_WARN"
+
+    def test_custom_threshold(self):
+        """Custom threshold of 5: 4-day-old is STALE_WARN."""
+        should_halt, detail = check_prediction_staleness(
+            "2025-01-15", "2025-01-09", 5,
+        )
+        assert should_halt is False
+        assert detail["tier"] == "STALE_WARN"
+        assert detail["threshold"] == 5
+
+
+# -----------------------------------------------------------------------
+# check_suspension_risk (Phase 9 -- 09-03, alert-only)
+# -----------------------------------------------------------------------
+
+
+class TestSuspensionRisk:
+    """Dimension 9: suspension risk awareness (alert-only, no auto-action)."""
+
+    def test_suspended_stock_high_score(self):
+        """Currently suspended stock (volume=0) gets high risk score."""
+        positions = {
+            "S": {"qty": 100, "avg_cost": 10.0, "market_value": 60000.0},
+        }
+        prices = {
+            "S": {"close": 10.0, "volume": 0.0, "change": 0.0, "threshold": 0.099},
+        }
+        scores = check_suspension_risk(positions, prices, "2025-01-15")
+        assert "S" in scores
+        assert scores["S"] >= 0.3  # suspended + large position
+
+    def test_healthy_stock_low_score(self):
+        """Normal stock with good volume: low or zero risk score."""
+        positions = {
+            "H": {"qty": 100, "avg_cost": 10.0, "market_value": 10000.0},
+        }
+        prices = {
+            "H": {"close": 15.0, "volume": 1e7, "change": 0.01, "threshold": 0.099},
+        }
+        scores = check_suspension_risk(positions, prices, "2025-01-15")
+        assert scores.get("H", 0) == 0.0
+
+    def test_st_stock_gets_score(self):
+        """ST stock (5% limit threshold) gets suspension risk points."""
+        positions = {
+            "ST": {"qty": 100, "avg_cost": 10.0, "market_value": 10000.0},
+        }
+        prices = {
+            "ST": {"close": 10.0, "volume": 1e6, "change": 0.01, "threshold": 0.049},
+        }
+        scores = check_suspension_risk(positions, prices, "2025-01-15")
+        assert "ST" in scores
+        assert scores["ST"] >= 0.2  # ST dimension
+
+    def test_extreme_change_gets_score(self):
+        """Stock with |change| > 8% gets risk points."""
+        positions = {
+            "X": {"qty": 100, "avg_cost": 10.0, "market_value": 10000.0},
+        }
+        prices = {
+            "X": {"close": 10.0, "volume": 1e6, "change": 0.09, "threshold": 0.099},
+        }
+        scores = check_suspension_risk(positions, prices, "2025-01-15")
+        assert "X" in scores
+        assert scores["X"] >= 0.2
+
+    def test_empty_positions_returns_empty(self):
+        """No positions: empty result."""
+        scores = check_suspension_risk({}, {}, "2025-01-15")
+        assert scores == {}
+
+    def test_score_capped_at_one(self):
+        """Risk score is capped at 1.0."""
+        positions = {
+            "M": {"qty": 100, "avg_cost": 2.0, "market_value": 60000.0},
+        }
+        prices = {
+            "M": {"close": 3.0, "volume": 0.0, "change": 0.10, "threshold": 0.049},
+        }
+        scores = check_suspension_risk(positions, prices, "2025-01-15")
+        assert scores["M"] <= 1.0

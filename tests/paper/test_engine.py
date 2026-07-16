@@ -16,7 +16,7 @@ from ashare_lab.paper.engine import (
     round_lots,
     settle_day,
 )
-from ashare_lab.paper.ledger import get_connection, init_schema
+from ashare_lab.paper.ledger import get_connection, init_schema, insert_order as ledger_insert_order
 
 
 # ===================================================================
@@ -721,3 +721,206 @@ class TestComputeNavReexport:
         nav = compute_nav(positions, {}, 5000.0)
         # Falls back to market_value / qty = 10.0
         assert nav == pytest.approx(5000.0 + 100 * 10.0)
+
+
+# ===================================================================
+# Phase 9 -- 09-03: Limit-down never-cancel + Suspension handling
+# ===================================================================
+
+
+class TestLimitDownNeverCancel:
+    """Limit-down orders must NEVER be cancelled, even after many resets."""
+
+    def test_limit_down_never_cancelled_after_100_cycles(self, tmp_path):
+        """100 consecutive limit-down carry cycles: order never cancelled."""
+        conn = _setup_db(tmp_path)
+        positions = {
+            "Y": {
+                "qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                "buy_date": "2024-01-01", "holding_high": 10.0,
+                "factor": 1.0,
+            }
+        }
+        oid = ledger_insert_order(
+            conn, "2024-01-02", "Y", "sell", 100, None, "pending", 0,
+            "2024-01-02",
+        )
+        conn.commit()
+
+        # Simulate 100 consecutive limit-down days
+        for day_offset in range(100):
+            trade_date = f"2024-01-{2 + day_offset:02d}"
+            orders = [
+                {"id": oid, "symbol": "Y", "side": "sell",
+                 "target_qty": 100, "carry_day": 3,
+                 "reset_count": day_offset},
+            ]
+            prices = _make_prices("Y", 9.0, change=-0.10, volume=1e7)
+            result = settle_day(
+                conn, trade_date, orders, prices, positions,
+                100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+                _make_config(),
+            )
+            # Order must never be cancelled
+            assert "Y" not in result.cancels, (
+                f"Order cancelled at day {day_offset}!"
+            )
+
+        # Final state: still carry
+        row = conn.execute(
+            "SELECT status, reset_count FROM orders WHERE id = ?", (oid,)
+        ).fetchone()
+        assert row["status"] == "carry"
+        assert row["reset_count"] >= 99
+
+
+class TestSuspensionTimeout:
+    """Suspension orders cancel after 25 days with cancel_reason."""
+
+    def test_suspension_timeout_at_25_days(self, tmp_path):
+        """Order cancelled when suspension_carry_day >= 25."""
+        conn = _setup_db(tmp_path)
+        oid = ledger_insert_order(
+            conn, "2024-01-02", "S", "sell", 100, None, "carry", 0,
+            "2024-01-02",
+        )
+        # Set suspension_carry_day to 25
+        conn.execute(
+            "UPDATE orders SET suspension_carry_day = 25 WHERE id = ?",
+            (oid,),
+        )
+        conn.commit()
+
+        orders = [
+            {"id": oid, "symbol": "S", "side": "sell",
+             "target_qty": 100, "carry_day": 0,
+             "suspension_carry_day": 25},
+        ]
+        # volume=0 means suspended
+        prices = _make_prices("S", 10.0, volume=0.0)
+        positions = {
+            "S": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                   "buy_date": "2024-01-01", "holding_high": 10.0,
+                   "factor": 1.0}
+        }
+        result = settle_day(
+            conn, "2024-01-30", orders, prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        assert "S" in result.cancels
+        row = conn.execute(
+            "SELECT status, cancel_reason FROM orders WHERE id = ?", (oid,)
+        ).fetchone()
+        assert row["status"] == "cancelled"
+        assert row["cancel_reason"] == "suspension_timeout"
+
+    def test_suspension_not_timeout_at_24_days(self, tmp_path):
+        """Order still carries at suspension_carry_day=24."""
+        conn = _setup_db(tmp_path)
+        oid = ledger_insert_order(
+            conn, "2024-01-02", "S", "sell", 100, None, "carry", 0,
+            "2024-01-02",
+        )
+        conn.execute(
+            "UPDATE orders SET suspension_carry_day = 24 WHERE id = ?",
+            (oid,),
+        )
+        conn.commit()
+
+        orders = [
+            {"id": oid, "symbol": "S", "side": "sell",
+             "target_qty": 100, "carry_day": 0,
+             "suspension_carry_day": 24},
+        ]
+        prices = _make_prices("S", 10.0, volume=0.0)
+        result = settle_day(
+            conn, "2024-01-30", orders, prices, {},
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        assert "S" not in result.cancels
+        assert len(result.carries_suspended) == 1
+
+
+class TestSuspensionResumeForcedSell:
+    """Cancelled suspension orders create forced sell on resume."""
+
+    def test_resume_creates_forced_sell(self, tmp_path):
+        """When suspended stock resumes, forced sell order created."""
+        conn = _setup_db(tmp_path)
+        positions = {
+            "S": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                   "buy_date": "2024-01-01", "holding_high": 10.0,
+                   "factor": 1.0}
+        }
+
+        # Create a cancelled suspension_timeout order
+        oid = ledger_insert_order(
+            conn, "2024-01-02", "S", "sell", 100, None, "cancelled", 0,
+            "2024-01-02",
+        )
+        conn.execute(
+            "UPDATE orders SET cancel_reason = 'suspension_timeout' WHERE id = ?",
+            (oid,),
+        )
+        conn.commit()
+
+        # Now stock resumes (volume > 0)
+        orders = []  # no pending orders
+        prices = _make_prices("S", 10.0, volume=1e6)  # resumed
+        result = settle_day(
+            conn, "2024-02-01", orders, prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        # Check forced sell order was created
+        forced = conn.execute(
+            "SELECT * FROM orders WHERE source = 'forced_liquidation' "
+            "AND symbol = 'S'"
+        ).fetchone()
+        assert forced is not None
+        assert forced["side"] == "sell"
+        assert forced["target_qty"] == 100
+        assert forced["status"] == "pending"
+
+    def test_resume_no_duplicate_forced_sell(self, tmp_path):
+        """Idempotent: no duplicate forced sell if one already exists."""
+        conn = _setup_db(tmp_path)
+        positions = {
+            "S": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                   "buy_date": "2024-01-01", "holding_high": 10.0,
+                   "factor": 1.0}
+        }
+
+        # Cancelled suspension order
+        oid = ledger_insert_order(
+            conn, "2024-01-02", "S", "sell", 100, None, "cancelled", 0,
+            "2024-01-02",
+        )
+        conn.execute(
+            "UPDATE orders SET cancel_reason = 'suspension_timeout' WHERE id = ?",
+            (oid,),
+        )
+        # Existing pending sell (not from forced_liquidation)
+        ledger_insert_order(
+            conn, "2024-02-01", "S", "sell", 100, None, "pending", 0,
+            "2024-02-01",
+        )
+        conn.commit()
+
+        prices = _make_prices("S", 10.0, volume=1e6)
+        settle_day(
+            conn, "2024-02-01", [], prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        # Should NOT create duplicate forced sell
+        forced = conn.execute(
+            "SELECT COUNT(*) as cnt FROM orders WHERE source = 'forced_liquidation'"
+        ).fetchone()
+        assert forced["cnt"] == 0
