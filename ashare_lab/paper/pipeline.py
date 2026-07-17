@@ -52,7 +52,7 @@ from ashare_lab.paper.ipo import (
 )
 from ashare_lab.paper.ledger import (
     bump_carry_days,
-    check_db_integrity,
+    bump_suspension_carry_days,
     cleanup_old_backups,
     compute_nav,
     create_golden_backup,
@@ -62,7 +62,6 @@ from ashare_lab.paper.ledger import (
     get_cooldowns,
     get_latest_cash,
     get_latest_positions,
-    hot_backup,
     hot_backup_with_integrity,
     init_schema,
     insert_order,

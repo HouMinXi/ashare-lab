@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 
 from ashare_lab.paper.fees import calculate_fees
 from ashare_lab.paper.ledger import (
-    bump_suspension_carry_days,
     compute_nav,
     insert_order,
     insert_trade,

@@ -79,6 +79,7 @@ def _risk_result(**overrides) -> RiskCheckResult:
         blocked_rebuys=set(),
         topk_override=None,
         cooldown_entries={},
+        suspension_risk={},
     )
     defaults.update(overrides)
     return RiskCheckResult(**defaults)
@@ -193,7 +194,8 @@ def _pipeline_patches(
             f"{_MOD}.run_all_risk_checks", return_value=risk_result
         ),
         "compute_nav": patch(f"{_MOD}.compute_nav", return_value=300_000),
-        "hot_backup": patch(f"{_MOD}.hot_backup"),
+        "hot_backup_with_integrity": patch(f"{_MOD}.hot_backup_with_integrity"),
+        "create_golden_backup": patch(f"{_MOD}.create_golden_backup"),
         "cleanup_old_backups": patch(f"{_MOD}.cleanup_old_backups"),
         "PREDICTIONS_DIR": patch(f"{_MOD}.PREDICTIONS_DIR", pred_dir),
         "latest_trading_day": patch(
@@ -209,6 +211,7 @@ def _pipeline_patches(
             return_value=dt.date(2025, 6, 19),
         ),
         "bump_carry_days": patch(f"{_MOD}.bump_carry_days"),
+        "bump_suspension_carry_days": patch(f"{_MOD}.bump_suspension_carry_days"),
         # Patch deferred imports via sys.modules
         "qlib_data": patch.dict(
             sys.modules,

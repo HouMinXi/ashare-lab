@@ -60,6 +60,8 @@ class RiskCheckResult:
         cooldown_entries: symbol -> {cooldown_until, holding_high} for
             symbols that triggered trailing stop this run.  Pipeline
             iterates this to call set_cooldown().
+        suspension_risk: symbol -> risk_score (0.0-1.0) for suspension
+            risk assessment. Alert-only, zero decision power.
     """
 
     buying_halted: bool
@@ -68,6 +70,7 @@ class RiskCheckResult:
     blocked_rebuys: set[str]
     topk_override: int | None
     cooldown_entries: dict[str, dict]
+    suspension_risk: dict[str, float]
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +498,20 @@ def run_all_risk_checks(
                 staleness_halted,
             )
 
+    # -- 9. Suspension risk (alert-only, no auto-action) --
+    suspension_risk = check_suspension_risk(
+        current_positions, current_prices, trade_date,
+    )
+    if suspension_risk:
+        high_risk = {s: r for s, r in suspension_risk.items() if r >= 0.5}
+        if high_risk:
+            logger.warning(
+                "Suspension risk alert: %d symbols with score >= 0.5: %s",
+                len(high_risk),
+                ", ".join(f"{s}={r:.2f}" for s, r in sorted(
+                    high_risk.items(), key=lambda x: -x[1])),
+            )
+
     # -- blocked_rebuys from cooldown_dict (>= for full N-day) --
     blocked_rebuys = {
         s
@@ -527,4 +544,5 @@ def run_all_risk_checks(
         blocked_rebuys=blocked_rebuys,
         topk_override=topk_override,
         cooldown_entries=cooldown_entries,
+        suspension_risk=suspension_risk,
     )
