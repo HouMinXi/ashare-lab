@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ashare_lab.data.calendar import next_trading_day, trading_days_between
 
@@ -70,7 +70,7 @@ class RiskCheckResult:
     blocked_rebuys: set[str]
     topk_override: int | None
     cooldown_entries: dict[str, dict]
-    suspension_risk: dict[str, float]
+    suspension_risk: dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -321,12 +321,17 @@ def check_suspension_risk(
 
         # Dimension 2: currently suspended
         volume = pdata.get("volume", 0.0)
-        if volume == 0.0 or (isinstance(volume, float) and volume != volume):
+        if volume == 0.0 or (isinstance(volume, float) and math.isnan(volume)):
             score += 0.3
 
-        # Dimension 3: near-zero volume
-        elif volume < 1_000_000:
-            score += 0.1
+        # Dimension 3: near-zero volume (< 10M CNY turnover)
+        # elif: suspended stocks (volume=0) already scored above
+        elif volume > 0:
+            close = pdata.get("close")
+            if close and close > 0:
+                turnover = volume * close
+                if turnover < 10_000_000:
+                    score += 0.1
 
         # Dimension 4: large position concentration
         # (approximate: market_value > 50000 CNY)
