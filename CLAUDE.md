@@ -139,3 +139,14 @@ Incidence evidence: project memory `feedback_pipeline_incident_20260713.md`.
 - **SSH environment != interactive environment.** Windows SSH sessions only have `py.exe`, not `python`. Verify commands in the actual execution context.
 - **No report > wrong report.** Skip WeChat report when data quality is suspect. The user received "+3647% return" because the pipeline sent reports with garbage data.
 - **`_is_normalized_price()` is the single source of truth.** Checks `adjusted` flag first (if True, price is real). Otherwise checks `factor < 0.1`. Used in both `_gate_price_sanity` and `_step13_report`.
+
+
+## End-to-End Test Gate (2026-07-17 P0 incident)
+
+Incidence evidence: `bump_suspension_carry_days` was added to ledger.py and called in pipeline.py:1091, but pipeline.py never imported it. All unit tests passed (mocks masked the missing import). Pipeline crashed on first real run with `NameError`.
+
+- **Unit tests passing ≠ pipeline works.** Mocks hide missing imports, dead code, and schema mismatches. An import that is mocked in tests but missing in production code will never fail in tests.
+- **End-to-end test is mandatory for logic-bearing changes.** After any change to pipeline.py/engine.py/risk.py/ledger.py imports or function signatures, run `python3 -m ashare_lab.cli paper run-all` with real data on X500. This is a HARD GATE -- do not skip even for "obvious" one-line fixes.
+- **Import smoke test is NOT sufficient.** `python3 -c "from ashare_lab.paper.pipeline import run_daily"` only verifies the import chain resolves. It does NOT verify the function bodies execute without NameError on missing imports that are called deeper in the code path.
+- **New function checklist**: when adding a function to any module, verify: (1) it is imported in every file that calls it, (2) it is mocked in every test file that exercises the calling code path, (3) it is actually called (not dead code).
+- **Forge review is required for all logic-bearing changes.** 3 rounds minimum, fix all confirmed findings before committing. This applies even to "trivial" wiring changes like adding a function call to an aggregator.
