@@ -223,8 +223,9 @@ def test_should_notify_false_after_notification(
 def test_should_notify_preserved_on_regression(
     conn: sqlite3.Connection,
 ) -> None:
-    """After regression, notified_at is preserved (not cleared) to
-    prevent re-notification spam on oscillation around threshold."""
+    """After regression, both graduated_at and notified_at are cleared
+    so a genuine recovery can re-notify.  Oscillation is prevented by
+    the 30-day window, not by preserving notified_at."""
     _fill(conn, 30)
     conn.execute(
         "INSERT OR REPLACE INTO graduation_status "
@@ -232,7 +233,7 @@ def test_should_notify_preserved_on_regression(
     )
     conn.commit()
 
-    # Add 4 stale -> gate fails -> graduated_at cleared but notified_at kept
+    # Add 4 stale -> gate fails -> both timestamps cleared
     for i in range(1, 5):
         insert_pipeline_run(conn, f"2026-02-{i:02d}", "stale", 10.0,
                             None, "2026-01-25")
@@ -241,13 +242,14 @@ def test_should_notify_preserved_on_regression(
     assert not passed
 
     row = conn.execute(
-        "SELECT notified_at FROM graduation_status WHERE id=1"
+        "SELECT graduated_at, notified_at FROM graduation_status WHERE id=1"
     ).fetchone()
-    # notified_at preserved -- prevents re-notification on oscillation
-    assert row is not None and row["notified_at"] is not None
+    # Both cleared on regression
+    assert row is not None
+    assert row["graduated_at"] is None
+    assert row["notified_at"] is None
 
-    # Add enough successes to fill the denominator window before hitting
-    # any stale rows (need 30 success rows more recent than the stale rows)
+    # Add enough successes to fill the denominator window
     for i in range(5, 35):
         month = 2 + (i - 1) // 28
         day = (i - 1) % 28 + 1
@@ -257,8 +259,8 @@ def test_should_notify_preserved_on_regression(
     conn.commit()
     passed, s = check_graduation(conn)
     assert passed
-    # should_notify=False because notified_at was already set (no spam)
-    assert s["should_notify"] is False
+    # should_notify=True because recovery after genuine regression
+    assert s["should_notify"] is True
 
 
 def test_notify_graduation_writes_timestamp(
