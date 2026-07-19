@@ -703,3 +703,85 @@ class TestPreCommitNavGate:
         count = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
         assert count == 2
         conn.close()
+
+
+class TestHedgePrefetch:
+    """Layer 3: _prefetch_hedge_prices_for_settle fetches ETF prices
+    before settle so hedge orders can fill."""
+
+    def test_prefetch_populates_hedge_prices(self, tmp_path):
+        """With hedge enabled, prefetch adds ETF prices to ctx.prices."""
+        from ashare_lab.paper.pipeline import (
+            DailyRunContext, _prefetch_hedge_prices_for_settle,
+        )
+        from ashare_lab.paper.hedge import HedgeConfig, HedgeLeg
+        from unittest.mock import patch
+
+        ctx = DailyRunContext(
+            trade_date="2024-01-02", force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str="",
+        )
+        ctx.config = {"paper": {"hedge": {"enabled": True}}}
+        ctx.prices = {}
+
+        mock_hedge_cfg = HedgeConfig(
+            equity_ramp=[(0.0, 0.8), (0.10, 0.2)],
+            legs=[HedgeLeg(symbol="511260", weight=1.0, leg_type="treasury_etf")],
+            activate_dd=0.10,
+        )
+        mock_prices = {"511260": {"close": 10.5, "volume": 1e12, "factor": 1.0, "change": 0.0, "threshold": 0.10}}
+        with patch("ashare_lab.paper.hedge._load_hedge_config", return_value=mock_hedge_cfg),              patch("ashare_lab.paper.pipeline._fetch_hedge_prices") as mock_fetch:
+            def side_effect(ctx, syms):
+                ctx.prices.update(mock_prices)
+            mock_fetch.side_effect = side_effect
+            _prefetch_hedge_prices_for_settle(ctx)
+
+        assert "511260" in ctx.prices
+        assert ctx.prices["511260"]["volume"] > 0
+        assert ctx.prices["511260"]["volume"] < float("inf")
+
+    def test_prefetch_skips_when_disabled(self):
+        """With hedge disabled, prefetch is a no-op."""
+        from ashare_lab.paper.pipeline import (
+            DailyRunContext, _prefetch_hedge_prices_for_settle,
+        )
+
+        ctx = DailyRunContext(
+            trade_date="2024-01-02", force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str="",
+        )
+        ctx.config = {"paper": {"hedge": {"enabled": False}}}
+        ctx.prices = {}
+
+        _prefetch_hedge_prices_for_settle(ctx)
+        assert ctx.prices == {}  # nothing added
+
+
+class TestPrefetchCallOrder:
+    """Layer 3 wiring: _prefetch_hedge_prices_for_settle must be called
+    before _step8_settle in the pipeline execution sequence."""
+
+    def test_prefetch_called_before_settle(self):
+        """Deleting the prefetch call at pipeline.py:1796 must fail this test."""
+        import ast
+        import inspect
+        source = inspect.getsource(
+            __import__('ashare_lab.paper.pipeline', fromlist=['run_daily'])
+        )
+        tree = ast.parse(source)
+        # Find run_daily function body
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) or isinstance(node, ast.FunctionDef):
+                if node.name == 'run_daily':
+                    body = ast.dump(node)
+                    # prefetch must appear before settle in the AST
+                    prefetch_pos = body.find('_prefetch_hedge_prices_for_settle')
+                    settle_pos = body.find('_step8_settle')
+                    assert prefetch_pos > 0, "_prefetch_hedge_prices_for_settle not found in run_daily"
+                    assert settle_pos > 0, "_step8_settle not found in run_daily"
+                    assert prefetch_pos < settle_pos, (
+                        f"_prefetch_hedge_prices_for_settle (pos {prefetch_pos}) must come "
+                        f"before _step8_settle (pos {settle_pos}) in run_daily"
+                    )
+                    return
+        pytest.fail("run_daily function not found in pipeline.py")

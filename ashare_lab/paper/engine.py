@@ -117,14 +117,15 @@ def cap_fill_by_volume(
 ) -> int:
     """Cap fill quantity by daily volume participation (D-46).
 
-    *side* is required (no default) so sell caps skip lot rounding.
+    Delegates to engine_settle._cap_fill_by_volume which handles
+    inf/nan/zero correctly (math.isfinite guard).  Applies lot
+    rounding for buy orders (A-share 100-share lots).
     """
-    if daily_volume != daily_volume or daily_volume == 0.0:  # NaN or zero
-        return 0
-    max_fill = int(daily_volume * participation_pct)
+    from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+    raw = _cap_fill_by_volume(target_qty, daily_volume, side, participation_pct)
     if side == "buy":
-        max_fill = round_lots(max_fill, "buy")
-    return min(target_qty, max_fill)
+        return round_lots(raw, "buy")
+    return raw
 
 
 # ---------------------------------------------------------------------------

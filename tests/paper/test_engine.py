@@ -1054,3 +1054,54 @@ class TestSuspensionResumeForcedSell:
             "WHERE source = 'forced_liquidation' AND symbol = 'S'"
         ).fetchone()
         assert forced["cnt"] == 1, "only the first forced sell should exist"
+
+
+class TestCapFillIsfiniteGuard:
+    """Layer 2: _cap_fill_by_volume handles inf/nan/zero via math.isfinite."""
+
+    def test_inf_returns_target_qty(self):
+        from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+        # inf must not OverflowError and must return target_qty (uncapped)
+        assert _cap_fill_by_volume(500, float("inf"), "buy", 0.05) == 500
+
+    def test_negative_inf_returns_zero(self):
+        from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+        assert _cap_fill_by_volume(500, float("-inf"), "buy", 0.05) == 0
+
+    def test_nan_returns_zero(self):
+        from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+        assert _cap_fill_by_volume(500, float("nan"), "buy", 0.05) == 0
+
+    def test_zero_returns_zero(self):
+        from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+        assert _cap_fill_by_volume(500, 0.0, "buy", 0.05) == 0
+
+    def test_normal_volume_caps(self):
+        from ashare_lab.paper.engine_settle import _cap_fill_by_volume
+        # 10000 * 0.05 = 500, min(600, 500) = 500
+        assert _cap_fill_by_volume(600, 10000.0, "buy", 0.05) == 500
+
+    def test_engine_delegates_to_settle(self):
+        """engine.py cap_fill_by_volume delegates to engine_settle version."""
+        from ashare_lab.paper.engine import cap_fill_by_volume
+        # inf must not crash via the engine.py public API
+        assert cap_fill_by_volume(500, float("inf"), "buy", 0.05) == 500
+
+
+class TestCapFillLotRounding:
+    """After merge, cap_fill_by_volume rounds AFTER capping (correct for A-share lots)."""
+
+    def test_buy_150_rounds_to_100(self):
+        """qty=150, vol=1e6, buy -> int(1e6*0.05)=50000, min(150,50000)=150, round_lots(150)=100."""
+        from ashare_lab.paper.engine import cap_fill_by_volume
+        assert cap_fill_by_volume(150, 1_000_000, "buy", 0.05) == 100
+
+    def test_buy_99_rounds_to_0(self):
+        """qty=99, vol=1e6, buy -> 99, round_lots(99)=0 (less than one lot)."""
+        from ashare_lab.paper.engine import cap_fill_by_volume
+        assert cap_fill_by_volume(99, 1_000_000, "buy", 0.05) == 0
+
+    def test_sell_150_no_rounding(self):
+        """Sells are not lot-rounded."""
+        from ashare_lab.paper.engine import cap_fill_by_volume
+        assert cap_fill_by_volume(150, 1_000_000, "sell", 0.05) == 150
