@@ -304,6 +304,9 @@ def settle_buy_orders(
                         new_qty * fill_price_est, cash,
                     )
                     target_qty = new_qty
+                    # Persist re-sized qty to DB so next carry day
+                    # uses the adjusted value, not the original.
+                    update_order(conn, oid, target_qty=new_qty)
                     # Recalculate est_cost after re-size
                     est_cost = fill_price_est * target_qty
         est_cost = fill_price_est * target_qty

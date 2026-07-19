@@ -1,3 +1,7 @@
+graph_triage:
+  enabled: true
+  db_path: .code-review-graph/graph.db
+
 backends:
   review-route:
     type: api

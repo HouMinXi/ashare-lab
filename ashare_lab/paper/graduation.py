@@ -87,12 +87,15 @@ def check_graduation(
         if gs_row is None or gs_row["notified_at"] is None:
             should_notify = True
     else:
-        # Gate regressed -- clear graduated_at but keep notified_at
-        # to prevent re-notification spam on oscillation around threshold.
+        # Gate regressed -- clear both graduated_at and notified_at
+        # so a genuine recovery after regression can re-notify.
+        # Oscillation is prevented by the 30-day window: the gate
+        # needs 30 consecutive good days, so casual oscillation
+        # around the threshold doesn't trigger repeated notifications.
         if gs_row is not None and gs_row["graduated_at"] is not None:
             conn.execute(
                 "UPDATE graduation_status "
-                "SET graduated_at = NULL "
+                "SET graduated_at = NULL, notified_at = NULL "
                 "WHERE id = 1",
             )
             conn.commit()

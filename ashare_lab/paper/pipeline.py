@@ -1045,35 +1045,49 @@ def _step7_csi1000_exits(ctx: DailyRunContext) -> None:
 
     Requires consecutive absence to handle qlib one-day lag: a stock
     must be absent for 2+ consecutive days before exit sell is created.
-    The absence counter is tracked in the position dict as
-    ``universe_absent_days``.
+
+    Persistence strategy: instead of an in-memory counter (resets each
+    run), use the orders table as the counter.  On first absence, insert
+    a pending exit sell for next_td.  On the next run, if the stock is
+    still absent and already has a pending/carry sell, that confirms
+    2+ consecutive absence -- let the order proceed.  If the stock
+    returns to the universe, cancel the pending exit sell.
     """
     universe_set = set(ctx.universe_symbols)
     next_td_date = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
     for sym, pos in ctx.current_positions.items():
         if sym in universe_set:
-            # Stock is in universe -- reset absence counter
-            pos.pop("universe_absent_days", None)
+            # Stock is in universe -- cancel any pending exit sell
+            # created by this mechanism (identified by cancel_reason).
+            pending_exit = ctx.conn.execute(
+                "SELECT id FROM orders WHERE symbol=? AND side='sell' "
+                "AND status IN ('pending','carry') "
+                "AND cancel_reason = 'csi1000_exit'",
+                (sym,),
+            ).fetchone()
+            if pending_exit is not None:
+                update_order(ctx.conn, pending_exit["id"], status="cancelled",
+                             cancel_reason="csi1000_returned")
+                logger.info("CSI1000 exit: %s returned to universe, exit sell cancelled", sym)
             continue
-        # Stock not in universe -- increment absence counter
-        absent_days = pos.get("universe_absent_days", 0) + 1
-        pos["universe_absent_days"] = absent_days
-        if absent_days < 2:
-            logger.info(
-                "CSI1000 exit: %s absent from universe (day %d/%d), waiting for confirmation",
-                sym, absent_days, 2,
-            )
-            continue
-        # Confirmed exit after consecutive absence
-        existing = ctx.conn.execute(
+        # Stock not in universe -- check for existing pending exit sell
+        existing_exit = ctx.conn.execute(
             "SELECT id FROM orders WHERE symbol=? AND side='sell' "
-            "AND status IN ('pending','carry') AND trade_date <= ?",
-            (sym, ctx.trade_date),
+            "AND status IN ('pending','carry') "
+            "AND cancel_reason = 'csi1000_exit'",
+            (sym,),
         ).fetchone()
-        if existing is None:
-            qty = pos["qty"]
-            insert_order(ctx.conn, next_td_date, sym, "sell", qty, None, "pending", 0, ctx.trade_date)
-            logger.info("CSI1000 exit: sell order created for %s (absent %d days)", sym, absent_days)
+        if existing_exit is not None:
+            # Already has a pending exit sell from yesterday's absence.
+            # This confirms 2+ consecutive absence. Let the order
+            # proceed to settlement.
+            logger.info("CSI1000 exit: %s confirmed absent (pending sell exists), proceeding", sym)
+            continue
+        # First absence -- insert pending exit sell for next_td
+        qty = pos["qty"]
+        insert_order(ctx.conn, next_td_date, sym, "sell", qty, None, "pending", 0, ctx.trade_date,
+                     cancel_reason="csi1000_exit")
+        logger.info("CSI1000 exit: %s absent from universe, exit sell for %s created", sym, next_td_date)
 
 
 def _prefetch_hedge_prices_for_settle(ctx: DailyRunContext) -> None:
@@ -1565,10 +1579,12 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
             today_nav = float(nav_rows[0]["total_nav"])
             prev_nav = float(nav_rows[1]["total_nav"])
             if prev_nav > 0:
-                nav_change = abs(today_nav - prev_nav) / prev_nav
+                nav_change = (today_nav - prev_nav) / prev_nav
+                # Only delete on suspicious GAINS (likely data error).
+                # Preserve real crashes so step13 crash alert can fire.
                 if nav_change > 0.20:
                     logger.error(
-                        "[pre-commit] NAV anomalous: %.0f%% change (%.0f -> %.0f), "
+                        "[pre-commit] NAV anomalous gain: +%.0f%% (%.0f -> %.0f), "
                         "removing today's NAV row to prevent corrupted persistence",
                         nav_change * 100, prev_nav, today_nav,
                     )
