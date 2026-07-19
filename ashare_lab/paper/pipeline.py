@@ -1058,22 +1058,24 @@ def _step7_csi1000_exits(ctx: DailyRunContext) -> None:
     for sym, pos in ctx.current_positions.items():
         if sym in universe_set:
             # Stock is in universe -- cancel any pending exit sell
+            # created by this mechanism (identified by cancel_reason).
             pending_exit = ctx.conn.execute(
                 "SELECT id FROM orders WHERE symbol=? AND side='sell' "
-                "AND status IN ('pending','carry') AND trade_date <= ? "
-                "AND cancel_reason IS NULL",
-                (sym, ctx.trade_date),
+                "AND status IN ('pending','carry') "
+                "AND cancel_reason = 'csi1000_exit'",
+                (sym,),
             ).fetchone()
             if pending_exit is not None:
-                # Stock returned to universe -- cancel exit sell
-                # (only cancel orders we created, not user-initiated sells)
-                pass  # conservative: don't cancel, let TopK recheck handle it
+                update_order(ctx.conn, pending_exit["id"], status="cancelled",
+                             cancel_reason="csi1000_returned")
+                logger.info("CSI1000 exit: %s returned to universe, exit sell cancelled", sym)
             continue
         # Stock not in universe -- check for existing pending exit sell
         existing_exit = ctx.conn.execute(
             "SELECT id FROM orders WHERE symbol=? AND side='sell' "
-            "AND status IN ('pending','carry') AND trade_date <= ?",
-            (sym, ctx.trade_date),
+            "AND status IN ('pending','carry') "
+            "AND cancel_reason = 'csi1000_exit'",
+            (sym,),
         ).fetchone()
         if existing_exit is not None:
             # Already has a pending exit sell from yesterday's absence.
@@ -1083,7 +1085,8 @@ def _step7_csi1000_exits(ctx: DailyRunContext) -> None:
             continue
         # First absence -- insert pending exit sell for next_td
         qty = pos["qty"]
-        insert_order(ctx.conn, next_td_date, sym, "sell", qty, None, "pending", 0, ctx.trade_date)
+        insert_order(ctx.conn, next_td_date, sym, "sell", qty, None, "pending", 0, ctx.trade_date,
+                     cancel_reason="csi1000_exit")
         logger.info("CSI1000 exit: %s absent from universe, exit sell for %s created", sym, next_td_date)
 
 
