@@ -32,13 +32,22 @@ def check_graduation(
     Returns (passed, stats) where stats contains success, error, stale,
     denominator, rate, days_remaining, max_stale, and should_notify.
     """
-    # Fetch a buffer of recent rows -- enough to cover min_days denominator
-    # plus stale days plus a safety margin
-    limit = min_days + max_stale + 10
+    # Deduplicate: one row per trade_date (latest attempt wins).
+    # Matches get_report's precedent: ORDER BY created_at DESC, id DESC.
+    # Windowing is day-based, not row-based, so retried days are not
+    # double-counted in the denominator.
     rows = conn.execute(
-        "SELECT trade_date, status FROM pipeline_runs "
-        "ORDER BY trade_date DESC LIMIT ?",
-        (limit,),
+        "SELECT trade_date, status FROM ("
+        "  SELECT trade_date, status,"
+        "    ROW_NUMBER() OVER ("
+        "      PARTITION BY trade_date"
+        "      ORDER BY created_at DESC, id DESC"
+        "    ) AS rn"
+        "  FROM pipeline_runs"
+        ") WHERE rn = 1 "
+        "ORDER BY trade_date DESC "
+        "LIMIT ?",
+        (min_days + max_stale + 10,),
     ).fetchall()
 
     success = 0
@@ -78,11 +87,12 @@ def check_graduation(
         if gs_row is None or gs_row["notified_at"] is None:
             should_notify = True
     else:
-        # Gate regressed -- clear timestamps so re-notification can fire
-        if gs_row is not None and gs_row["notified_at"] is not None:
+        # Gate regressed -- clear graduated_at but keep notified_at
+        # to prevent re-notification spam on oscillation around threshold.
+        if gs_row is not None and gs_row["graduated_at"] is not None:
             conn.execute(
                 "UPDATE graduation_status "
-                "SET graduated_at = NULL, notified_at = NULL "
+                "SET graduated_at = NULL "
                 "WHERE id = 1",
             )
             conn.commit()

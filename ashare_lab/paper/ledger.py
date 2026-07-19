@@ -126,13 +126,16 @@ CREATE TABLE IF NOT EXISTS order_settle_log (
 );
 
 CREATE TABLE IF NOT EXISTS reports (
-    trade_date      TEXT PRIMARY KEY,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date      TEXT NOT NULL,
     mode            TEXT NOT NULL,
     report_text     TEXT NOT NULL,
     delivered_via   TEXT,
     delivery_status TEXT,
     created_at      TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_report_td_created
+    ON reports(trade_date, created_at DESC, id DESC);
 
 -- scored_at/created_at use SQLite CURRENT_TIMESTAMP (YYYY-MM-DD HH:MM:SS UTC);
 -- these columns are for cache expiry and debugging, not cross-table joins
@@ -158,7 +161,8 @@ CREATE TABLE IF NOT EXISTS sentiment_events (
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
-    trade_date       TEXT PRIMARY KEY,
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date       TEXT NOT NULL,
     status           TEXT NOT NULL
                      CHECK(status IN ('success','error','stale')),
     duration_s       REAL NOT NULL,
@@ -166,6 +170,8 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     predictions_date TEXT,
     created_at       TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_td_created
+    ON pipeline_runs(trade_date, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS graduation_status (
     id            INTEGER PRIMARY KEY CHECK(id = 1),
@@ -208,7 +214,8 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_size_limit=67108864")  # 64 MB
+    # No journal_size_limit: large backfills can exceed 64MB WAL.
+    # SQLite auto-checkpoints on close; pipeline mutex prevents concurrent writes.
     return conn
 
 
@@ -218,6 +225,14 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all 14 tables (idempotent) and seed initial state."""
+    # Migration: reports/pipeline_runs from trade_date PK to auto-increment id.
+    # Must run BEFORE executescript because _SCHEMA_SQL now references the
+    # `id` column in CREATE INDEX statements -- on old-schema databases
+    # executescript would fail with "no such column: id" before the migration
+    # is ever reached if we left it after.
+    _migrate_audit_table(conn, "reports")
+    _migrate_audit_table(conn, "pipeline_runs")
+
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
         "INSERT OR IGNORE INTO paper_state (key, value) "
@@ -267,6 +282,65 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_audit_table(conn: sqlite3.Connection, table: str) -> None:
+    """Recreate audit table with auto-increment id if it has the old schema.
+
+    Uses explicit BEGIN IMMEDIATE so all DDL is atomic -- SQLite DDL is
+    transactional (unlike MySQL/PostgreSQL), but Python's executescript()
+    implicitly commits, breaking the transaction.  We use execute() only.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if row is None:
+        return
+    create_sql = row[0]
+    if "PRIMARY KEY" in create_sql and "AUTOINCREMENT" not in create_sql:
+        # Old schema: trade_date is PRIMARY KEY.  Migrate atomically.
+        backup = f"{table}_old"
+        old_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        col_list = ", ".join(old_cols)
+        # Get the CREATE TABLE statement from _SCHEMA_SQL for this table
+        new_create = _extract_create_table(_SCHEMA_SQL, table)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {backup}")
+            conn.execute(f"ALTER TABLE {table} RENAME TO {backup}")
+            conn.execute(new_create)
+            conn.execute(f"INSERT INTO {table} ({col_list}) SELECT {col_list} FROM {backup}")
+            conn.execute(f"DROP TABLE IF EXISTS {backup}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def _extract_create_table(schema_sql: str, table: str) -> str:
+    """Extract the CREATE TABLE statement for *table* from a multi-statement schema.
+
+    Uses balanced-parentheses parsing instead of regex, so nested
+    parens (CHECK constraints, sub-selects) are handled correctly.
+    """
+    marker = f"CREATE TABLE IF NOT EXISTS {table}"
+    start = schema_sql.find(marker)
+    if start == -1:
+        raise ValueError(f"CREATE TABLE for {table} not found in schema")
+    # Find the opening paren
+    paren_start = schema_sql.find("(", start)
+    if paren_start == -1:
+        raise ValueError(f"No opening paren for {table}")
+    # Walk balanced parens to find the closing one
+    depth = 0
+    for i in range(paren_start, len(schema_sql)):
+        if schema_sql[i] == "(":
+            depth += 1
+        elif schema_sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return schema_sql[start : i + 1] + ";"
+    raise ValueError(f"Unbalanced parens in CREATE TABLE for {table}")
+
+
 # ---------------------------------------------------------------------------
 # Report helpers
 # ---------------------------------------------------------------------------
@@ -279,13 +353,13 @@ def insert_report(
     delivered_via: str | None,
     delivery_status: str,
 ) -> None:
-    """Insert or replace a report row.
-    
+    """Append a report row (never overwrites history).
+
     *created_at* is computed internally (UTC ISO-8601).
     """
     created_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT OR REPLACE INTO reports "
+        "INSERT INTO reports "
         "(trade_date, mode, report_text, delivered_via, delivery_status, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (trade_date, mode, report_text, delivered_via, delivery_status, created_at),
@@ -300,13 +374,13 @@ def insert_pipeline_run(
     error_msg: str | None,
     predictions_date: str | None,
 ) -> None:
-    """Insert or replace a pipeline run record.
+    """Append a pipeline run record (never overwrites history).
 
     *created_at* is computed internally (UTC ISO-8601).
     """
     created_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT OR REPLACE INTO pipeline_runs "
+        "INSERT INTO pipeline_runs "
         "(trade_date, status, duration_s, error_msg, predictions_date, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (trade_date, status, duration_s, error_msg, predictions_date, created_at),
@@ -314,9 +388,11 @@ def insert_pipeline_run(
 
 
 def get_report(conn: sqlite3.Connection, trade_date: str) -> sqlite3.Row | None:
-    """Return the report row for *trade_date*."""
+    """Return the latest report row for *trade_date*."""
     return conn.execute(
-        "SELECT * FROM reports WHERE trade_date = ?", (trade_date,)
+        "SELECT * FROM reports WHERE trade_date = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (trade_date,),
     ).fetchone()
 
 

@@ -201,11 +201,12 @@ def _make_prices(symbol, close, change=0.0, volume=1e7, factor=1.0,
 
 
 class TestSettleDaySellBeforeBuy:
-    """Sell proceeds must fund subsequent buy within the same day."""
+    """T+1: sell proceeds are NOT available for same-day buys."""
 
-    def test_sell_releases_cash_for_buy(self, tmp_path):
+    def test_sell_does_not_fund_same_day_buy(self, tmp_path):
+        """Sell proceeds are T+1 -- buy must be carried when only
+        funded by same-day sell proceeds."""
         conn = _setup_db(tmp_path)
-        # Position: 200 shares of A at 10.0
         positions = {
             "A": {
                 "qty": 200,
@@ -216,7 +217,8 @@ class TestSettleDaySellBeforeBuy:
                 "factor": 1.0,
             }
         }
-        # Cash is NOT enough to buy B without selling A first
+        # Cash=50 is NOT enough to buy B (100*5=500+fees).
+        # Sell A proceeds (~2000) should NOT fund the buy (T+1).
         cash = 50.0
         prices = {
             "A": {
@@ -248,8 +250,68 @@ class TestSettleDaySellBeforeBuy:
             cash, {"A", "B"}, {"csi300": 100.0, "csi1000": 200.0},
             _make_config(),
         )
+        # Sell fills, buy is carried (T+1: sell proceeds not available)
         sides = [f["side"] for f in result.fills]
-        assert sides == ["sell", "buy"]
+        assert sides == ["sell"]
+        assert any(c["symbol"] == "B" for c in result.carries_to_bump)
+
+    def test_sell_proceeds_available_next_day(self, tmp_path):
+        """Sell proceeds are available on the NEXT trading day."""
+        conn = _setup_db(tmp_path)
+        positions = {
+            "A": {
+                "qty": 200,
+                "avg_cost": 10.0,
+                "market_value": 2000.0,
+                "buy_date": "2024-01-01",
+                "holding_high": 10.0,
+                "factor": 1.0,
+            }
+        }
+        cash = 50.0
+        prices = {
+            "A": {
+                "close": 10.0, "change": 0.0, "volume": 1e7,
+                "factor": 1.0, "threshold": 0.099,
+            },
+            "B": {
+                "close": 5.0, "change": 0.0, "volume": 1e7,
+                "factor": 1.0, "threshold": 0.099,
+            },
+        }
+        from ashare_lab.paper.ledger import insert_order as lio
+        sell_id = lio(
+            conn, "2024-01-02", "A", "sell", 200, None, "pending", 0,
+            "2024-01-02",
+        )
+        orders = [
+            {"id": sell_id, "symbol": "A", "side": "sell",
+             "target_qty": 200, "carry_day": 0},
+        ]
+        # Day 1: sell A
+        result1 = settle_day(
+            conn, "2024-01-02", orders, prices, positions,
+            cash, {"A", "B"}, {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+        # Sell proceeds (~1998) added to cash for next day
+        assert result1.cash > 2000, "sell proceeds in result.cash for next day"
+
+        # Day 2: buy B with sell proceeds now available
+        buy_id = lio(
+            conn, "2024-01-03", "B", "buy", 100, None, "pending", 0,
+            "2024-01-03",
+        )
+        buy_order = [
+            {"id": buy_id, "symbol": "B", "side": "buy",
+             "target_qty": 100, "carry_day": 0},
+        ]
+        result2 = settle_day(
+            conn, "2024-01-03", buy_order, prices, positions,
+            result1.cash, {"B"}, {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+        assert any(f["side"] == "buy" for f in result2.fills)
 
 
 class TestSettleDayLimitUpBlock:
@@ -924,3 +986,71 @@ class TestSuspensionResumeForcedSell:
             "SELECT COUNT(*) as cnt FROM orders WHERE source = 'forced_liquidation'"
         ).fetchone()
         assert forced["cnt"] == 0
+
+    def test_no_phantom_sell_after_second_suspension_cycle(self, tmp_path):
+        """After forced sell fills, a second suspension timeout must NOT
+        create a phantom sell for the already-exited position."""
+        conn = _setup_db(tmp_path)
+
+        # Cycle 1: position exists, suspension timeout -> forced sell created
+        positions = {
+            "S": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                   "buy_date": "2024-01-01", "holding_high": 10.0,
+                   "factor": 1.0}
+        }
+        oid1 = ledger_insert_order(
+            conn, "2024-01-02", "S", "sell", 100, None, "cancelled", 0,
+            "2024-01-02",
+        )
+        conn.execute(
+            "UPDATE orders SET cancel_reason = 'suspension_timeout' WHERE id = ?",
+            (oid1,),
+        )
+        conn.commit()
+
+        # Settle day 1: stock resumes, forced sell created as pending
+        prices = _make_prices("S", 10.0, volume=1e6)
+        settle_day(
+            conn, "2024-02-01", [], prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        # Fetch the forced sell from DB and settle it on day 2
+        forced_sell = conn.execute(
+            "SELECT * FROM orders WHERE source = 'forced_liquidation' "
+            "AND status = 'pending'"
+        ).fetchone()
+        assert forced_sell is not None
+        pending_order = dict(forced_sell)
+        settle_day(
+            conn, "2024-02-02", [pending_order], prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+        assert "S" not in positions
+
+        # Cycle 2: second suspension timeout for same symbol
+        oid2 = ledger_insert_order(
+            conn, "2024-02-05", "S", "sell", 100, None, "cancelled", 0,
+            "2024-02-05",
+        )
+        conn.execute(
+            "UPDATE orders SET cancel_reason = 'suspension_timeout' WHERE id = ?",
+            (oid2,),
+        )
+        conn.commit()
+
+        # Settle day 3: stock resumes, but no position -> no phantom sell
+        settle_day(
+            conn, "2024-03-01", [], prices, positions,
+            100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        # Only the original forced sell should exist
+        forced = conn.execute(
+            "SELECT COUNT(*) as cnt FROM orders "
+            "WHERE source = 'forced_liquidation' AND symbol = 'S'"
+        ).fetchone()
+        assert forced["cnt"] == 1, "only the first forced sell should exist"

@@ -3,6 +3,20 @@
 # Trading day check -> GPU inference (retry-first) -> stale fallback ->
 # pipeline with ASHARE_USE_STALE env -> pipeline retry -> alert.
 # No set -e: explicit error checks preserve retry/alert flow (R4H1).
+
+# Script self-invocation: tee all output to per-run log with reliable exit codes.
+# exec > >(tee ...) is unreliable -- pipefail doesn't cover process substitution,
+# so tee failures are invisible.  Self-invocation wraps the whole script in a
+# pipeline where pipefail DOES apply.
+REPO="$HOME/code/ashare-lab"
+RUN_LOG_DIR="$REPO/logs/pipeline"
+mkdir -p "$RUN_LOG_DIR"
+RUN_LOG="$RUN_LOG_DIR/$(date +%Y%m%d-%H%M%S).log"
+if [[ "${__PIPELINE_LOGGING:-}" != "1" ]]; then
+    export __PIPELINE_LOGGING=1
+    exec "$0" "$@" 2>&1 | tee -a "$RUN_LOG"
+fi
+
 set -uo pipefail
 
 # Pipeline mutex: prevent double execution (no flock = race window
@@ -14,7 +28,6 @@ if ! flock -w 60 8; then
     exit 1
 fi
 
-REPO="$HOME/code/ashare-lab"
 GPU_HOST="192.168.100.11"
 GPU_MAC="04:7C:16:49:BE:32"
 GPU_USER="admin"
@@ -25,6 +38,8 @@ PREDICTIONS_DIR="$REPO/predictions"
 SECONDS_START=$SECONDS
 USE_STALE=0
 PRED_ARG=""
+
+echo "=== ashare-pipeline run started at $(date -Iseconds) ==="
 
 # ---- Step 1: Trading day check (D-D13) ----
 
@@ -208,7 +223,12 @@ fi
 # Stale fallback: ONLY after all GPU retries exhausted
 if [ $GPU_RC -ne 0 ]; then
     USE_STALE=1
-    LATEST_PRED=$(find "$PREDICTIONS_DIR" -name '*.parquet' 2>/dev/null | sort | tail -1)
+    TODAY=$(date +%Y-%m-%d)
+    LATEST_PRED=$(find "$PREDICTIONS_DIR" -name '*.parquet' 2>/dev/null \
+        | awk -v today="$TODAY" '{
+            f=$0; gsub(/.*\//, "", f); gsub(/\.parquet$/, "", f)
+            if (f <= today) print
+        }' | sort | tail -1)
     if [ -z "$LATEST_PRED" ]; then
         echo "ERROR: GPU failed and no stale predictions available"
         python3 "$REPO/scripts/alert.py" "1" "gpu_inference" "$((SECONDS - SECONDS_START))" "$STDERR_LOG" || true
@@ -223,7 +243,7 @@ fi
 # ---- Step 4: Run pipeline (R3B1: ASHARE_USE_STALE env for pipeline.py) ----
 
 # shellcheck disable=SC2086
-ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>"$STDERR_LOG"
+ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>>"$STDERR_LOG"
 PIPELINE_RC=$?
 
 # Pipeline retry: 2 attempts total (1 initial + 1 retry, D-D14)
@@ -231,7 +251,7 @@ if [ $PIPELINE_RC -ne 0 ]; then
     echo "Pipeline attempt 1 failed (rc=$PIPELINE_RC), retrying in 30min"
     sleep 1800
     # shellcheck disable=SC2086
-    ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>"$STDERR_LOG"
+    ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>>"$STDERR_LOG"
     PIPELINE_RC=$?
 fi
 

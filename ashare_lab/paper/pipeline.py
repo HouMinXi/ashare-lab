@@ -483,6 +483,9 @@ class DailyRunContext:
     # Step 11 output
     ipo_cash_changed: bool = False
 
+    # Sentiment veto status (set by step 10 on failure)
+    sentiment_veto_skipped: bool = False
+
 
 def _step1_init(ctx: DailyRunContext) -> None:
     """Load config, open DB, init qlib."""
@@ -711,13 +714,26 @@ else:
                             break
                     # qlib $close is normalized (IPO day=1.0); divide by $factor
                     # to recover actual CNY price for NAV and order sizing.
-                    _factor = max(pdata.get("factor", 1.0), 1e-8)
+                    _raw_factor = pdata.get("factor")
+                    if _raw_factor is None:
+                        # Factor missing: price may be normalized but we
+                        # cannot recover real CNY. Log warning, do NOT set
+                        # adjusted=True so the sanity gate can flag it.
+                        logger.warning(
+                            "Factor missing for %s, using raw qlib close=%.4f",
+                            matched, pdata["close"],
+                        )
+                        _factor = 1.0
+                        _adjusted = False
+                    else:
+                        _factor = max(_raw_factor, 1e-8)
+                        _adjusted = True
                     ctx.prices[matched] = {
                         "close": pdata["close"] / _factor,
                         "change": pdata["change"],
                         "volume": pdata["volume"],
-                        "factor": pdata["factor"],
-                        "adjusted": True,  # price divided by factor
+                        "factor": _raw_factor if _raw_factor is not None else 1.0,
+                        "adjusted": _adjusted,
                         "threshold": get_limit_threshold(matched, ctx.st_names),
                     }
                 logger.info("fetched %d prices via subprocess", len(ctx.prices))
@@ -966,13 +982,14 @@ def _is_normalized_price(close: float, factor: float | None, adjusted: bool = Fa
     If `adjusted` is True, the price was already divided by factor — not normalized.
     Otherwise: factor < 0.1 indicates high-IPO-price stock where normalized close
     could be >= 1.0 (e.g., IPO at 500 yuan, now at 600 -> normalized close=1.2).
-    Missing factor: flag if close < 0.5 (conservative fallback).
+    Missing factor: flag if close < 5 (normalized closes are typically < 2.0,
+    while most A-share stocks trade above 5 CNY).
     """
     if adjusted:
         return False
     if factor is not None:
         return factor < 0.1
-    return close < 0.5
+    return close < 5
 
 
 def _gate_price_sanity(ctx: DailyRunContext) -> None:
@@ -1024,19 +1041,60 @@ def _step6_adjustfactor(ctx: DailyRunContext) -> None:
 
 
 def _step7_csi1000_exits(ctx: DailyRunContext) -> None:
-    """Insert sell orders for positions that have left the CSI1000 universe."""
+    """Insert sell orders for positions that have left the CSI1000 universe.
+
+    Requires consecutive absence to handle qlib one-day lag: a stock
+    must be absent for 2+ consecutive days before exit sell is created.
+    The absence counter is tracked in the position dict as
+    ``universe_absent_days``.
+    """
     universe_set = set(ctx.universe_symbols)
-    csi1000_exits = {s for s in ctx.current_positions if s not in universe_set}
     next_td_date = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
-    for s in csi1000_exits:
+    for sym, pos in ctx.current_positions.items():
+        if sym in universe_set:
+            # Stock is in universe -- reset absence counter
+            pos.pop("universe_absent_days", None)
+            continue
+        # Stock not in universe -- increment absence counter
+        absent_days = pos.get("universe_absent_days", 0) + 1
+        pos["universe_absent_days"] = absent_days
+        if absent_days < 2:
+            logger.info(
+                "CSI1000 exit: %s absent from universe (day %d/%d), waiting for confirmation",
+                sym, absent_days, 2,
+            )
+            continue
+        # Confirmed exit after consecutive absence
         existing = ctx.conn.execute(
             "SELECT id FROM orders WHERE symbol=? AND side='sell' "
             "AND status IN ('pending','carry') AND trade_date <= ?",
-            (s, ctx.trade_date),
+            (sym, ctx.trade_date),
         ).fetchone()
         if existing is None:
-            qty = ctx.current_positions[s]["qty"]
-            insert_order(ctx.conn, next_td_date, s, "sell", qty, None, "pending", 0, ctx.trade_date)
+            qty = pos["qty"]
+            insert_order(ctx.conn, next_td_date, sym, "sell", qty, None, "pending", 0, ctx.trade_date)
+            logger.info("CSI1000 exit: sell order created for %s (absent %d days)", sym, absent_days)
+
+
+def _prefetch_hedge_prices_for_settle(ctx: DailyRunContext) -> None:
+    """Fetch hedge leg prices before settle so yesterday's hedge orders can fill.
+
+    step9b_hedge_sleeve creates orders for next_td.  On the next day,
+    step8_settle needs those ETF prices in ctx.prices.  Without this
+    prefetch, step5 only fetches universe stocks and hedge legs get
+    volume=0.0 -> _is_suspended -> orders carried indefinitely.
+    """
+    hedge_cfg_dict = ctx.config.get("paper", {}).get("hedge", {})
+    if not hedge_cfg_dict.get("enabled", False):
+        return
+    from ashare_lab.paper.hedge import _load_hedge_config
+    hedge_cfg = _load_hedge_config(hedge_cfg_dict)
+    leg_symbols = [leg.symbol for leg in hedge_cfg.legs]
+    # Only fetch for legs not already in ctx.prices (step5 may have some)
+    missing = [s for s in leg_symbols if s not in ctx.prices]
+    if missing:
+        _fetch_hedge_prices(ctx, missing)
+        logger.info("hedge pre-fetch: got prices for %d legs before settle", len(missing))
 
 
 def _step8_settle(ctx: DailyRunContext) -> None:
@@ -1331,6 +1389,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
                 "halted" if veto_result.global_halted else "ok",
             )
         except Exception:
+            ctx.sentiment_veto_skipped = True
             logger.warning("Sentiment veto failed, continuing without veto", exc_info=True)
 
     # T+1 sell guard
@@ -1494,6 +1553,32 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
 
 def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
     """Commit, integrity-gated backup, golden monthly backup, cleanup, record settled."""
+    # Pre-commit NAV gate: if NAV is anomalous (>20% change), delete
+    # today's NAV row before commit to prevent corrupted data from
+    # persisting. Step 13 report gate also catches this, but the
+    # corrupted row would still be in DB for next day's risk engine.
+    try:
+        nav_rows = ctx.conn.execute(
+            "SELECT trade_date, total_nav FROM nav ORDER BY trade_date DESC LIMIT 2"
+        ).fetchall()
+        if len(nav_rows) >= 2:
+            today_nav = float(nav_rows[0]["total_nav"])
+            prev_nav = float(nav_rows[1]["total_nav"])
+            if prev_nav > 0:
+                nav_change = abs(today_nav - prev_nav) / prev_nav
+                if nav_change > 0.20:
+                    logger.error(
+                        "[pre-commit] NAV anomalous: %.0f%% change (%.0f -> %.0f), "
+                        "removing today's NAV row to prevent corrupted persistence",
+                        nav_change * 100, prev_nav, today_nav,
+                    )
+                    ctx.conn.execute(
+                        "DELETE FROM nav WHERE trade_date = ?",
+                        (ctx.trade_date,),
+                    )
+    except Exception:
+        logger.warning("[pre-commit] NAV gate check failed", exc_info=True)
+
     ctx.conn.commit()
 
     # Integrity gate: check DB health before backup
@@ -1520,65 +1605,65 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
 def _step13_report(ctx: DailyRunContext) -> None:
     """Deliver WeChat report (non-blocking)."""
-    if os.environ.get("ASHARE_USE_STALE") == "1":
-        logger.info("Skipping report: using stale predictions (GPU inference failed)")
-        return
-    # Report quality gate: NAV reasonableness
-    nav_rows = ctx.conn.execute(
-        "SELECT trade_date, total_nav FROM nav ORDER BY trade_date DESC LIMIT 2"
-    ).fetchall()
-    if len(nav_rows) >= 2:
-        today_nav = float(nav_rows[0]["total_nav"])
-        prev_nav = float(nav_rows[1]["total_nav"])
-        if prev_nav > 0:
-            nav_change = (today_nav - prev_nav) / prev_nav
-            # Suppress report only on suspiciously large GAINS
-            # (likely data error). Large LOSSES must always alert
-            # -- the operator needs to know (2024-02 crash lesson).
-            if nav_change > 0.20:
-                logger.error(
-                    "Report gate: NAV jumped %.0f%% (%.0f -> %.0f), "
-                    "likely data error, skipping report",
-                    nav_change * 100, prev_nav, today_nav)
-                return
-            if nav_change < -0.20:
-                logger.critical(
-                    "CRASH ALERT: NAV dropped %.0f%% (%.0f -> %.0f)!",
-                    abs(nav_change) * 100, prev_nav, today_nav)
-                # Immediate out-of-band alert via alert.py so the
-                # operator sees it even if the report delivery fails.
-                try:
-                    # alert.py contract: EXIT_CODE STAGE ELAPSED_S
-                    # exit_code=1 (failure signal), stage="crash_alert",
-                    # elapsed=0 (immediate, not a timed operation).
-                    subprocess.Popen(
-                        [sys.executable,
-                         str(PROJECT_ROOT / "scripts" / "alert.py"),
-                         "1", "crash_alert", "0"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    pass  # alert is best-effort
-                # Still send the report (operator MUST know).
-    # Report quality gate: normalized price detection
-    for sym, pdata in ctx.prices.items():
-        close = pdata.get("close")
-        if close is None or close <= 0:
-            continue  # missing data is not a normalized price
-        if _is_normalized_price(close, pdata.get("factor"), pdata.get("adjusted", False)):
-            logger.error("Report gate: normalized price (%s=%.4f factor=%s), skip report",
-                         sym, close, pdata.get("factor"))
-            return
-    if ctx.steps is not None and "report" not in ctx.steps:
-        return
+    logger.info("[report] entered for %s (steps=%s)", ctx.trade_date, ctx.steps)
     try:
+        if os.environ.get("ASHARE_USE_STALE") == "1":
+            logger.info("[report] skipping: stale predictions (GPU inference failed)")
+            return
+        # Report quality gate: NAV reasonableness
+        nav_rows = ctx.conn.execute(
+            "SELECT trade_date, total_nav FROM nav ORDER BY trade_date DESC LIMIT 2"
+        ).fetchall()
+        if len(nav_rows) >= 2:
+            today_nav = float(nav_rows[0]["total_nav"])
+            prev_nav = float(nav_rows[1]["total_nav"])
+            if prev_nav > 0:
+                nav_change = (today_nav - prev_nav) / prev_nav
+                if nav_change > 0.20:
+                    logger.error(
+                        "[report] gate: NAV jumped %.0f%% (%.0f -> %.0f), "
+                        "likely data error, skipping report",
+                        nav_change * 100, prev_nav, today_nav)
+                    return
+                if nav_change < -0.20:
+                    logger.critical(
+                        "[report] CRASH ALERT: NAV dropped %.0f%% (%.0f -> %.0f)!",
+                        abs(nav_change) * 100, prev_nav, today_nav)
+                    try:
+                        subprocess.Popen(
+                            [sys.executable,
+                             str(PROJECT_ROOT / "scripts" / "alert.py"),
+                             "1", "crash_alert", "0"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass  # alert is best-effort
+            else:
+                logger.info("[report] NAV gate: prev_nav=%.0f <= 0, skipping NAV check", prev_nav)
+        else:
+            logger.info("[report] NAV gate: only %d rows, skipping NAV check", len(nav_rows))
+        # Report quality gate: normalized price detection
+        for sym, pdata in ctx.prices.items():
+            close = pdata.get("close")
+            if close is None or close <= 0:
+                continue
+            if _is_normalized_price(close, pdata.get("factor"), pdata.get("adjusted", False)):
+                logger.error("[report] gate: normalized price (%s=%.4f factor=%s), skip report",
+                             sym, close, pdata.get("factor"))
+                return
+        if ctx.steps is not None and "report" not in ctx.steps:
+            logger.info("[report] skipping: steps=%s does not include 'report'", ctx.steps)
+            return
+        logger.info("[report] calling generate_and_send_report for %s", ctx.trade_date)
         from ashare_lab.paper.report import generate_and_send_report
         report_rc = generate_and_send_report(ctx.trade_date, ctx.conn, ctx.config)
         if report_rc != 0:
-            logger.warning("Report delivery failed for %s (rc=%d)", ctx.trade_date, report_rc)
+            logger.warning("[report] delivery failed for %s (rc=%d)", ctx.trade_date, report_rc)
+        else:
+            logger.info("[report] delivery succeeded for %s", ctx.trade_date)
     except Exception as exc:
-        logger.warning("Report step failed for %s: %s", ctx.trade_date, exc)
+        logger.warning("[report] step failed for %s: %s", ctx.trade_date, exc, exc_info=True)
     finally:
         ctx.conn.commit()
 
@@ -1692,6 +1777,7 @@ def run_daily(
 
     _step6_adjustfactor(ctx)
     _step7_csi1000_exits(ctx)
+    _prefetch_hedge_prices_for_settle(ctx)
     _step8_settle(ctx)
     _step9_risk_checks(ctx)
     _step9b_hedge_sleeve(ctx)

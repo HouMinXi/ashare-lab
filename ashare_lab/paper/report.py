@@ -573,6 +573,17 @@ HERMES_GATEWAY_URL = (
     os.environ.get("HERMES_GATEWAY_URL")
     or "http://127.0.0.1:8642/api/weixin/send"
 )
+HERMES_GATEWAY_BASE = HERMES_GATEWAY_URL.rsplit("/", 1)[0]  # http://127.0.0.1:8642/api/weixin
+
+
+def check_hermes_gateway(timeout: int = 5) -> bool:
+    """Return True if hermes-gateway is reachable."""
+    import requests
+    try:
+        resp = requests.get(HERMES_GATEWAY_BASE, timeout=timeout)
+        return resp.status_code < 500
+    except (requests.ConnectionError, requests.Timeout):
+        return False
 
 
 def send_via_hermes_gateway(chat_id: str, message: str, timeout: int = 15) -> bool:
@@ -636,15 +647,17 @@ _FALLBACK_PUSH = {
 
 
 def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict) -> str:
+    logger.info("[deliver] start for %s (mode=%s, text_len=%d)", trade_date, mode, len(report_text))
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
 
     try:
         wx_chat_id = _get_secret("ashare/weixin-chat-id")
-    except Exception:
+        logger.info("[deliver] secret loaded, chat_id=%s", wx_chat_id[:6] + "..." if len(wx_chat_id) > 6 else wx_chat_id)
+    except Exception as exc:
         insert_report(conn, trade_date, mode, report_text, None, "failed")
         conn.commit()
-        logger.warning("Failed to load weixin-chat-id secret, aborting delivery")
+        logger.warning("[deliver] secret load failed, aborting: %s", exc)
         return "failed"
 
     rcfg = config["paper"].get("report", {})
@@ -652,14 +665,21 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     delay = rcfg.get("ilink_chunk_delay", 0.3)
     gw_timeout = rcfg.get("ilink_timeout", 15)
 
+    if not check_hermes_gateway():
+        logger.warning("[deliver] hermes-gateway unreachable at %s, will attempt anyway", HERMES_GATEWAY_BASE)
+    else:
+        logger.info("[deliver] hermes-gateway reachable")
+
     chunks = split_report_text(report_text, max_len)
     sent_upto = 0
+    logger.info("[deliver] split into %d chunks (max_len=%d)", len(chunks), max_len)
 
     # Send chunks via hermes-gateway (persistent iLink session).
     # Retry once on failure, resuming from the last successfully sent chunk.
     def _send_via_gateway() -> None:
         nonlocal sent_upto
         for i in range(sent_upto, len(chunks)):
+            logger.info("[deliver] sending chunk %d/%d via hermes-gateway", i + 1, len(chunks))
             if not send_via_hermes_gateway(wx_chat_id, chunks[i], gw_timeout):
                 raise RuntimeError(f"gateway send failed at chunk {i}")
             sent_upto = i + 1
@@ -670,19 +690,22 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
         _send_via_gateway()
         insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
         conn.commit()
+        logger.info("[deliver] all %d chunks sent successfully", len(chunks))
         return "sent"
     except Exception as e:
-        logger.warning("hermes-gateway first attempt failed (sent %d/%d): %s", sent_upto, len(chunks), e)
+        logger.warning("[deliver] hermes-gateway attempt 1 failed (sent %d/%d): %s", sent_upto, len(chunks), e)
         time.sleep(5)
         try:
             _send_via_gateway()
             insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
             conn.commit()
+            logger.info("[deliver] retry succeeded, all chunks sent")
             return "sent"
         except Exception as e2:
-            logger.warning("hermes-gateway second attempt failed: %s", e2)
+            logger.warning("[deliver] hermes-gateway attempt 2 failed: %s", e2)
 
     fb_name = rcfg.get("fallback_service", "serverchan")
+    logger.info("[deliver] trying fallback=%s", fb_name)
     fb_entry = _FALLBACK_PUSH.get(fb_name)
     if fb_entry:
         pass_key, fn_name = fb_entry
@@ -692,9 +715,10 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
             if send_fn(fb_token, f"A股日报 {trade_date}", report_text, rcfg.get("fallback_timeout", 15)):
                 insert_report(conn, trade_date, mode, report_text, fb_name, "sent")
                 conn.commit()
+                logger.info("[deliver] fallback %s succeeded", fb_name)
                 return "sent"
         except Exception as e:
-            logger.warning("%s fallback failed: %s", fb_name, e)
+            logger.warning("[deliver] fallback %s failed: %s", fb_name, e)
     else:
         logger.warning("unknown fallback_service '%s', skipping fallback", fb_name)
 

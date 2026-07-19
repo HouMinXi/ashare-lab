@@ -129,7 +129,7 @@ def test_positions_sorted_by_change_desc(base_report):
     pos_lines = []
     in_pos = False
     for line in text.split("\n"):
-        if "持仓" in line:  # positions header
+        if "涨跌TOP" in line:  # positions header
             in_pos = True
             continue
         if in_pos and line.strip() and not line.startswith("━"):
@@ -150,12 +150,12 @@ def test_positive_change_up_triangle(base_report):
     # Find PingAn in positions section (after header), not in trades
     in_pos = False
     for line in text.split("\n"):
-        if "持仓" in line:
+        if "涨跌TOP" in line:
             in_pos = True
             continue
         if in_pos and "PingAn" in line:
-            assert "\U0001f53a" in line
-            assert "5.00%" in line
+            assert "\U0001f4c8" in line  # up chart emoji
+            assert "+5.00%" in line
             break
     else:
         pytest.fail("PingAn position line not found")
@@ -165,12 +165,12 @@ def test_negative_change_down_triangle(base_report):
     text = format_chinese_report(base_report)
     in_pos = False
     for line in text.split("\n"):
-        if "持仓" in line:
+        if "涨跌TOP" in line:
             in_pos = True
             continue
         if in_pos and "WanKe" in line:
-            assert "\U0001f53b" in line
-            assert "3.00%" in line
+            assert "\U0001f4c9" in line  # down chart emoji
+            assert "-3.00%" in line
             break
     else:
         pytest.fail("WanKe position line not found")

@@ -220,10 +220,11 @@ def test_should_notify_false_after_notification(
     assert s["should_notify"] is False
 
 
-def test_should_notify_cleared_on_regression(
+def test_should_notify_preserved_on_regression(
     conn: sqlite3.Connection,
 ) -> None:
-    """After regression, notified_at is cleared; on recovery, should_notify=True."""
+    """After regression, notified_at is preserved (not cleared) to
+    prevent re-notification spam on oscillation around threshold."""
     _fill(conn, 30)
     conn.execute(
         "INSERT OR REPLACE INTO graduation_status "
@@ -231,7 +232,7 @@ def test_should_notify_cleared_on_regression(
     )
     conn.commit()
 
-    # Add 4 stale -> gate fails -> clears notified_at
+    # Add 4 stale -> gate fails -> graduated_at cleared but notified_at kept
     for i in range(1, 5):
         insert_pipeline_run(conn, f"2026-02-{i:02d}", "stale", 10.0,
                             None, "2026-01-25")
@@ -242,7 +243,8 @@ def test_should_notify_cleared_on_regression(
     row = conn.execute(
         "SELECT notified_at FROM graduation_status WHERE id=1"
     ).fetchone()
-    assert row is None or row["notified_at"] is None
+    # notified_at preserved -- prevents re-notification on oscillation
+    assert row is not None and row["notified_at"] is not None
 
     # Add enough successes to fill the denominator window before hitting
     # any stale rows (need 30 success rows more recent than the stale rows)
@@ -255,7 +257,8 @@ def test_should_notify_cleared_on_regression(
     conn.commit()
     passed, s = check_graduation(conn)
     assert passed
-    assert s["should_notify"] is True
+    # should_notify=False because notified_at was already set (no spam)
+    assert s["should_notify"] is False
 
 
 def test_notify_graduation_writes_timestamp(
@@ -300,3 +303,67 @@ def test_notify_graduation_no_write_on_failure(
         "SELECT notified_at FROM graduation_status WHERE id=1"
     ).fetchone()
     assert row is None or row["notified_at"] is None
+
+
+# -- Duplicate-row dedup tests (trade_date no longer unique) -----------------
+
+class TestDuplicateRowDedup:
+    """After INSERT→INSERT change, trade_date can hold multiple rows.
+
+    The graduation gate must count DAYS not ROWS, and pick the latest
+    attempt per day.
+    """
+
+    def test_retried_days_count_as_one(self, conn: sqlite3.Connection) -> None:
+        """30 successful days, 2 with a transient error before retry.
+
+        The gate must see 30 days and rate 1.0, not 32 rows with 2 errors.
+        This test FAILS on 77bbcb4 (row-based counting) and PASSES after
+        the ROW_NUMBER() dedup fix.
+
+        Days 5 and 15: error first, then success (retry). Latest attempt
+        (success) wins because ROW_NUMBER uses ORDER BY created_at DESC,
+        id DESC, and the success row has a higher id.
+        """
+        for i in range(1, 31):
+            d = f"2026-01-{i:02d}"
+            # For days 5 and 15, insert error THEN success (retry)
+            if i in (5, 15):
+                insert_pipeline_run(
+                    conn, d, "error", 5.0, "transient failure", None,
+                )
+            insert_pipeline_run(conn, d, "success", 10.0, None, d)
+        conn.commit()
+
+        passed, stats = check_graduation(conn)
+
+        assert stats["denominator"] == 30, (
+            f"expected 30 days, got {stats['denominator']} "
+            f"(success={stats['success']} error={stats['error']})"
+        )
+        assert stats["success"] == 30
+        assert stats["error"] == 0
+        assert stats["rate"] == 1.0
+        assert passed is True
+
+    def test_latest_attempt_wins(self, conn: sqlite3.Connection) -> None:
+        """Day with error then success: latest (success) is used."""
+        d = "2026-01-01"
+        insert_pipeline_run(conn, d, "error", 5.0, "failed", None)
+        insert_pipeline_run(conn, d, "success", 10.0, None, d)
+        conn.commit()
+
+        passed, stats = check_graduation(conn, min_days=1)
+        assert stats["success"] == 1
+        assert stats["error"] == 0
+
+    def test_latest_attempt_wins_reverse(self, conn: sqlite3.Connection) -> None:
+        """Day with success then error: latest (error) is used."""
+        d = "2026-01-01"
+        insert_pipeline_run(conn, d, "success", 10.0, None, d)
+        insert_pipeline_run(conn, d, "error", 5.0, "failed later", None)
+        conn.commit()
+
+        passed, stats = check_graduation(conn, min_days=1)
+        assert stats["success"] == 0
+        assert stats["error"] == 1

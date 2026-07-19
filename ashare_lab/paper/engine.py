@@ -109,22 +109,6 @@ def apply_slippage(
     return close * (1.0 - slippage)
 
 
-def _check_lot_budget(
-    target_value: float, close: float, lot_size: int = 100
-) -> tuple[int, bool]:
-    """Check whether the per-stock budget can buy at least one lot.
-
-    Returns (rounded_qty, is_lot_skip).
-    """
-    if close <= 0:
-        return (0, True)
-    raw_qty = target_value / close
-    rounded = round_lots(raw_qty, "buy", lot_size)
-    if rounded == 0:
-        return (0, True)
-    return (rounded, False)
-
-
 def cap_fill_by_volume(
     target_qty: int,
     daily_volume: float,
@@ -211,13 +195,15 @@ def settle_day(
 
     with conn:
         # Step 2: process SELL orders first
-        cash = settle_sell_orders(
+        # T+1: sell proceeds are NOT available for same-day buys.
+        # settle_sell_orders returns (cash, sell_proceeds) separately.
+        cash, sell_proceeds = settle_sell_orders(
             conn, trade_date, sell_orders, prices,
             current_positions, cash, carry_days_limit,
             slippage, participation_pct, result,
         )
 
-        # Step 3: process BUY orders (after sells)
+        # Step 3: process BUY orders (after sells, using pre-sell cash only)
         cash = settle_buy_orders(
             conn, trade_date, buy_orders, prices,
             current_positions, cash, topk_symbols,
@@ -233,10 +219,13 @@ def settle_day(
         # ---------------------------------------------------------------
         # Step 6: post-trade NAV
         # ---------------------------------------------------------------
+        # T+1: sell_proceeds added to cash for next-day availability.
+        # NAV includes sell_proceeds (they are real cash, just unsettled).
+        cash_with_proceeds = cash + sell_proceeds
         result.post_trade_nav = compute_nav(
-            current_positions, prices, cash
+            current_positions, prices, cash_with_proceeds
         )
-        result.cash = cash
+        result.cash = cash_with_proceeds
 
         # ---------------------------------------------------------------
         # Step 7: equity check (D-28)

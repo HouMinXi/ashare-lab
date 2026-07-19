@@ -616,3 +616,90 @@ class TestResolvePredictionFile:
         with patch(f"{_MOD}.PREDICTIONS_DIR", tmp_path):
             result = _resolve_prediction_file("2025-06-20")
         assert result is None
+
+
+class TestPreCommitNavGate:
+    """Pre-commit NAV gate: delete anomalous NAV row before commit."""
+
+    def test_anomalous_nav_deleted_before_commit(self, tmp_path):
+        """NAV change >20% -> row deleted, preventing corrupted persistence."""
+        from ashare_lab.paper.ledger import get_connection, init_schema, record_nav
+        from ashare_lab.paper.pipeline import DailyRunContext, _step12_backup_and_finalize
+        from dataclasses import dataclass, field
+        from pathlib import Path
+        from unittest.mock import patch
+
+        db_path = tmp_path / "test.db"
+        conn = get_connection(db_path)
+        init_schema(conn)
+
+        # Insert 2 NAV rows: yesterday normal, today anomalous (+50%)
+        record_nav(conn, "2024-01-01", 100000, 200000, 300000, None, None, None, None)
+        record_nav(conn, "2024-01-02", 100000, 350000, 450000, None, None, None, None)
+        conn.commit()
+
+        # Verify both rows exist
+        count = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
+        assert count == 2
+
+        ctx = DailyRunContext(
+            trade_date="2024-01-02", force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str="",
+        )
+        ctx.conn = conn
+        ctx.db_path = db_path
+        ctx.config = {"paper": {"backup_retention_days": 7}}
+        ctx.paper_cfg = {"backup_retention_days": 7}
+
+        # Patch backup functions to avoid filesystem operations
+        with patch("ashare_lab.paper.pipeline.hot_backup_with_integrity") as mock_backup, \
+             patch("ashare_lab.paper.pipeline.create_golden_backup"), \
+             patch("ashare_lab.paper.pipeline.cleanup_old_backups"), \
+             patch("ashare_lab.paper.pipeline.record_run"):
+            mock_backup.return_value = type("R", (), {"success": True})()
+            _step12_backup_and_finalize(ctx)
+
+        # Today's anomalous NAV row should be deleted
+        rows = conn.execute(
+            "SELECT trade_date, total_nav FROM nav ORDER BY trade_date"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["trade_date"] == "2024-01-01"
+        assert rows[0]["total_nav"] == 300000.0
+        conn.close()
+
+    def test_normal_nav_preserved(self, tmp_path):
+        """NAV change <20% -> row preserved."""
+        from ashare_lab.paper.ledger import get_connection, init_schema, record_nav
+        from ashare_lab.paper.pipeline import DailyRunContext, _step12_backup_and_finalize
+        from unittest.mock import patch
+
+        db_path = tmp_path / "test.db"
+        conn = get_connection(db_path)
+        init_schema(conn)
+
+        # Insert 2 NAV rows: both normal (+5%)
+        record_nav(conn, "2024-01-01", 100000, 200000, 300000, None, None, None, None)
+        record_nav(conn, "2024-01-02", 100000, 205000, 305000, None, None, None, None)
+        conn.commit()
+
+        ctx = DailyRunContext(
+            trade_date="2024-01-02", force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str="",
+        )
+        ctx.conn = conn
+        ctx.db_path = db_path
+        ctx.config = {"paper": {"backup_retention_days": 7}}
+        ctx.paper_cfg = {"backup_retention_days": 7}
+
+        with patch("ashare_lab.paper.pipeline.hot_backup_with_integrity") as mock_backup, \
+             patch("ashare_lab.paper.pipeline.create_golden_backup"), \
+             patch("ashare_lab.paper.pipeline.cleanup_old_backups"), \
+             patch("ashare_lab.paper.pipeline.record_run"):
+            mock_backup.return_value = type("R", (), {"success": True})()
+            _step12_backup_and_finalize(ctx)
+
+        # Both rows preserved
+        count = conn.execute("SELECT COUNT(*) FROM nav").fetchone()[0]
+        assert count == 2
+        conn.close()

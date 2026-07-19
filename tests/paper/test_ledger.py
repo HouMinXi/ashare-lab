@@ -756,3 +756,101 @@ class TestFindAndRestoreBackup:
         backup_dir.mkdir()
 
         assert restore_from_backup(db_path, backup_dir) is False
+
+
+# ---------------------------------------------------------------------------
+# Migration tests
+# ---------------------------------------------------------------------------
+
+
+class TestAuditTableMigration:
+    """init_schema migrates old-schema audit tables to auto-increment id."""
+
+    @staticmethod
+    def _create_old_schema_db(path: Path) -> None:
+        """Build a database with the pre-migration schema for reports/pipeline_runs."""
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS reports (
+                trade_date TEXT PRIMARY KEY,
+                mode       TEXT NOT NULL,
+                report_text TEXT NOT NULL,
+                delivered_via TEXT,
+                delivery_status TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                trade_date TEXT PRIMARY KEY,
+                status     TEXT NOT NULL,
+                duration_s REAL NOT NULL,
+                error_msg  TEXT,
+                predictions_date TEXT,
+                created_at TEXT NOT NULL
+            );
+        """)
+        conn.execute(
+            "INSERT INTO reports VALUES (?, ?, ?, ?, ?, ?)",
+            ("2025-01-01", "daily", "old report", None, "sent", "2025-01-01T10:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO pipeline_runs VALUES (?, ?, ?, ?, ?, ?)",
+            ("2025-01-01", "success", 12.5, None, None, "2025-01-01T10:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_init_schema_migrates_old_db(self, tmp_path: Path) -> None:
+        """init_schema on old-schema DB: no crash, id present, rows preserved, indexes present."""
+        db_path = tmp_path / "old.db"
+        self._create_old_schema_db(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        # Must not raise -- before the fix this was OperationalError: no such column: id
+        init_schema(conn)
+
+        # id column present
+        report_cols = {r[1] for r in conn.execute("PRAGMA table_info(reports)").fetchall()}
+        assert "id" in report_cols, f"reports missing id column: {report_cols}"
+        run_cols = {r[1] for r in conn.execute("PRAGMA table_info(pipeline_runs)").fetchall()}
+        assert "id" in run_cols, f"pipeline_runs missing id column: {run_cols}"
+
+        # seeded rows preserved
+        assert conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 1
+
+        # indexes present
+        idx_names = {r[1] for r in conn.execute("PRAGMA index_list(reports)").fetchall()}
+        assert "idx_report_td_created" in idx_names
+        idx_names2 = {r[1] for r in conn.execute("PRAGMA index_list(pipeline_runs)").fetchall()}
+        assert "idx_pipeline_runs_td_created" in idx_names2
+
+        # two same-date inserts both survive (INSERT append, not INSERT OR REPLACE)
+        from ashare_lab.paper.ledger import insert_report, insert_pipeline_run
+        insert_report(conn, "2025-01-01", "daily", "new report", None, "sent")
+        insert_pipeline_run(conn, "2025-01-01", "success", 8.0, None, None)
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM pipeline_runs").fetchone()[0] == 2
+
+        conn.close()
+
+    def test_init_schema_fresh_db(self, tmp_path: Path) -> None:
+        """init_schema on empty DB: everything created normally."""
+        db_path = tmp_path / "fresh.db"
+        conn = sqlite3.connect(str(db_path))
+        init_schema(conn)
+
+        report_cols = {r[1] for r in conn.execute("PRAGMA table_info(reports)").fetchall()}
+        assert "id" in report_cols
+        idx_names = {r[1] for r in conn.execute("PRAGMA index_list(reports)").fetchall()}
+        assert "idx_report_td_created" in idx_names
+
+        conn.close()
+
+    def test_migration_already_migrated(self, tmp_path: Path) -> None:
+        """init_schema on already-migrated DB: no-op, no crash."""
+        db_path = tmp_path / "migrated.db"
+        conn = sqlite3.connect(str(db_path))
+        init_schema(conn)  # creates with new schema
+        init_schema(conn)  # second call should be idempotent
+        conn.close()

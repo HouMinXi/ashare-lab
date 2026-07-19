@@ -31,8 +31,13 @@ def settle_sell_orders(
     slippage: float,
     participation_pct: float,
     result,  # SettleResult
-) -> float:
-    """Process sell orders. Returns updated cash."""
+) -> tuple[float, float]:
+    """Process sell orders. Returns (cash, sell_proceeds).
+
+    sell_proceeds is the total cash received from sells (T+1: not
+    available for same-day buys, but available next trading day).
+    """
+    sell_proceeds = 0.0
     for order in sell_orders:
         oid = order["id"]
         symbol = order["symbol"]
@@ -169,8 +174,9 @@ def settle_sell_orders(
             pos["qty"] = new_qty
             pos["market_value"] = new_qty * close
 
-        # Cash proceeds = notional - fees
-        cash += notional - fees.total
+        # Cash proceeds = notional - fees (T+1: not available same day)
+        proceeds = notional - fees.total
+        sell_proceeds += proceeds
 
         result.fills.append(
             {
@@ -183,7 +189,7 @@ def settle_sell_orders(
             }
         )
 
-    return cash
+    return cash, sell_proceeds
 
 
 def settle_buy_orders(
@@ -275,6 +281,31 @@ def settle_buy_orders(
 
         # Cash check (D-25)
         fill_price_est = _apply_slippage(close, "buy", slippage)
+
+        # Carry order re-sizing: if this is a carry order and the
+        # estimated cost exceeds 10% of current cash, scale down
+        # target_qty.  Orders are sized at creation-time NAV; after
+        # a market decline the original qty may be oversized relative
+        # to current portfolio value.  The 10% cap prevents a single
+        # carry order from consuming more than its fair share of cash.
+        if carry_day > 0 and fill_price_est > 0:
+            est_cost = fill_price_est * target_qty
+            max_cost = cash * 0.10
+            if est_cost > max_cost and max_cost >= fill_price_est * 100:
+                new_qty = min(
+                    target_qty,
+                    int(max_cost / fill_price_est / 100) * 100,
+                )
+                if new_qty >= 100 and new_qty < target_qty:
+                    logger.info(
+                        "Carry re-size: %s qty %d -> %d (cost %.0f -> %.0f, "
+                        "cash=%.0f)",
+                        symbol, target_qty, new_qty, est_cost,
+                        new_qty * fill_price_est, cash,
+                    )
+                    target_qty = new_qty
+                    # Recalculate est_cost after re-size
+                    est_cost = fill_price_est * target_qty
         est_cost = fill_price_est * target_qty
         fees_est = calculate_fees(est_cost, "buy")
         total_cost_est = est_cost + fees_est.total
@@ -372,6 +403,8 @@ def settle_buy_orders(
                 pos["avg_cost"] = (
                     (old_avg * old_qty + fill_price * fill_qty) / new_qty
                 )
+            else:
+                pos["avg_cost"] = 0.0
             pos["qty"] = new_qty
             pos["market_value"] = new_qty * close
             pos["holding_high"] = max(
@@ -411,8 +444,12 @@ def check_suspension_resume(
     cancelled_suspended = conn.execute(
         "SELECT id, symbol, side, target_qty FROM orders "
         "WHERE cancel_reason = 'suspension_timeout' "
-        "AND trade_date <= ?",
-        (trade_date,),
+        "AND trade_date <= ? "
+        "AND id = (SELECT MAX(o2.id) FROM orders o2 "
+        "          WHERE o2.symbol = orders.symbol "
+        "          AND o2.cancel_reason = 'suspension_timeout' "
+        "          AND o2.trade_date <= ?)",
+        (trade_date, trade_date),
     ).fetchall()
     for crow in cancelled_suspended:
         csym = crow["symbol"]
@@ -513,6 +550,8 @@ def _cap_fill_by_volume(
     participation_pct: float,
 ) -> int:
     """Cap fill quantity by volume participation."""
+    if not math.isfinite(volume):
+        return target_qty if volume > 0 else 0
     if volume <= 0:
         return 0
     max_qty = int(volume * participation_pct)

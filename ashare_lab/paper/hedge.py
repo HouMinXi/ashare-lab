@@ -459,11 +459,14 @@ def _fetch_hedge_prices(ctx: "DailyRunContext", leg_symbols: list[str]) -> None:
             logger.warning("hedge price fetch failed for %s", sym, exc_info=True)
             continue
 
-        # ETF spot API returns price only; placeholders for pipeline compatibility
+        # ETF spot API returns price only; placeholders for pipeline compatibility.
+        # Large finite volume: ETFs are always liquid, but inf would
+        # crash int(volume * pct) in _cap_fill_by_volume if it ever
+        # reaches settle.  1e12 is above any real daily volume.
         ctx.prices[sym] = {
             "close": close,
             "factor": 1.0,
             "change": 0.0,
-            "volume": 0.0,
+            "volume": 1e12,
             "threshold": 0.10,
         }

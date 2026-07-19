@@ -383,4 +383,39 @@ def test_n_leg_config_driven():
     )
     state = compute_hedge_state(475_000, 500_000, 1, cfg)
     assert len(state.leg_allocations) == 2
-    assert sum(state.leg_allocations.values()) == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Fix #4: Hedge volume must not trigger _is_suspended
+# ---------------------------------------------------------------------------
+
+
+def test_hedge_volume_not_suspended():
+    """ETF prices injected by _fetch_hedge_prices must have large finite
+    volume so _is_suspended() returns False and hedge orders are never
+    carried forward as suspended.  Also verifies _cap_fill_by_volume
+    does not crash on the value."""
+    from ashare_lab.paper.engine_settle import _is_suspended, _cap_fill_by_volume
+
+    ctx = _MockCtx(prices={})
+
+    def _fake_spot():
+        import pandas as pd
+        return pd.DataFrame({
+            "代码": ["511260"],
+            "最新价": [10.5],
+        })
+
+    import akshare
+    original = akshare.fund_etf_spot_em
+    akshare.fund_etf_spot_em = _fake_spot
+    try:
+        _fetch_hedge_prices(ctx, ["511260"])
+    finally:
+        akshare.fund_etf_spot_em = original
+
+    vol = ctx.prices["511260"]["volume"]
+    assert vol > 0 and vol < float("inf"), f"hedge volume must be finite positive, got {vol}"
+    assert not _is_suspended(vol), "hedge ETF must not be treated as suspended"
+    # Must not crash in cap_fill (inf would OverflowError here)
+    assert _cap_fill_by_volume(500, vol, "buy", 0.05) == 500

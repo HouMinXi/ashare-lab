@@ -220,23 +220,27 @@ def test_send_pushplus(mock_post):
     kwargs = mock_post.call_args[1]
     assert kwargs["json"]["token"] == "tok"
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
-def test_deliver_report_ilink_success(mock_gw, mock_sec, db_conn):
+def test_deliver_report_ilink_success(mock_gw, mock_sec, mock_hc, db_conn):
     mock_sec.return_value = "token"
     mock_gw.return_value = True
+    mock_hc.return_value = True
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
 @patch("time.sleep")
-def test_deliver_report_ilink_retry(mock_sleep, mock_gw, mock_sec, db_conn):
+def test_deliver_report_ilink_retry(mock_sleep, mock_gw, mock_sec, mock_hc, db_conn):
     mock_sec.return_value = "token"
     mock_gw.side_effect = [False, True]
+    mock_hc.return_value = True
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
 
 @patch("requests.post")
@@ -247,54 +251,63 @@ def test_send_serverchan(mock_post):
     assert "sctapi.ftqq.com/SCTxxx.send" in args[0][0]
     assert args[1]["data"]["text"] == "title"
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
 @patch("ashare_lab.paper.report.send_serverchan")
 @patch("time.sleep")
-def test_deliver_report_fallback(mock_sleep, mock_sc, mock_gw, mock_sec, db_conn):
+def test_deliver_report_fallback(mock_sleep, mock_sc, mock_gw, mock_sec, mock_hc, db_conn):
     mock_sec.return_value = "token"
     mock_gw.return_value = False
     mock_sc.return_value = True
+    mock_hc.return_value = True
     cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "serverchan"
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
 @patch("ashare_lab.paper.report.send_serverchan")
 @patch("time.sleep")
-def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_gw, mock_sec, db_conn):
+def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_gw, mock_sec, mock_hc, db_conn):
     mock_sec.return_value = "token"
     mock_gw.return_value = False
     mock_sc.return_value = False
+    mock_hc.return_value = True
     cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "failed"
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivery_status"] == "failed"
 
 def test_deliver_report_saves_always(db_conn):
-    with patch("ashare_lab.paper.report._get_secret", side_effect=Exception("err")):
+    with patch("ashare_lab.paper.report._get_secret", side_effect=Exception("err")), \
+         patch("ashare_lab.paper.report.check_hermes_gateway", return_value=True):
         deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}})
-    r = db_conn.execute("SELECT * FROM reports").fetchone()
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r is not None
     assert r["delivery_status"] == "failed"
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
 @patch("time.sleep")
-def test_deliver_report_splits(mock_sleep, mock_gw, mock_sec, db_conn):
+def test_deliver_report_splits(mock_sleep, mock_gw, mock_sec, mock_hc, db_conn):
     mock_sec.return_value = "token"
     mock_gw.return_value = True
+    mock_hc.return_value = True
     deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, {"paper":{"report":{"ilink_max_message_length":4000}}})
     assert mock_gw.call_count == 2
 
+@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report.send_via_hermes_gateway")
 @patch("time.sleep")
-def test_deliver_report_retry_resumes_from_sent(mock_tsleep, mock_gw, mock_sec, db_conn):
+def test_deliver_report_retry_resumes_from_sent(mock_tsleep, mock_gw, mock_sec, mock_hc, db_conn):
     """F2: retry must resume from last successfully sent chunk, not re-send from 0."""
     mock_sec.return_value = "token"
+    mock_hc.return_value = True
     call_count = [0]
     sent_chunk_indices = []
 
@@ -324,7 +337,7 @@ def test_generate_and_send_report_dry_run(populated_db, paper_config):
     paper_config["report"] = {}
     rc = generate_and_send_report("2025-01-06", populated_db, {"paper": paper_config}, dry_run=True)
     assert rc == 0
-    r = populated_db.execute("SELECT * FROM reports").fetchone()
+    r = populated_db.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivery_status"] == "dry_run"
 
 @patch("ashare_lab.paper.report.deliver_report")
