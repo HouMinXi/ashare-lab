@@ -154,14 +154,14 @@ paper:
     llm_base_url: "http://localhost:20129/v1"
     llm_model: "auto/cheap"
     llm_api_key_pass: "api/omniroute"
-    llm_timeout: 30
+    llm_timeout: 300
     llm_extra_body: {"stream": false}
   report:
     # LLM config -- see sentiment section above for supported providers.
     llm_base_url: "http://localhost:20129/v1"
     llm_model: "auto/best-fast"
     llm_api_key_pass: "api/omniroute"
-    llm_timeout: 30
+    llm_timeout: 300
     llm_extra_body: {"stream": false}
     ilink_timeout: 15
     ilink_max_message_length: 4000
