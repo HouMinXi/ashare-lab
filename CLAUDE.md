@@ -150,3 +150,23 @@ Incidence evidence: `bump_suspension_carry_days` was added to ledger.py and call
 - **Import smoke test is NOT sufficient.** `python3 -c "from ashare_lab.paper.pipeline import run_daily"` only verifies the import chain resolves. It does NOT verify the function bodies execute without NameError on missing imports that are called deeper in the code path.
 - **New function checklist**: when adding a function to any module, verify: (1) it is imported in every file that calls it, (2) it is mocked in every test file that exercises the calling code path, (3) it is actually called (not dead code).
 - **Forge review is required for all logic-bearing changes.** 3 rounds minimum, fix all confirmed findings before committing. This applies even to "trivial" wiring changes like adding a function call to an aggregator.
+
+## GPU Script Testing Safety (2026-07-22)
+
+Incident: subagent testing `gpu-switch.bat ollama` killed llama-server, breaking trinity-router's inference session.
+
+- **Never test `ollama` or `training-3080` targets during automated runs.** These targets stop llama-server, which is shared with trinity-router on GPU 0. Only test `training` (stops OllamaService only) and `llama-server` (restores after training).
+- **Safe test sequence**: `gpu-switch training` → verify → `gpu-switch llama-server` → verify. Never call `gpu-switch ollama` from a subagent or automated script.
+- **OllamaService is manual-start only.** It has `CUDA_VISIBLE_DEVICES=0` pinned. Starting it while llama-server is running will conflict. If OllamaService needs to run, stop llama-server first — but this is a human decision, not an automated one.
+- **Include this rule in all subagent prompts that SSH to win-gpu.** Add: "只测试 training 和 llama-server 目标，禁止测试 ollama 和 training-3080"
+
+
+## Commit Message Hygiene (2026-07-19)
+
+Never use severity labels (P0/P1/P2), review vocabulary (Layer N, finding #N),
+or plan/task IDs in commit messages. Git readers cannot see our review context.
+Use direct impact descriptions instead:
+  BAD:  "P0: fix NAV gate crash alert suppression"
+  GOOD: "fix NAV gate suppressing crash alerts on real market crashes"
+  BAD:  "add Layer 2/3 tests for hedge volume"
+  GOOD: "add isfinite guard and prefetch ordering tests for hedge volume"
