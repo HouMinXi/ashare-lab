@@ -1,13 +1,12 @@
 """Unit tests for report generation and delivery."""
 
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 from ashare_lab.paper.report import (
     ReportData, gather_report_data, format_chinese_report,
     split_report_text, send_text_ilink, send_pushplus, send_serverchan,
-    send_via_hermes_gateway, deliver_report,
-    generate_and_send_report, _get_secret
+    deliver_report, generate_and_send_report, _get_secret
 )
 
 # -------------------------------------------------------------------
@@ -220,28 +219,52 @@ def test_send_pushplus(mock_post):
     kwargs = mock_post.call_args[1]
     assert kwargs["json"]["token"] == "tok"
 
-@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
-def test_deliver_report_ilink_success(mock_gw, mock_sec, mock_hc, db_conn):
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
+def test_deliver_report_ilink_success(mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    mock_gw.return_value = True
-    mock_hc.return_value = True
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
 
-@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
 @patch("time.sleep")
-def test_deliver_report_ilink_retry(mock_sleep, mock_gw, mock_sec, mock_hc, db_conn):
+def test_deliver_report_ilink_retry(mock_sleep, mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    mock_gw.side_effect = [False, True]
-    mock_hc.return_value = True
+    mock_ilink.side_effect = [Exception("fail"), None]
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
+
+@patch("ashare_lab.paper.report._get_secret")
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
+@patch("time.sleep")
+def test_deliver_report_retry_resumes_from_sent_chunk(mock_sleep, mock_ilink, mock_sec, db_conn):
+    """Retry must resume from the last successfully sent chunk, not from 0."""
+    mock_sec.return_value = "token"
+    # Use enough text to produce multiple chunks.
+    cfg = {"paper": {"report": {"ilink_max_message_length": 20}}}
+    text = "A" * 60  # -> 3 chunks of 20
+
+    call_count = {"n": 0}
+    resume_log = []
+
+    async def side_effect_fn(*args, **kwargs):
+        sent_upto = kwargs.get("sent_upto")
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Simulate: chunk 0 sent successfully, chunk 1 fails.
+            sent_upto[0] = 1
+            raise Exception("transient network error")
+        else:
+            # On retry, verify we resume from chunk 1, not 0.
+            resume_log.append(sent_upto[0])
+
+    mock_ilink.side_effect = side_effect_fn
+    assert deliver_report(db_conn, "2025-01-06", "simple", text, cfg) == "sent"
+    assert call_count["n"] == 2
+    assert resume_log == [1], f"retry should resume from chunk 1, got {resume_log}"
 
 @patch("requests.post")
 def test_send_serverchan(mock_post):
@@ -251,85 +274,48 @@ def test_send_serverchan(mock_post):
     assert "sctapi.ftqq.com/SCTxxx.send" in args[0][0]
     assert args[1]["data"]["text"] == "title"
 
-@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
 @patch("ashare_lab.paper.report.send_serverchan")
 @patch("time.sleep")
-def test_deliver_report_fallback(mock_sleep, mock_sc, mock_gw, mock_sec, mock_hc, db_conn):
+def test_deliver_report_fallback(mock_sleep, mock_sc, mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    mock_gw.return_value = False
+    mock_ilink.side_effect = Exception("iLink down")
     mock_sc.return_value = True
-    mock_hc.return_value = True
     cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "serverchan"
 
-@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
 @patch("ashare_lab.paper.report.send_serverchan")
 @patch("time.sleep")
-def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_gw, mock_sec, mock_hc, db_conn):
+def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    mock_gw.return_value = False
+    mock_ilink.side_effect = Exception("iLink down")
     mock_sc.return_value = False
-    mock_hc.return_value = True
     cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "failed"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivery_status"] == "failed"
 
 def test_deliver_report_saves_always(db_conn):
-    with patch("ashare_lab.paper.report._get_secret", side_effect=Exception("err")), \
-         patch("ashare_lab.paper.report.check_hermes_gateway", return_value=True):
+    with patch("ashare_lab.paper.report._get_secret", side_effect=Exception("err")):
         deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}})
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r is not None
     assert r["delivery_status"] == "failed"
 
-@patch("ashare_lab.paper.report.check_hermes_gateway")
 @patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
-@patch("time.sleep")
-def test_deliver_report_splits(mock_sleep, mock_gw, mock_sec, mock_hc, db_conn):
+@patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
+def test_deliver_report_splits(mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    mock_gw.return_value = True
-    mock_hc.return_value = True
     deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, {"paper":{"report":{"ilink_max_message_length":4000}}})
-    assert mock_gw.call_count == 2
-
-@patch("ashare_lab.paper.report.check_hermes_gateway")
-@patch("ashare_lab.paper.report._get_secret")
-@patch("ashare_lab.paper.report.send_via_hermes_gateway")
-@patch("time.sleep")
-def test_deliver_report_retry_resumes_from_sent(mock_tsleep, mock_gw, mock_sec, mock_hc, db_conn):
-    """F2: retry must resume from last successfully sent chunk, not re-send from 0."""
-    mock_sec.return_value = "token"
-    mock_hc.return_value = True
-    call_count = [0]
-    sent_chunk_indices = []
-
-    def gw_side_effect(chat_id, text, timeout=15):
-        call_count[0] += 1
-        # Fail on the 3rd call (chunk 2 of first attempt)
-        if call_count[0] == 3:
-            return False
-        sent_chunk_indices.append(text)
-        return True
-
-    mock_gw.side_effect = gw_side_effect
-
-    # 3 chunks: force small max_length so "x"*5000 splits into 3
-    cfg = {"paper": {"report": {"ilink_max_message_length": 2000}}}
-    result = deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, cfg)
-    assert result == "sent"
-    # Total calls: 2 (first attempt chunks 0,1) + 1 fail (chunk 2) + 1 retry (chunk 2 only) = 4
-    assert mock_gw.call_count == 4, f"expected 4 calls (2 ok + 1 fail + 1 retry), got {mock_gw.call_count}"
-    # Verify no duplicate: each chunk text should appear exactly once in sent_chunk_indices
-    # Chunks 0 and 1 were sent once in first attempt, chunk 2 failed then succeeded on retry
-    assert len(sent_chunk_indices) == 3, f"expected 3 successful sends, got {len(sent_chunk_indices)}"
+    assert mock_ilink.call_count == 1
+    # Verify chunks arg has 2 elements
+    chunks_arg = mock_ilink.call_args[0][0]
+    assert len(chunks_arg) == 2
 
 
 # Integration

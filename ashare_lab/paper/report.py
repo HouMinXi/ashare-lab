@@ -646,14 +646,40 @@ _FALLBACK_PUSH = {
 }
 
 
+async def _send_via_ilink(chunks: list[str], chat_id: str, token: str,
+                          timeout: int = 15, delay: float = 0.3,
+                          sent_upto: list[int] | None = None) -> None:
+    """Send report chunks directly via iLink API (same path as DSA sentinel).
+
+    *sent_upto* is a single-element list ``[n]`` that tracks the index of the
+    next chunk to send.  It is updated **after** each successful delivery so
+    that callers can resume from the right position on retry.  When *None*,
+    defaults to ``[0]`` (send everything).
+    """
+    if sent_upto is None:
+        sent_upto = [0]
+    import aiohttp
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as session:
+        for i in range(sent_upto[0], len(chunks)):
+            await send_text_ilink(session, token, chat_id, chunks[i], timeout=timeout)
+            sent_upto[0] = i + 1
+            logger.info("[deliver] iLink chunk %d/%d sent", i + 1, len(chunks))
+            if i < len(chunks) - 1:
+                await asyncio.sleep(delay)
+
+
 def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict) -> str:
     logger.info("[deliver] start for %s (mode=%s, text_len=%d)", trade_date, mode, len(report_text))
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
 
     try:
+        wx_token = _get_secret("ashare/weixin-token")
         wx_chat_id = _get_secret("ashare/weixin-chat-id")
-        logger.info("[deliver] secret loaded, chat_id=%s", wx_chat_id[:6] + "..." if len(wx_chat_id) > 6 else wx_chat_id)
+        logger.info("[deliver] secrets loaded, chat_id=%s",
+                    wx_chat_id[:6] + "..." if len(wx_chat_id) > 6 else wx_chat_id)
     except Exception as exc:
         insert_report(conn, trade_date, mode, report_text, None, "failed")
         conn.commit()
@@ -663,46 +689,38 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     rcfg = config["paper"].get("report", {})
     max_len = rcfg.get("ilink_max_message_length", 4000)
     delay = rcfg.get("ilink_chunk_delay", 0.3)
-    gw_timeout = rcfg.get("ilink_timeout", 15)
-
-    if not check_hermes_gateway():
-        logger.warning("[deliver] hermes-gateway unreachable at %s, will attempt anyway", HERMES_GATEWAY_BASE)
-    else:
-        logger.info("[deliver] hermes-gateway reachable")
+    ilink_timeout = rcfg.get("ilink_timeout", 15)
 
     chunks = split_report_text(report_text, max_len)
-    sent_upto = 0
     logger.info("[deliver] split into %d chunks (max_len=%d)", len(chunks), max_len)
 
-    # Send chunks via hermes-gateway (persistent iLink session).
+    # Primary path: send directly via iLink API (same as DSA sentinel).
     # Retry once on failure, resuming from the last successfully sent chunk.
-    def _send_via_gateway() -> None:
-        nonlocal sent_upto
-        for i in range(sent_upto, len(chunks)):
-            logger.info("[deliver] sending chunk %d/%d via hermes-gateway", i + 1, len(chunks))
-            if not send_via_hermes_gateway(wx_chat_id, chunks[i], gw_timeout):
-                raise RuntimeError(f"gateway send failed at chunk {i}")
-            sent_upto = i + 1
-            if i < len(chunks) - 1:
-                time.sleep(delay)
-
-    try:
-        _send_via_gateway()
-        insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
-        conn.commit()
-        logger.info("[deliver] all %d chunks sent successfully", len(chunks))
-        return "sent"
-    except Exception as e:
-        logger.warning("[deliver] hermes-gateway attempt 1 failed (sent %d/%d): %s", sent_upto, len(chunks), e)
-        time.sleep(5)
+    sent_upto = [0]
+    for attempt in range(2):
         try:
-            _send_via_gateway()
+            coro = _send_via_ilink(chunks, wx_chat_id, wx_token,
+                                   timeout=ilink_timeout, delay=delay,
+                                   sent_upto=sent_upto)
+            try:
+                asyncio.get_running_loop()
+                # Already inside an event loop (Jupyter, async runner).
+                # Run the coroutine in a dedicated thread with its own loop.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    pool.submit(asyncio.run, coro).result()
+            except RuntimeError:
+                # No running event loop -- safe to use asyncio.run().
+                asyncio.run(coro)
             insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
             conn.commit()
-            logger.info("[deliver] retry succeeded, all chunks sent")
+            logger.info("[deliver] all %d chunks sent via iLink (attempt %d)", len(chunks), attempt + 1)
             return "sent"
-        except Exception as e2:
-            logger.warning("[deliver] hermes-gateway attempt 2 failed: %s", e2)
+        except Exception as e:
+            logger.warning("[deliver] iLink attempt %d failed at chunk %d: %s",
+                           attempt + 1, sent_upto[0], e)
+            if attempt == 0:
+                time.sleep(5)
 
     fb_name = rcfg.get("fallback_service", "serverchan")
     logger.info("[deliver] trying fallback=%s", fb_name)
