@@ -554,8 +554,9 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
         logger.warning("chenditc refresh failed (%s), trying baostock fallback", exc)
         try:
             from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
-            yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
-            rc = gap_fill(yesterday, ctx.trade_date)
+            from ashare_lab.data.calendar import previous_trading_day  # noqa: PLC0415
+            start_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+            rc = gap_fill(start_date, ctx.trade_date)
             if rc == 0:
                 logger.info("baostock fallback succeeded for %s", ctx.trade_date)
                 stale = 0
