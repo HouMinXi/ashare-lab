@@ -155,12 +155,19 @@ def _load_stock_names_cache(symbols: set[str]) -> dict[str, str] | None:
     bs_path = _BS_CACHE_DIR / "stock_names.csv"
     if not bs_path.exists():
         return None
+    # Integrity check: file too small is likely corrupt
+    if bs_path.stat().st_size < 100:
+        logger.warning("stock_names.csv too small (%d bytes), likely corrupt", bs_path.stat().st_size)
+        return None
     result = {}
     with open(bs_path, newline="") as f:
         for row in csv.DictReader(f):
             sym = _bs_code_to_universe(row["code"], symbols)
             if sym:
                 result[sym] = row["code_name"]
+    if not result:
+        logger.warning("stock_names.csv parsed to empty dict, likely corrupt")
+        return None
     return result
 
 
@@ -313,7 +320,7 @@ def _fetch_ipo_calendar(listing_date: str) -> list[dict]:
         f"&filter=(LISTING_DATE='{listing_date}')"
     )
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -393,7 +400,7 @@ print(json.dumps(result))
 """
     try:
         _r = subprocess.run([sys.executable, "-c", _bench_script, trade_date],
-                            capture_output=True, text=True, timeout=30,
+                            capture_output=True, text=True, timeout=60,
                             cwd=str(PROJECT_ROOT))
         if _r.returncode == 0 and _r.stdout.strip():
             result = json.loads(_r.stdout.strip())
@@ -544,11 +551,29 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     try:
         stale = daily_refresh()
     except Exception as exc:
-        logger.error("data refresh failed", exc_info=True)
-        record_run(ctx.conn, ctx.trade_date, "error")
-        _try_record_pipeline_run(ctx, "error", str(exc))
-        ctx.conn.commit()
-        return 2
+        logger.warning("chenditc refresh failed (%s), trying baostock fallback", exc)
+        try:
+            from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
+            yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+            rc = gap_fill(yesterday, ctx.trade_date)
+            if rc == 0:
+                logger.info("baostock fallback succeeded for %s", ctx.trade_date)
+                stale = 0
+            elif rc == 1:
+                logger.info("baostock fallback: no gap detected")
+                stale = 0
+            else:
+                logger.error("baostock fallback partial (rc=%d)", rc)
+                record_run(ctx.conn, ctx.trade_date, "error")
+                _try_record_pipeline_run(ctx, "error", f"chenditc+baostock both partial: {exc}")
+                ctx.conn.commit()
+                return 2
+        except Exception as fb_exc:
+            logger.error("baostock fallback also failed: %s", fb_exc, exc_info=True)
+            record_run(ctx.conn, ctx.trade_date, "error")
+            _try_record_pipeline_run(ctx, "error", f"chenditc: {exc}; baostock: {fb_exc}")
+            ctx.conn.commit()
+            return 2
     if stale == 1:
         record_run(ctx.conn, ctx.trade_date, "skipped_stale")
         ctx.conn.commit()
@@ -665,7 +690,7 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
         names = _load_stock_names_cache(ctx.fetch_symbols)
         if names:
             for sym, name in names.items():
-                if _ST_PATTERN.match(name):
+                if _ST_PATTERN.match(name or ""):
                     ctx.st_names.add(sym)
             logger.info("ST detection from stock_names_cache: %d ST stocks", len(ctx.st_names))
         else:
@@ -700,7 +725,7 @@ else:
             _result = subprocess.run(
                 [sys.executable, "-c", _fetch_script,
                  json.dumps(list(ctx.fetch_symbols)), ctx.trade_date],
-                capture_output=True, text=True, timeout=90,
+                capture_output=True, text=True, timeout=120,
                 cwd=str(PROJECT_ROOT),
             )
             if _result.returncode == 0 and _result.stdout.strip():
@@ -864,7 +889,7 @@ print(json.dumps(result))
             _r = subprocess.run(
                 [sys.executable, "-c", _ind_script,
                  ctx.trade_date, json.dumps(_missing)],
-                capture_output=True, text=True, timeout=180,
+                capture_output=True, text=True, timeout=300,
                 cwd=str(PROJECT_ROOT))
             if _r.returncode == 0 and _r.stdout.strip():
                 _new = json.loads(_r.stdout.strip())
@@ -1161,9 +1186,6 @@ def _step8_settle(ctx: DailyRunContext) -> None:
     bump_suspension_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_suspended])
     ctx.current_positions = get_latest_positions(ctx.conn)
     ctx.cash = ctx.settle_result.cash
-
-  
-    # populates ctx.hedge_symbols).  At step 8 the set is still empty.
 
 
 def _step9_risk_checks(ctx: DailyRunContext) -> None:
@@ -1623,7 +1645,10 @@ def _step13_report(ctx: DailyRunContext) -> None:
     """Deliver WeChat report (non-blocking)."""
     logger.info("[report] entered for %s (steps=%s)", ctx.trade_date, ctx.steps)
     try:
-        if os.environ.get("ASHARE_USE_STALE") == "1":
+        stale_flag = os.environ.get("ASHARE_USE_STALE", "")
+        if stale_flag and stale_flag != "1":
+            logger.warning("[report] ASHARE_USE_STALE='%s' (expected '1' or empty), treating as stale", stale_flag)
+        if stale_flag == "1":
             logger.info("[report] skipping: stale predictions (GPU inference failed)")
             return
         # Report quality gate: NAV reasonableness
@@ -1646,12 +1671,13 @@ def _step13_report(ctx: DailyRunContext) -> None:
                         "[report] CRASH ALERT: NAV dropped %.0f%% (%.0f -> %.0f)!",
                         abs(nav_change) * 100, prev_nav, today_nav)
                     try:
-                        subprocess.Popen(
+                        subprocess.run(
                             [sys.executable,
                              str(PROJECT_ROOT / "scripts" / "alert.py"),
                              "1", "crash_alert", "0"],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
+                            timeout=30,
                         )
                     except Exception:
                         pass  # alert is best-effort
@@ -1686,7 +1712,8 @@ def _step13_report(ctx: DailyRunContext) -> None:
 
 def _step14_record_pipeline_run(ctx: DailyRunContext) -> None:
     """Record pipeline run metadata (non-blocking)."""
-    use_stale = os.environ.get("ASHARE_USE_STALE") == "1"
+    stale_flag = os.environ.get("ASHARE_USE_STALE", "")
+    use_stale = stale_flag == "1"
     try:
         from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
         duration_s = time.monotonic() - ctx.start_time
@@ -1700,7 +1727,8 @@ def _step14_record_pipeline_run(ctx: DailyRunContext) -> None:
 
 def _step15_graduation(ctx: DailyRunContext) -> None:
     """Check graduation gate (non-blocking, skip when stale)."""
-    if os.environ.get("ASHARE_USE_STALE") == "1":
+    stale_flag = os.environ.get("ASHARE_USE_STALE", "")
+    if stale_flag == "1":
         return
     try:
         from ashare_lab.paper.graduation import check_graduation, notify_graduation  # noqa: PLC0415

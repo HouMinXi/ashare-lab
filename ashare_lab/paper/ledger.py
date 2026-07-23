@@ -214,6 +214,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     # No journal_size_limit: large backfills can exceed 64MB WAL.
     # SQLite auto-checkpoints on close; pipeline mutex prevents concurrent writes.
     return conn
