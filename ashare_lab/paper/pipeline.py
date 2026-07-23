@@ -531,6 +531,35 @@ def _step2_idempotency(ctx: DailyRunContext) -> int:
     return -1  # sentinel: continue
 
 
+def _try_baostock_fallback(ctx: DailyRunContext, chenditc_exc: Exception) -> int:
+    """Try baostock gap_fill when chenditc download fails.
+
+    Returns 0 on success, 1 on stale (no gap), 2 on failure.
+    """
+    try:
+        from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
+        from ashare_lab.data.calendar import previous_trading_day  # noqa: PLC0415
+        start_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+        rc = gap_fill(start_date, ctx.trade_date)
+        if rc == 0:
+            logger.info("baostock fallback succeeded for %s", ctx.trade_date)
+            return 0
+        if rc == 1:
+            logger.info("baostock fallback: no gap detected")
+            return 0
+        logger.error("baostock fallback partial (rc=%d)", rc)
+        record_run(ctx.conn, ctx.trade_date, "error")
+        _try_record_pipeline_run(ctx, "error", f"chenditc+baostock both partial: {chenditc_exc}")
+        ctx.conn.commit()
+        return 2
+    except Exception as fb_exc:
+        logger.error("baostock fallback also failed: %s", fb_exc, exc_info=True)
+        record_run(ctx.conn, ctx.trade_date, "error")
+        _try_record_pipeline_run(ctx, "error", f"chenditc: {chenditc_exc}; baostock: {fb_exc}")
+        ctx.conn.commit()
+        return 2
+
+
 def _step3_data_update(ctx: DailyRunContext) -> int:
     """Refresh qlib data feed; return 1 if stale, 2 on error, -1 to continue."""
     if ctx.steps == {"signal"}:
@@ -551,29 +580,8 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
     try:
         stale = daily_refresh()
     except Exception as exc:
-        logger.warning("chenditc refresh failed (%s), trying baostock fallback", exc)
-        try:
-            from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
-            from ashare_lab.data.calendar import previous_trading_day  # noqa: PLC0415
-            start_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
-            rc = gap_fill(start_date, ctx.trade_date)
-            if rc == 0:
-                logger.info("baostock fallback succeeded for %s", ctx.trade_date)
-                stale = 0
-            elif rc == 1:
-                logger.info("baostock fallback: no gap detected")
-                stale = 0
-            else:
-                logger.error("baostock fallback partial (rc=%d)", rc)
-                record_run(ctx.conn, ctx.trade_date, "error")
-                _try_record_pipeline_run(ctx, "error", f"chenditc+baostock both partial: {exc}")
-                ctx.conn.commit()
-                return 2
-        except Exception as fb_exc:
-            logger.error("baostock fallback also failed: %s", fb_exc, exc_info=True)
-            record_run(ctx.conn, ctx.trade_date, "error")
-            _try_record_pipeline_run(ctx, "error", f"chenditc: {exc}; baostock: {fb_exc}")
-            ctx.conn.commit()
+        stale = _try_baostock_fallback(ctx, exc)
+        if stale == 2:
             return 2
     if stale == 1:
         record_run(ctx.conn, ctx.trade_date, "skipped_stale")
