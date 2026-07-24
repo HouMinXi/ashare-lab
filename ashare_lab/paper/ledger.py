@@ -607,37 +607,63 @@ def snapshot_positions(
     trade_date: str,
     positions_dict: dict[str, dict],
 ) -> None:
-    """Write (or overwrite) daily position snapshot."""
-    for symbol, p in positions_dict.items():
-        conn.execute(
-            "INSERT OR REPLACE INTO positions "
-            "(trade_date, symbol, qty, avg_cost, market_value, "
-            " buy_date, holding_high, factor) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                trade_date,
-                symbol,
-                p["qty"],
-                p["avg_cost"],
-                p["market_value"],
-                p.get("buy_date", ""),
-                p.get("holding_high", 0.0),
-                p.get("factor", 1.0),
-            ),
-        )
+    """Replace the daily position snapshot for *trade_date*.
 
+    Deletes any existing rows for this date first, then inserts
+    *positions_dict* fresh.  This makes an empty dict write zero rows
+    on purpose (a real, queryable "fully liquidated" snapshot) instead
+    of silently leaving the date absent, and it drops any symbol that
+    a re-run no longer holds instead of leaving its old row behind.
 
-def get_latest_positions(conn: sqlite3.Connection) -> dict[str, dict]:
-    """Return positions from the most recent snapshot date.
-
-    Empty dict on Day 1 (no rows).
+    The delete and the inserts run inside a named SAVEPOINT, which
+    makes them atomic WITH RESPECT TO EACH OTHER: an exception partway
+    through the insert loop rolls the delete back too, instead of
+    committing an empty snapshot for a date that should still hold
+    rows.  A savepoint is used instead of `with conn:` deliberately --
+    it nests inside whatever transaction is already open on *conn*
+    without ever committing it, so it cannot end an outer transaction
+    early.  That outer transaction is a second, separate atomicity
+    requirement this function does not provide by itself: the caller
+    still needs one so this snapshot lands in the same commit as the
+    rest of that day's settlement (record_nav, etc.), not just so the
+    delete and insert loop agree with each other.  All three current
+    call sites satisfy this: engine_settle.py's
+    update_positions_post_trade runs inside settle_day's `with conn:`
+    block, and pipeline.py's two _step11_ipo_processing call sites run
+    inside the same uncommitted transaction that _step12_backup_and_
+    finalize later commits.
     """
-    rows = conn.execute(
-        "SELECT symbol, qty, avg_cost, market_value, "
-        "       buy_date, holding_high, factor "
-        "FROM positions "
-        "WHERE trade_date = (SELECT MAX(trade_date) FROM positions)"
-    ).fetchall()
+    conn.execute("SAVEPOINT snapshot_positions")
+    try:
+        conn.execute("DELETE FROM positions WHERE trade_date = ?", (trade_date,))
+        for symbol, p in positions_dict.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO positions "
+                "(trade_date, symbol, qty, avg_cost, market_value, "
+                " buy_date, holding_high, factor) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade_date,
+                    symbol,
+                    p["qty"],
+                    p["avg_cost"],
+                    p["market_value"],
+                    p.get("buy_date", ""),
+                    p.get("holding_high", 0.0),
+                    p.get("factor", 1.0),
+                ),
+            )
+    except Exception:
+        conn.execute("ROLLBACK TO snapshot_positions")
+        conn.execute("RELEASE snapshot_positions")
+        raise
+    else:
+        conn.execute("RELEASE snapshot_positions")
+
+
+def _positions_from_rows(rows: list[sqlite3.Row]) -> dict[str, dict]:
+    """Convert positions rows (symbol, qty, avg_cost, ...) to the
+    {symbol: {...}} shape shared by every positions reader."""
     result: dict[str, dict] = {}
     for r in rows:
         result[r["symbol"]] = {
@@ -649,6 +675,46 @@ def get_latest_positions(conn: sqlite3.Connection) -> dict[str, dict]:
             "factor": r["factor"],
         }
     return result
+
+
+def get_latest_positions(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Return positions from the most recently settled trading day.
+
+    Anchored on the runs table rather than MAX(trade_date) FROM
+    positions: a fully liquidated day writes zero position rows (see
+    snapshot_positions), so anchoring on positions alone would skip
+    that day and resurrect an older, non-empty snapshot instead.
+    Empty dict on Day 1 (no settled runs yet) or when the most
+    recently settled day held nothing.
+    """
+    rows = conn.execute(
+        "SELECT symbol, qty, avg_cost, market_value, "
+        "       buy_date, holding_high, factor "
+        "FROM positions "
+        "WHERE trade_date = (SELECT MAX(trade_date) FROM runs WHERE status='settled')"
+    ).fetchall()
+    return _positions_from_rows(rows)
+
+
+def get_positions_for_date(
+    conn: sqlite3.Connection, trade_date: str,
+) -> dict[str, dict]:
+    """Return positions exactly as snapshotted for *trade_date*.
+
+    Unlike get_latest_positions, this does not look for the latest
+    settled day -- it reads the exact date given.  Needed right after
+    settle_day commits, before record_run has marked the day settled:
+    at that point get_latest_positions would still point at the
+    previous settled day.  Empty dict if the day was fully liquidated
+    or never snapshotted.
+    """
+    rows = conn.execute(
+        "SELECT symbol, qty, avg_cost, market_value, "
+        "       buy_date, holding_high, factor "
+        "FROM positions WHERE trade_date = ?",
+        (trade_date,),
+    ).fetchall()
+    return _positions_from_rows(rows)
 
 
 # ---------------------------------------------------------------------------

@@ -247,11 +247,15 @@ def settle_day(
         # ---------------------------------------------------------------
         # Step 8: record NAV
         # ---------------------------------------------------------------
-        market_value = result.post_trade_nav - cash
+        # Persist cash_with_proceeds (not the pre-proceeds `cash`), so
+        # tomorrow's opening cash (read back via get_latest_cash) actually
+        # includes today's sell proceeds.  market_value is derived from the
+        # same base so it stays pure positions value, not proceeds-in-transit.
+        market_value = result.post_trade_nav - cash_with_proceeds
         record_nav(
             conn,
             trade_date,
-            cash,
+            cash_with_proceeds,
             market_value,
             result.post_trade_nav,
             result.pre_trade_nav,

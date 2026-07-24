@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -274,6 +275,59 @@ class TestForceReset:
     ) -> None:
         conn = get_connection(db_path)
         record_run(conn, "2025-06-20", "settled")
+        conn.commit()
+        conn.close()
+
+        extra = {
+            "force_reset_day": patch(f"{_MOD}.force_reset_day"),
+        }
+        with _pipeline_patches(
+            db_path, base_config, extra_patches=extra
+        ) as mocks:
+            from ashare_lab.paper.pipeline import run_daily
+            run_daily("2025-06-20", force=True)
+        mocks["force_reset_day"].assert_called_once()
+
+
+class TestLedgerErrorRejection:
+    """A day marked ledger_error refuses automatic retry; --force is
+    required to proceed past it."""
+
+    def test_ledger_error_day_blocks_auto_retry(
+        self, db_path: Path, base_config: dict
+    ) -> None:
+        conn = get_connection(db_path)
+        record_run(conn, "2025-06-20", "ledger_error")
+        conn.commit()
+        conn.close()
+
+        with (
+            patch(f"{_MOD}.load_config", return_value=base_config),
+            patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
+        ):
+            from ashare_lab.paper.pipeline import run_daily
+            rc = run_daily("2025-06-20", force=False)
+        assert rc == 2
+
+        conn2 = get_connection(db_path)
+        row = conn2.execute(
+            "SELECT status FROM runs WHERE trade_date='2025-06-20'"
+        ).fetchone()
+        assert row["status"] == "ledger_error"  # not overwritten by the rejection
+        pr_row = conn2.execute(
+            "SELECT status FROM pipeline_runs WHERE trade_date='2025-06-20' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert pr_row["status"] == "error"
+        conn2.close()
+
+    def test_force_bypasses_ledger_error_block(
+        self, db_path: Path, base_config: dict
+    ) -> None:
+        """--force still proceeds past a ledger_error day (the existing
+        force path resets the day before continuing)."""
+        conn = get_connection(db_path)
+        record_run(conn, "2025-06-20", "ledger_error")
         conn.commit()
         conn.close()
 
@@ -785,3 +839,191 @@ class TestPrefetchCallOrder:
                     )
                     return
         pytest.fail("run_daily function not found in pipeline.py")
+
+
+class TestSettleIdentityGate:
+    """_step8_settle halts when the DB positions snapshot plus
+    settled cash don't reconstruct the post-trade NAV settle_day
+    itself computed."""
+
+    def test_identity_violation_halts_with_error(self, db_path: Path) -> None:
+        from ashare_lab.paper.pipeline import DailyRunContext, _step8_settle
+        from ashare_lab.paper.ledger import (
+            get_connection, insert_order, snapshot_positions,
+        )
+
+        trade_date = "2025-06-20"
+        conn = get_connection(db_path)
+
+        # Seed a positions snapshot that will NOT reconcile with the
+        # (mocked) settle result below -- stands in for a ledger
+        # where persisted cash/positions have drifted from true NAV.
+        snapshot_positions(conn, trade_date, {
+            "SZ000001": {
+                "qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                "buy_date": trade_date, "holding_high": 10.0, "factor": 1.0,
+            },
+        })
+
+        # Seed a real carry order so the gate-before-bump ordering can be
+        # checked directly: if bump_carry_days ran before the identity
+        # gate, this order's carry_day would already be incremented by
+        # the time the gate trips and we inspect it below.
+        carry_order_id = insert_order(
+            conn, trade_date, "SZ000002", "buy", 100, None,
+            "carry", 1, trade_date,
+        )
+        conn.commit()
+
+        ctx = DailyRunContext(
+            trade_date=trade_date, force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str=trade_date,
+        )
+        ctx.conn = conn
+        ctx.cooldown_state = {}
+        ctx.current_positions = {}
+        ctx.cash = 50_000.0
+        ctx.prices = {}
+        ctx.benchmarks = {}
+        ctx.paper_cfg = {}
+
+        fake_result = _settle_mock(cash=50_000)
+        fake_result.post_trade_nav = 999_999.0  # deliberately unreconcilable
+        # Explicit, not just _settle_mock's default: pin exactly which
+        # order a violation must NOT touch, so the assertion below is
+        # unambiguous about what "not bumped" means.
+        fake_result.carries_to_bump = [
+            {"order_id": carry_order_id, "symbol": "SZ000002", "side": "buy"},
+        ]
+        fake_result.carries_suspended = []
+
+        with patch(f"{_MOD}.settle_day", return_value=fake_result):
+            rc = _step8_settle(ctx)
+
+        assert rc == 2
+        row = conn.execute(
+            "SELECT status FROM runs WHERE trade_date=?", (trade_date,)
+        ).fetchone()
+        assert row["status"] == "ledger_error"
+
+        # The gate runs before bump_carry_days, so a violation must not
+        # leave this order's carry_day incremented.
+        order_row = conn.execute(
+            "SELECT carry_day FROM orders WHERE id=?", (carry_order_id,)
+        ).fetchone()
+        assert order_row["carry_day"] == 1, (
+            "carry_day must stay at its seeded value -- bump_carry_days "
+            "must not run when the identity gate trips"
+        )
+
+        conn.close()
+
+    def test_reconciled_settle_does_not_halt(self, db_path: Path) -> None:
+        """Control case: matching numbers must NOT trip the gate."""
+        from ashare_lab.paper.pipeline import DailyRunContext, _step8_settle
+        from ashare_lab.paper.ledger import get_connection, snapshot_positions
+
+        trade_date = "2025-06-20"
+        conn = get_connection(db_path)
+
+        snapshot_positions(conn, trade_date, {
+            "SZ000001": {
+                "qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                "buy_date": trade_date, "holding_high": 10.0, "factor": 1.0,
+            },
+        })
+        conn.commit()
+
+        ctx = DailyRunContext(
+            trade_date=trade_date, force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str=trade_date,
+        )
+        ctx.conn = conn
+        ctx.cooldown_state = {}
+        ctx.current_positions = {}
+        ctx.cash = 50_000.0
+        ctx.prices = {}
+        ctx.benchmarks = {}
+        ctx.paper_cfg = {}
+
+        # market_value(1000) + cash(50_000) == post_trade_nav(51_000)
+        fake_result = _settle_mock(cash=50_000)
+        fake_result.post_trade_nav = 51_000.0
+
+        with patch(f"{_MOD}.settle_day", return_value=fake_result):
+            rc = _step8_settle(ctx)
+
+        assert rc is None
+        row = conn.execute(
+            "SELECT status FROM runs WHERE trade_date=?", (trade_date,)
+        ).fetchone()
+        assert row is None  # gate did not touch runs
+        conn.close()
+
+    def _run_with_drift(self, db_path: Path, drift: float) -> tuple[int | None, sqlite3.Row | None]:
+        """Seed market_value=1000, cash=50_000, and pick post_trade_nav so
+        that mv_db + cash - post_trade_nav equals exactly *drift*."""
+        from ashare_lab.paper.pipeline import DailyRunContext, _step8_settle
+        from ashare_lab.paper.ledger import get_connection, snapshot_positions
+
+        trade_date = "2025-06-20"
+        conn = get_connection(db_path)
+
+        snapshot_positions(conn, trade_date, {
+            "SZ000001": {
+                "qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                "buy_date": trade_date, "holding_high": 10.0, "factor": 1.0,
+            },
+        })
+        conn.commit()
+
+        ctx = DailyRunContext(
+            trade_date=trade_date, force=False, steps=None,
+            pred_path=None, start_time=0.0, predictions_date_str=trade_date,
+        )
+        ctx.conn = conn
+        ctx.cooldown_state = {}
+        ctx.current_positions = {}
+        ctx.cash = 50_000.0
+        ctx.prices = {}
+        ctx.benchmarks = {}
+        ctx.paper_cfg = {}
+
+        fake_result = _settle_mock(cash=50_000)
+        fake_result.post_trade_nav = 1000.0 + 50_000.0 - drift
+
+        with patch(f"{_MOD}.settle_day", return_value=fake_result):
+            rc = _step8_settle(ctx)
+
+        row = conn.execute(
+            "SELECT status FROM runs WHERE trade_date=?", (trade_date,)
+        ).fetchone()
+        conn.close()
+        return rc, row
+
+    def test_drift_just_under_threshold_does_not_halt(self, db_path: Path) -> None:
+        """drift=0.99 is inside the 1.0 CNY tolerance -- must not trip."""
+        rc, row = self._run_with_drift(db_path, 0.99)
+        assert rc is None
+        assert row is None
+
+    def test_drift_at_threshold_halts(self, db_path: Path) -> None:
+        """drift=1.00 meets the >= 1.0 boundary -- must trip."""
+        rc, row = self._run_with_drift(db_path, 1.00)
+        assert rc == 2
+        assert row["status"] == "ledger_error"
+
+    def test_negative_drift_just_under_threshold_does_not_halt(
+        self, db_path: Path
+    ) -> None:
+        """drift=-0.99 is inside the tolerance on the other side of zero --
+        abs(drift) must be checked, not drift alone."""
+        rc, row = self._run_with_drift(db_path, -0.99)
+        assert rc is None
+        assert row is None
+
+    def test_negative_drift_at_threshold_halts(self, db_path: Path) -> None:
+        """drift=-1.00 meets the |drift| >= 1.0 boundary -- must trip."""
+        rc, row = self._run_with_drift(db_path, -1.00)
+        assert rc == 2
+        assert row["status"] == "ledger_error"

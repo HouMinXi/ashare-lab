@@ -62,6 +62,7 @@ from ashare_lab.paper.ledger import (
     get_cooldowns,
     get_latest_cash,
     get_latest_positions,
+    get_positions_for_date,
     hot_backup_with_integrity,
     init_schema,
     insert_order,
@@ -515,6 +516,29 @@ def _step2_idempotency(ctx: DailyRunContext) -> int:
     if not ctx.force and is_day_settled(ctx.conn, ctx.trade_date):
         logger.info("Already settled: %s", ctx.trade_date)
         return 0  # sentinel: caller returns 0
+    if not ctx.force:
+        row = ctx.conn.execute(
+            "SELECT status FROM runs WHERE trade_date = ?", (ctx.trade_date,)
+        ).fetchone()
+        if row is not None and row["status"] == "ledger_error":
+            # A prior run's settle identity check failed and left this
+            # date's cash and positions out of sync.  Auto-retrying would
+            # open the next day on a book that pairs an errored day's cash
+            # with a stale day's positions -- a human needs to inspect and
+            # repair the ledger first, so only an explicit --force may
+            # proceed past it.
+            logger.error(
+                "%s is marked ledger_error (settle identity check failed); "
+                "refusing automatic retry. Investigate the drift, repair "
+                "the ledger, then re-run with --force.",
+                ctx.trade_date,
+            )
+            _try_record_pipeline_run(
+                ctx, "error",
+                f"{ctx.trade_date} marked ledger_error, refusing auto-retry",
+            )
+            ctx.conn.commit()
+            return 2
     if ctx.force:
         latest_settled = ctx.conn.execute(
             "SELECT MAX(trade_date) FROM runs WHERE status='settled'"
@@ -1145,10 +1169,14 @@ def _prefetch_hedge_prices_for_settle(ctx: DailyRunContext) -> None:
         logger.info("hedge pre-fetch: got prices for %d legs before settle", len(missing))
 
 
-def _step8_settle(ctx: DailyRunContext) -> None:
-    """Settle pending orders; skip for signal-only runs."""
+def _step8_settle(ctx: DailyRunContext) -> int | None:
+    """Settle pending orders; skip for signal-only runs.
+
+    Returns 2 if the post-settle ledger identity check fails (caller
+    must halt), None otherwise.
+    """
     if ctx.steps == {"signal"}:
-        return
+        return None
     active_cooldowns = {
         s for s, cd in ctx.cooldown_state.items()
         if cd["cooldown_until"] >= ctx.trade_date
@@ -1191,9 +1219,52 @@ def _step8_settle(ctx: DailyRunContext) -> None:
         ctx.conn, ctx.trade_date, all_orders, ctx.prices,
         ctx.current_positions, ctx.cash, topk_symbols, ctx.benchmarks, ctx.paper_cfg,
     )
+    # Ledger identity check: the positions settle_day just committed to the
+    # DB, plus the settled cash, must reconstruct the post-trade NAV that
+    # settle_day itself computed.  This runs before the four lines below
+    # (carry-day bumps, positions/cash reload) on purpose: a violation
+    # means a human has to repair the ledger, and the abort path must not
+    # leave orders with bumped carry counts or leave ctx holding cash/
+    # positions read back from a day that never really finished settling.
+    # mv_db and drift depend only on ctx.settle_result (set by settle_day
+    # above) and the positions table settle_day already wrote -- neither
+    # needs bump_carry_days/bump_suspension_carry_days/current_positions/
+    # ctx.cash, so moving the gate ahead of them changes nothing it reads.
+    mv_db = ctx.conn.execute(
+        "SELECT COALESCE(SUM(market_value), 0) FROM positions WHERE trade_date = ?",
+        (ctx.trade_date,),
+    ).fetchone()[0]
+    drift = mv_db + ctx.settle_result.cash - ctx.settle_result.post_trade_nav
+    # 1.0 CNY is an absolute threshold, not relative to NAV: float64 carries
+    # about 15-17 significant digits, so even a million-CNY book leaves a
+    # ~1e-7 CNY rounding floor -- seven orders of magnitude below this gate.
+    # A relative threshold would only make the gate laxer on a large book,
+    # which is exactly backwards for a correctness check.
+    if abs(drift) >= 1.0:
+        logger.error(
+            "Settle identity check failed on %s: positions market_value=%.2f "
+            "+ cash=%.2f != post_trade_nav=%.2f (drift=%.2f)",
+            ctx.trade_date, mv_db, ctx.settle_result.cash,
+            ctx.settle_result.post_trade_nav, drift,
+        )
+        # runs.status is free text (no CHECK constraint) so it can carry a
+        # status finer-grained than pipeline_runs' fixed enum: 'ledger_error'
+        # marks this date as needing manual repair, not just a transient
+        # failure -- see the idempotency check in _step2_idempotency.
+        record_run(ctx.conn, ctx.trade_date, "ledger_error")
+        _try_record_pipeline_run(
+            ctx, "error",
+            f"settle identity check failed: drift={drift:.2f}",
+        )
+        ctx.conn.commit()
+        return 2
+
     bump_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_to_bump])
     bump_suspension_carry_days(ctx.conn, [o["order_id"] for o in ctx.settle_result.carries_suspended])
-    ctx.current_positions = get_latest_positions(ctx.conn)
+    # Exact-date read, not get_latest_positions: record_run hasn't marked
+    # today 'settled' yet at this point in the pipeline, so the "latest
+    # settled day" anchor would still resolve to yesterday.
+    ctx.current_positions = get_positions_for_date(ctx.conn, ctx.trade_date)
     ctx.cash = ctx.settle_result.cash
 
 
@@ -1831,7 +1902,9 @@ def run_daily(
     _step6_adjustfactor(ctx)
     _step7_csi1000_exits(ctx)
     _prefetch_hedge_prices_for_settle(ctx)
-    _step8_settle(ctx)
+    rc = _step8_settle(ctx)
+    if rc == 2:
+        return 2
     _step9_risk_checks(ctx)
     _step9b_hedge_sleeve(ctx)
     _step9c_nav_hedge_split(ctx)

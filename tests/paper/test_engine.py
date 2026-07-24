@@ -547,6 +547,87 @@ class TestSettleDayNAVReconciliation:
         assert result.cash >= 0
 
 
+class TestSettleDayCashPersistence:
+    """Sell proceeds must reach disk (via record_nav), not just
+    live in the in-memory SettleResult.cash."""
+
+    def test_sell_proceeds_survive_nav_roundtrip(self, tmp_path):
+        """result.cash and the cash persisted to the nav table (read
+        back via get_latest_cash) must agree -- and both must include
+        the sell proceeds, not just the pre-sell cash."""
+        from ashare_lab.paper.ledger import get_latest_cash
+
+        conn = _setup_db(tmp_path)
+        positions = {
+            "A": {
+                "qty": 200,
+                "avg_cost": 10.0,
+                "market_value": 2000.0,
+                "buy_date": "2024-01-01",
+                "holding_high": 10.0,
+                "factor": 1.0,
+            }
+        }
+        cash = 50.0
+        prices = {
+            "A": {
+                "close": 10.0, "change": 0.0, "volume": 1e7,
+                "factor": 1.0, "threshold": 0.099,
+            },
+        }
+        from ashare_lab.paper.ledger import insert_order as lio
+        sell_id = lio(
+            conn, "2024-01-02", "A", "sell", 200, None, "pending", 0,
+            "2024-01-02",
+        )
+        orders = [
+            {"id": sell_id, "symbol": "A", "side": "sell",
+             "target_qty": 200, "carry_day": 0},
+        ]
+        result = settle_day(
+            conn, "2024-01-02", orders, prices, positions,
+            cash, {"A"}, {"csi300": 100.0, "csi1000": 200.0},
+            _make_config(),
+        )
+
+        # Exact expected cash, derived independently from the fill/fee math
+        # (not the settle_day code path) so a future double-count or
+        # dropped-fee regression in either path cannot slip past this test
+        # by producing the same wrong number on both sides.
+        from ashare_lab.paper.fees import calculate_fees
+
+        fill_price = apply_slippage(10.0, "sell", 0.001)
+        notional = fill_price * 200
+        sell_proceeds = notional - calculate_fees(notional, "sell").total
+        expected_cash = cash + sell_proceeds
+
+        persisted_cash = get_latest_cash(conn)
+        assert persisted_cash == pytest.approx(result.cash)
+        assert persisted_cash == pytest.approx(expected_cash), (
+            "sell proceeds must reach disk, not just result.cash "
+            f"(persisted={persisted_cash}, expected={expected_cash}, "
+            f"pre-sell cash was {cash})"
+        )
+
+        # nav.market_value must be pure positions value (post_trade_nav
+        # minus the same cash_with_proceeds base), not proceeds-in-transit.
+        # The position was fully sold here, so the correct value is exactly
+        # zero -- this is the historical incident pattern: the bug reported
+        # a fully-liquidated day's sell proceeds as if they were still
+        # unsold holdings.
+        nav_row = conn.execute(
+            "SELECT market_value FROM nav WHERE trade_date = '2024-01-02'"
+        ).fetchone()
+        assert nav_row["market_value"] == pytest.approx(
+            result.post_trade_nav - result.cash
+        )
+        assert nav_row["market_value"] == pytest.approx(0.0, abs=1e-6), (
+            "position was fully sold -- persisted market_value must not "
+            f"carry the sell proceeds as phantom holdings value (got "
+            f"{nav_row['market_value']})"
+        )
+
+
 class TestSettleDayPartialFill:
     """Partial fill: fill_qty capped by volume participation."""
 

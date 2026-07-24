@@ -22,6 +22,7 @@ from ashare_lab.paper.ledger import (
     get_cooldowns,
     get_latest_cash,
     get_latest_positions,
+    get_positions_for_date,
     hot_backup,
     hot_backup_with_integrity,
     init_schema,
@@ -223,6 +224,9 @@ class TestPositions:
                 "factor": 1.0,
             },
         })
+        # get_latest_positions anchors on the most recently settled run,
+        # not on the positions table alone -- see TestPositions below.
+        record_run(conn, "2025-01-02", "settled")
         conn.commit()
         pos = get_latest_positions(conn)
         assert "SH600000" in pos
@@ -234,6 +238,140 @@ class TestPositions:
     def test_latest_positions_empty(self, conn: sqlite3.Connection) -> None:
         pos = get_latest_positions(conn)
         assert pos == {}
+
+    def test_liquidation_day_returns_empty_not_resurrected(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """A settled day that sold everything must load empty next --
+        not the last non-empty snapshot (defect B: zombie resurrection).
+        """
+        snapshot_positions(conn, "2025-01-02", {
+            "SH600000": {
+                "qty": 300,
+                "avg_cost": 10.0,
+                "market_value": 3000.0,
+                "buy_date": "2025-01-01",
+                "holding_high": 10.5,
+                "factor": 1.0,
+            },
+        })
+        record_run(conn, "2025-01-02", "settled")
+
+        # 2025-01-03: sold everything.  Zero rows, but the day WAS
+        # settled -- that's what must distinguish "empty" from
+        # "never ran" so MAX(trade_date) can't just skip it.
+        snapshot_positions(conn, "2025-01-03", {})
+        record_run(conn, "2025-01-03", "settled")
+        conn.commit()
+
+        pos = get_latest_positions(conn)
+        assert pos == {}, "empty settled day must not resurrect the prior snapshot"
+
+    def test_snapshot_drops_symbols_no_longer_held(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """A re-snapshot for the same date must remove rows for symbols
+        no longer in positions_dict, not just add/overwrite (defect B
+        latent bug: stale rows survive a re-run that sold a symbol)."""
+        snapshot_positions(conn, "2025-01-02", {
+            "A": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0},
+            "B": {"qty": 200, "avg_cost": 5.0, "market_value": 1000.0},
+        })
+        conn.commit()
+        rows = conn.execute(
+            "SELECT symbol FROM positions WHERE trade_date = '2025-01-02'"
+        ).fetchall()
+        assert {r["symbol"] for r in rows} == {"A", "B"}
+
+        # Re-run of the same date: B was sold, only A remains.
+        snapshot_positions(conn, "2025-01-02", {
+            "A": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0},
+        })
+        conn.commit()
+        rows = conn.execute(
+            "SELECT symbol FROM positions WHERE trade_date = '2025-01-02'"
+        ).fetchall()
+        assert {r["symbol"] for r in rows} == {"A"}
+
+    def test_snapshot_insert_failure_preserves_existing_rows(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """A mid-loop insert failure must roll the delete back too (the
+        savepoint), not leave the date's rows deleted with only a
+        partial replacement applied -- that would be a silent, empty-
+        looking snapshot nobody reported an error for."""
+        snapshot_positions(conn, "2025-01-02", {
+            "A": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0},
+            "B": {"qty": 200, "avg_cost": 5.0, "market_value": 1000.0},
+        })
+        conn.commit()
+
+        # C is well-formed and inserts fine; D is missing the required
+        # "qty" key, so the loop's p["qty"] raises KeyError on it --
+        # after the delete and the C insert have already run.
+        bad_positions = {
+            "C": {"qty": 300, "avg_cost": 7.0, "market_value": 2100.0},
+            "D": {"avg_cost": 8.0, "market_value": 800.0},
+        }
+        with pytest.raises(KeyError):
+            snapshot_positions(conn, "2025-01-02", bad_positions)
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT symbol FROM positions WHERE trade_date = '2025-01-02'"
+        ).fetchall()
+        assert {r["symbol"] for r in rows} == {"A", "B"}, (
+            "the savepoint must roll the delete (and the successful C "
+            "insert) back together when the D insert raises -- the "
+            "original A/B snapshot must survive untouched"
+        )
+
+
+class TestGetPositionsForDate:
+    """get_positions_for_date reads one exact date, no MAX() involved."""
+
+    def test_missing_date_returns_empty(self, conn: sqlite3.Connection) -> None:
+        assert get_positions_for_date(conn, "2025-01-02") == {}
+
+    def test_multi_symbol_mapping(self, conn: sqlite3.Connection) -> None:
+        snapshot_positions(conn, "2025-01-02", {
+            "A": {
+                "qty": 100, "avg_cost": 10.0, "market_value": 1000.0,
+                "buy_date": "2025-01-01", "holding_high": 10.5, "factor": 1.0,
+            },
+            "B": {
+                "qty": 200, "avg_cost": 5.0, "market_value": 1000.0,
+                "buy_date": "2025-01-02", "holding_high": 5.2, "factor": 1.0,
+            },
+        })
+        conn.commit()
+        pos = get_positions_for_date(conn, "2025-01-02")
+        assert set(pos) == {"A", "B"}
+        assert pos["A"]["qty"] == 100
+        assert pos["A"]["holding_high"] == 10.5
+        assert pos["B"]["qty"] == 200
+        assert pos["B"]["avg_cost"] == 5.0
+
+    def test_other_dates_do_not_leak_in(self, conn: sqlite3.Connection) -> None:
+        """Only the requested date's rows come back -- no MAX(trade_date)
+        fallback to an earlier or later snapshot."""
+        snapshot_positions(conn, "2025-01-02", {
+            "A": {"qty": 100, "avg_cost": 10.0, "market_value": 1000.0},
+        })
+        snapshot_positions(conn, "2025-01-03", {
+            "B": {"qty": 200, "avg_cost": 5.0, "market_value": 1000.0},
+        })
+        conn.commit()
+
+        pos_02 = get_positions_for_date(conn, "2025-01-02")
+        assert set(pos_02) == {"A"}
+
+        pos_03 = get_positions_for_date(conn, "2025-01-03")
+        assert set(pos_03) == {"B"}
+
+        # A date with no snapshot at all (not even the earliest or latest)
+        # must be empty, not fall back to a neighboring date.
+        assert get_positions_for_date(conn, "2025-01-10") == {}
 
 
 # ---------------------------------------------------------------------------
