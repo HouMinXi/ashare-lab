@@ -101,7 +101,7 @@ ashare group sovereign territory (Zone C): paper.db, models, pipeline, sentinel,
 
 **gpu-win contention**: serving is default GPU owner; training batches acquire `H:\gpu.lock`, serving yields. Stale-lock TTL (mtime-based expiry).
 
-**X500 timer namespace** (reserved): dsa-sentinel 18:50, data-update 00:30, pipeline 01:00, fetch-today 17:00/18:00/21:00 (CST). Harness dispatcher gets separate namespace per J2.
+**X500 timer namespace** (reserved): ashare-wol 17:30, data-update 17:45, pipeline 18:00, dsa-sentinel 18:50, chenditc 21:00, backup 23:00 (CST). Harness dispatcher gets separate namespace per J2.
 
 Fleet law binding: S1/S2/S2b, known-answer validation, pre-registration, zone discipline, R4 agent contract, Golden Rules 1-6. Full ref: memory `reference_fleet_assignments.md`.
 
