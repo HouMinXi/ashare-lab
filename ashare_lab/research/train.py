@@ -265,6 +265,50 @@ def train_window(
         "test": (window["test_start"], window["test_end"]),
     }
 
+    # Determine seq_len for time-series models (TRA/ALSTM).
+    # Tabular models (lgbm, densemble) have no sequence requirement.
+    _seq_len = 0
+    if model_type == "alstm":
+        _seq_len = cfg_model.get("step_len", 20)
+    elif model_type == "tra":
+        _seq_len = cfg_model.get("step_len", 60)
+
+    # Extend test segment backward so every date in [test_start, test_end]
+    # has a full seq_len lookback inside the segment.  Without this,
+    # MTSDatasetH/TSDatasetH yield zero test sequences when the test span
+    # is shorter than seq_len, and pytorch_tra.py:322 crashes with
+    # KeyError: 'MSE' on the empty metrics frame after all epochs finish.
+    true_test_start = window["test_start"]
+    if _seq_len > 0:
+        from qlib.data import D as _D  # noqa: PLC0415
+
+        _cal = _D.calendar(
+            start_time=ALPHA158_WARMUP_START,
+            end_time=window["test_end"],
+        )
+        _cal = sorted(_cal)
+        # Find the index of test_start in the calendar.
+        _test_start_idx = None
+        for _i, _d in enumerate(_cal):
+            if str(_d)[:10] >= true_test_start:
+                _test_start_idx = _i
+                break
+        if _test_start_idx is not None and _test_start_idx >= _seq_len:
+            _extended = _cal[_test_start_idx - _seq_len]
+            _extended_str = str(_extended)[:10]
+            if _extended_str < true_test_start:
+                segs["test"] = (_extended_str, window["test_end"])
+                log.info(
+                    "W%d: test segment extended %s -> %s (seq_len=%d warmup)",
+                    window_id, _extended_str, true_test_start, _seq_len,
+                )
+        else:
+            log.warning(
+                "W%d: cannot extend test warmup (test_start_idx=%s, seq_len=%d); "
+                "crash may still occur on short test spans",
+                window_id, _test_start_idx, _seq_len,
+            )
+
     if model_type == "alstm":
         step_len = cfg_model.get("step_len", 20)
         if cfg_handler == "alpha360":
@@ -567,7 +611,7 @@ def train_window(
             # pred uses (datetime, instrument) -- swap if needed.
             if raw.index.names[0] != "datetime":
                 raw = raw.swaplevel().sort_index()
-            label = raw.loc[segs["test"][0] : segs["test"][1]].iloc[:, 0]
+            label = raw.loc[true_test_start : window["test_end"]].iloc[:, 0]
 
     log.info(
         "W%d: %d predictions after price filter, %d labels",
