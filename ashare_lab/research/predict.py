@@ -26,6 +26,66 @@ log = logging.getLogger(__name__)
 
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
+# -- Alert infrastructure (fail-open, stdlib only) --------------------------
+_ALERT_SENT_THIS_RUN = False  # rate-sanity: one alert per predict run
+
+
+def _send_alert(text: str) -> None:
+    """Send a plain-text alert via hermes-gateway. Fail-open: never raises.
+
+    Uses stdlib urllib to avoid importing aiohttp/requests in the predict
+    path. Reads GATEWAY_API_KEY from env or pass store. One alert per
+    predict run (module-level _ALERT_SENT_THIS_RUN flag).
+    """
+    global _ALERT_SENT_THIS_RUN  # noqa: PLW0603
+    if _ALERT_SENT_THIS_RUN:
+        return
+
+    import os  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    api_key = os.environ.get("GATEWAY_API_KEY", "").strip()
+    if not api_key and shutil.which("pass"):
+        try:
+            r = subprocess.run(
+                ["pass", "show", "api/hermes-gateway"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if r.returncode == 0:
+                api_key = r.stdout.strip()
+        except Exception:
+            pass
+    if not api_key:
+        log.warning("alert: no GATEWAY_API_KEY available, skipping alert")
+        return
+
+    url = os.environ.get("GATEWAY_URL", "http://192.168.100.10:8642/api/weixin/send")
+    chat_id = os.environ.get("WEIXIN_CHAT_ID", "").strip()
+    if not chat_id:
+        try:
+            r = subprocess.run(
+                ["pass", "show", "ashare/weixin-chat-id"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if r.returncode == 0:
+                chat_id = r.stdout.strip()
+        except Exception:
+            pass
+
+    payload = json.dumps({"message": text, "chat_id": chat_id}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info("alert sent: %s", resp.read().decode("utf-8")[:100])
+        _ALERT_SENT_THIS_RUN = True  # only after successful send
+    except Exception as exc:
+        log.warning("alert failed (non-fatal): %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Score diversity / collapse detection (Phase 9 -- 09-04)
@@ -334,6 +394,11 @@ def predict_for_date(
             if fallback.exists():
                 log.warning("w%d.pt missing, falling back to latest.pt", window_id)
                 model_path = fallback
+                _send_alert(
+                    f"[predict] model fallback: w{window_id}.pt missing, "
+                    f"using {fallback.name} on {trade_date}. "
+                    f"Action: train w{window_id}.pt"
+                )
             # else: let the FileNotFoundError below fire with the original path
 
     if not model_path.exists():
@@ -350,6 +415,11 @@ def predict_for_date(
             "MODEL STALE: %s is %.0f days old (threshold: %d days). "
             "Consider retraining.",
             model_path.name, model_age_days, _MODEL_STALE_DAYS,
+        )
+        _send_alert(
+            f"[predict] model stale: {model_path.name} is {model_age_days:.1f} days old "
+            f"(threshold: {_MODEL_STALE_DAYS}) on {trade_date}. "
+            f"Action: retrain"
         )
 
     log.info(
