@@ -499,16 +499,28 @@ class TestDumpBinUpdate:
         assert vals[1] == pytest.approx(10.5)
 
     def test_extends_instrument_end_date(self, tmp_path: Path) -> None:
+        """R1: only all.txt is extended; index files are NEVER touched."""
         from ashare_lab.data.fallback import _dump_bin_update
 
         provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        # Add a csi1000.txt with a stale end_date to prove it is NOT extended.
+        # Use 1000 members so the gate passes (the gate runs after extension).
+        csi1000 = provider / "instruments" / "csi1000.txt"
+        csi_lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(999)]
+        csi_lines.append("SH600519\t2020-01-01\t2023-12-31")
+        csi1000.write_text("\n".join(csi_lines) + "\n", encoding="utf-8")
         csv_dir = tmp_path / "csvs"
         self._make_csv(csv_dir, "SH600519", "2024-03-04")
 
         _dump_bin_update(csv_dir, provider)
 
-        inst = (provider / "instruments" / "all.txt").read_text()
-        assert "2024-03-04" in inst
+        # all.txt: end_date extended to trade date.
+        all_inst = (provider / "instruments" / "all.txt").read_text()
+        assert "2024-03-04" in all_inst
+        # csi1000.txt: end_date UNCHANGED (index files never modified).
+        csi_inst = csi1000.read_text()
+        assert "2023-12-31" in csi_inst
+        assert "2024-03-04" not in csi_inst
 
     def test_no_csvs_raises(self, tmp_path: Path) -> None:
         from ashare_lab.data.fallback import _dump_bin_update
@@ -544,3 +556,87 @@ class TestDumpBinUpdate:
         size_after_second = (provider / "features" / "sh600519" / "close.day.bin").stat().st_size
 
         assert size_after_first == size_after_second
+
+
+class TestIndexMembershipGate:
+    """Tests for check_index_membership (R2 + A4)."""
+
+    def _make_instruments(self, tmp_path: Path, csi1000_lines: list[str]) -> Path:
+        inst_dir = tmp_path / "instruments"
+        inst_dir.mkdir()
+        (inst_dir / "csi1000.txt").write_text("\n".join(csi1000_lines) + "\n", encoding="utf-8")
+        return inst_dir
+
+    def test_gate_passes_at_1000(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import check_index_membership
+
+        lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(1000)]
+        inst_dir = self._make_instruments(tmp_path, lines)
+        # Should not raise.
+        check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_fails_at_2600(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import check_index_membership
+
+        lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(2600)]
+        inst_dir = self._make_instruments(tmp_path, lines)
+        with pytest.raises(ValueError, match="FAILED"):
+            check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_fails_at_500(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import check_index_membership
+
+        lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(500)]
+        inst_dir = self._make_instruments(tmp_path, lines)
+        with pytest.raises(ValueError, match="FAILED"):
+            check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_skips_missing_index_file(self, tmp_path: Path) -> None:
+        """Silently skip when csi1000.txt does not exist (test fixtures)."""
+        from ashare_lab.data.fallback import check_index_membership
+
+        inst_dir = tmp_path / "instruments"
+        inst_dir.mkdir()
+        # No csi1000.txt -- should not raise.
+        check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_fires_through_dump_bin_update(self, tmp_path: Path) -> None:
+        """A4: gate fires via _dump_bin_update, not only via cli."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        # Create a qlib dir with 2600 csi1000 members (inflation scenario).
+        provider = self._make_qlib_dir_inflated(tmp_path, ["SH600519"], ["2024-03-01"], 2600)
+        csv_dir = tmp_path / "csvs"
+        TestDumpBinUpdate._make_csv(csv_dir, "SH600519", "2024-03-04")
+        with pytest.raises(ValueError, match="FAILED"):
+            _dump_bin_update(csv_dir, provider)
+
+    def _make_qlib_dir_inflated(
+        self, tmp_path: Path, symbols: list[str], dates: list[str], n_members: int
+    ) -> Path:
+        """Build a minimal qlib provider dir with inflated csi1000 membership."""
+        provider = tmp_path / "qlib"
+        provider.mkdir()
+        cal = provider / "calendars"
+        cal.mkdir()
+        (cal / "day.txt").write_text("\n".join(dates) + "\n", encoding="utf-8")
+
+        inst = provider / "instruments"
+        inst.mkdir()
+        # all.txt: just the real symbols.
+        all_lines = [f"{sym}\t{dates[0]}\t" for sym in symbols]
+        (inst / "all.txt").write_text("\n".join(all_lines) + "\n", encoding="utf-8")
+        # csi1000.txt: inflated membership.
+        csi_lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(n_members)]
+        (inst / "csi1000.txt").write_text("\n".join(csi_lines) + "\n", encoding="utf-8")
+
+        feat = provider / "features"
+        feat.mkdir()
+        for sym in symbols:
+            sym_dir = feat / sym.lower()
+            sym_dir.mkdir()
+            for field in ["open", "close", "high", "low", "volume", "factor"]:
+                (sym_dir / f"{field}.day.bin").write_bytes(b"")
+        return provider
+
+    # Reuse _make_csv from TestDumpBinUpdate (same signature, includes 'change' column).

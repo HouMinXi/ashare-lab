@@ -265,19 +265,79 @@ def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
 def _extend_instrument_end_dates(
     inst_dir: Path, traded_syms: set[str], latest: str
 ) -> None:
-    """Update instrument files so end_date covers *latest* for traded symbols."""
-    for inst_file in inst_dir.glob("*.txt"):
-        lines = inst_file.read_text(encoding="utf-8").splitlines()
-        new_lines: list[str] = []
-        changed = False
-        for line in lines:
-            parts = line.split("\t")
-            if len(parts) == 3 and parts[0] in traded_syms and parts[2] < latest:
-                parts[2] = latest
-                changed = True
-            new_lines.append("\t".join(parts))
-        if changed:
-            inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    """Extend end_date in all.txt for symbols that traded on *latest*.
+
+    Only touches all.txt (the full-market universe).  Index membership
+    files (csi300/csi500/csi800/csi1000/csiall) are NEVER modified --
+    their membership comes exclusively from the data provider bundle
+    (chenditc swap in update.py).  Extending index files would erase
+    historical removals, causing universe inflation (e.g. csi1000
+    showing 2600 active vs the official 1000).
+    """
+    all_file = inst_dir / "all.txt"
+    if not all_file.exists():
+        return
+    lines = all_file.read_text(encoding="utf-8").splitlines()
+    new_lines: list[str] = []
+    changed = False
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0] in traded_syms and parts[2] < latest:
+            parts[2] = latest
+            changed = True
+        new_lines.append("\t".join(parts))
+    if changed:
+        all_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+def check_index_membership(
+    inst_dir: Path,
+    trade_date: str,
+    index: str = "csi1000",
+    expected: int = 1000,
+    tolerance: int = 100,
+) -> None:
+    """Verify index member count is within tolerance of expected.
+
+    Reads instruments/{index}.txt and counts symbols active on trade_date
+    (start <= trade_date, end >= trade_date or empty). Raises ValueError
+    if count is outside [expected - tolerance, expected + tolerance].
+
+    Default values (expected=1000, tolerance=100) match
+    baseline.yaml universe.data_quality.csi1000_member_count.
+    Callers may override if config is available.
+
+    Silently skips when the index file does not exist (unit-test fixtures
+    build minimal instrument dirs without all index files).
+
+    Called at the end of _dump_bin_update so every data-write path
+    (fetch-today, backfill, pipeline baostock fallback) inherits the
+    gate. On violation the caller fails (fetch-today -> rc!=0 ->
+    ashare-data-update.sh alerts; pipeline fallback -> gap_fill rc!=0 ->
+    existing fallback failure path).
+    """
+    index_file = inst_dir / f"{index}.txt"
+    if not index_file.exists():
+        log.debug("membership gate: %s not found, skipping", index_file.name)
+        return
+
+    active = 0
+    for line in index_file.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        start = parts[1]
+        end = parts[2] if len(parts) >= 3 else ""
+        if start <= trade_date and (not end or end >= trade_date):
+            active += 1
+
+    lo, hi = expected - tolerance, expected + tolerance
+    if not (lo <= active <= hi):
+        raise ValueError(
+            f"{index} membership gate FAILED: {active} active on {trade_date} "
+            f"(expected [{lo}, {hi}]). Possible universe inflation."
+        )
+    log.info("membership gate: %s %d active on %s (OK)", index, active, trade_date)
 
 
 def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
@@ -316,6 +376,10 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     dates_to_add = [d for d in new_dates if d not in existing_dates]
     if not dates_to_add:
         log.info("dump_bin update: all dates already in calendar, skipping")
+        # Gate: still check membership even when no new dates.
+        latest_date = max(new_dates) if new_dates else (max(existing_dates) if existing_dates else None)
+        if latest_date:
+            check_index_membership(inst_dir, latest_date)
         return
     with open(cal_path, "a", encoding="utf-8") as f:
         for d in dates_to_add:
@@ -348,6 +412,12 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
 
     if new_dates:
         _extend_instrument_end_dates(inst_dir, traded_syms, max(new_dates))
+
+    # Gate: always check after data write, even if no new dates
+    # (the caller may have written data on a previous partial run).
+    latest_date = max(new_dates) if new_dates else max(existing_dates) if existing_dates else None
+    if latest_date:
+        check_index_membership(inst_dir, latest_date)
 
     log.info(
         "dump_bin update: %d instruments, %d new dates", count, len(dates_to_add)
