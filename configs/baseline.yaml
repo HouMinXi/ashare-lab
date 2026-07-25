@@ -3,6 +3,10 @@ universe:
   primary: csi1000      # try: more alpha in smaller/mid caps than csi500
   reference: csi500
   exclude_close_above_cny: 300
+  data_quality:
+    csi1000_member_count:
+      expected: 1000
+      tolerance: 100
 walk_forward:
   train_start: "2018-01-01"    # absolute earliest allowed train start (safety floor)
   base_train_end: "2020-12-31"
