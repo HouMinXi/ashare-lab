@@ -34,7 +34,7 @@ class TestPredictAlert:
         """B1: missing model -> alert sent with expected and fallback names."""
         from ashare_lab.research.predict import _send_alert
 
-        with mock.patch.dict("os.environ", {"GATEWAY_API_KEY": "test-key"}):
+        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
             with mock.patch("urllib.request.urlopen") as mock_urlopen:
                 mock_resp = mock.MagicMock()
                 mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
@@ -50,14 +50,14 @@ class TestPredictAlert:
                 mock_urlopen.assert_called_once()
                 req = mock_urlopen.call_args[0][0]
                 body = json.loads(req.data.decode("utf-8"))
-                assert "w11.pt missing" in body["message"]
-                assert "latest.pt" in body["message"]
+                assert "w11.pt missing" in body["body"]
+                assert "latest.pt" in body["body"]
 
     def test_alert_fail_open(self, caplog) -> None:
         """B2: notify raises -> logged, does not propagate."""
         from ashare_lab.research.predict import _send_alert
 
-        with mock.patch.dict("os.environ", {"GATEWAY_API_KEY": "test-key"}):
+        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
             with mock.patch("urllib.request.urlopen", side_effect=Exception("network down")):
                 _send_alert("[test] alert")
 
@@ -67,7 +67,7 @@ class TestPredictAlert:
         """One alert per run: second call is a no-op."""
         from ashare_lab.research.predict import _send_alert
 
-        with mock.patch.dict("os.environ", {"GATEWAY_API_KEY": "test-key"}):
+        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
             with mock.patch("urllib.request.urlopen") as mock_urlopen:
                 mock_resp = mock.MagicMock()
                 mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
@@ -106,7 +106,7 @@ class TestPredictAlert:
         import ashare_lab.research.predict as mod
         mod._ALERT_SENT_THIS_RUN = False
 
-        with mock.patch.dict("os.environ", {"GATEWAY_API_KEY": "test-key"}):
+        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
             with mock.patch("urllib.request.urlopen") as mock_urlopen:
                 mock_resp = mock.MagicMock()
                 mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
@@ -117,4 +117,5 @@ class TestPredictAlert:
                 mod._send_alert("[test] boundary check")
 
                 req = mock_urlopen.call_args[0][0]
-                assert "8642" in req.full_url or "api/weixin/send" in req.full_url
+                assert req.full_url.endswith("/alert")
+                assert req.headers.get("X-bridge-token") == "test-token" or req.headers.get("X-Bridge-Token") == "test-token"
