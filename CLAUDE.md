@@ -99,7 +99,7 @@ ashare group sovereign territory (Zone C): paper.db, models, pipeline, sentinel,
 
 **H0b ownership**: ashare EXECUTES + OPERATES qwen serving on gpu-win. Zero ashare-lab code edits during observation window. Config edits via mhou_workspace worktree only.
 
-**gpu-win contention**: serving is default GPU owner; training batches acquire `H:\gpu.lock`, serving yields. Stale-lock TTL (mtime-based expiry).
+**gpu-win GPU split (user policy 2026-07-25)**: static dual-GPU partition -- GPU 0 (RTX 3080) is RESERVED for local models (llama-server serving), ashare training runs pinned to GPU 1 (RTX 3060 Ti, `CUDA_VISIBLE_DEVICES=1`). Training no longer contends with serving; do NOT stop llama-server for training. Legacy: `batch_experiment.py` may still acquire `H:\gpu.lock` (stale-lock TTL, mtime-based expiry) from the pre-split era.
 
 **X500 timer namespace** (reserved): ashare-wol 17:30, data-update 17:45, pipeline 18:00, dsa-sentinel 18:50, chenditc 21:00, backup 23:00 (CST). Harness dispatcher gets separate namespace per J2.
 

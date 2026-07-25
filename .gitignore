@@ -37,3 +37,4 @@ results/
 results_*/
 *.html
 .mcp.json
+paper.db*
