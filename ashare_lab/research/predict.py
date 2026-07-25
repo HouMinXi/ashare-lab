@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,6 +26,64 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
+
+# -- Alert infrastructure (fail-open, stdlib only) --------------------------
+_ALERT_SENT_THIS_RUN = False  # rate-sanity: one alert per predict run
+
+_BRIDGE_TOKEN_PATHS = (
+    r"H:\.secrets\bridge-token",  # gpu-win
+    os.path.expanduser("~/.secrets/bridge-token"),  # POSIX
+)
+
+
+def _bridge_token() -> str:
+    """Read the alert-bridge shared token: env first, then token file."""
+    tok = os.environ.get("X_BRIDGE_TOKEN", "").strip()
+    if tok:
+        return tok
+    for p in _BRIDGE_TOKEN_PATHS:
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            continue
+    return ""
+
+
+def _send_alert(text: str) -> None:
+    """Send a plain-text alert via alert-bridge POST /alert. Fail-open.
+
+    Uses stdlib urllib to avoid importing aiohttp/requests in the predict
+    path. Transport: alert-bridge :8377/alert, the same proven path
+    surflare alerts use (it forwards to hermes-gateway with its own
+    credentials). hermes-gateway :8642 direct is NOT usable here -- it
+    requires an API_SERVER_KEY this project does not have (verified by
+    real-send test 2026-07-25). Token comes from X_BRIDGE_TOKEN env or a
+    bridge-token file (see _BRIDGE_TOKEN_PATHS); without it the alert is
+    skipped with a warning. One alert per predict run (module-level
+    _ALERT_SENT_THIS_RUN flag, set only after a successful send).
+    """
+    global _ALERT_SENT_THIS_RUN  # noqa: PLW0603
+    if _ALERT_SENT_THIS_RUN:
+        return
+
+    import urllib.request  # noqa: PLC0415
+
+    token = _bridge_token()
+    if not token:
+        log.warning("alert: no bridge token available, skipping alert")
+        return
+
+    url = os.environ.get("GATEWAY_URL", "http://192.168.100.10:8377/alert")
+    headers = {"Content-Type": "application/json", "X-Bridge-Token": token}
+    payload = json.dumps({"title": "ashare-predict", "body": text}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info("alert sent: %s", resp.read().decode("utf-8")[:100])
+        _ALERT_SENT_THIS_RUN = True  # only after successful send
+    except Exception as exc:
+        log.warning("alert failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +393,11 @@ def predict_for_date(
             if fallback.exists():
                 log.warning("w%d.pt missing, falling back to latest.pt", window_id)
                 model_path = fallback
+                _send_alert(
+                    f"[predict] model fallback: w{window_id}.pt missing, "
+                    f"using {fallback.name} on {trade_date}. "
+                    f"Action: train w{window_id}.pt"
+                )
             # else: let the FileNotFoundError below fire with the original path
 
     if not model_path.exists():
@@ -350,6 +414,11 @@ def predict_for_date(
             "MODEL STALE: %s is %.0f days old (threshold: %d days). "
             "Consider retraining.",
             model_path.name, model_age_days, _MODEL_STALE_DAYS,
+        )
+        _send_alert(
+            f"[predict] model stale: {model_path.name} is {model_age_days:.1f} days old "
+            f"(threshold: {_MODEL_STALE_DAYS}) on {trade_date}. "
+            f"Action: retrain"
         )
 
     log.info(
