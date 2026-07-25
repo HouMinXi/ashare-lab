@@ -571,9 +571,9 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
 
 HERMES_GATEWAY_URL = (
     os.environ.get("HERMES_GATEWAY_URL")
-    or "http://192.168.100.10:8642/api/weixin/send"
+    or "http://192.168.100.10:8377/api/weixin/send"
 )
-HERMES_GATEWAY_BASE = HERMES_GATEWAY_URL.rsplit("/", 1)[0]  # http://192.168.100.10:8642/api/weixin
+HERMES_GATEWAY_BASE = HERMES_GATEWAY_URL.rsplit("/", 1)[0]  # http://192.168.100.10:8377/api/weixin
 
 
 def check_hermes_gateway(timeout: int = 5) -> bool:
