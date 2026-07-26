@@ -223,12 +223,17 @@ def load_risk_state(conn) -> tuple[RiskState, str | None]:
 
 
 def save_risk_state(
-    conn, state: RiskState, lockdown_enter_date: str | None,
+    conn,
+    state: RiskState,
+    lockdown_enter_date: str | None,
+    *,
+    derive_soft_reduced: bool = False,
 ) -> None:
     """Persist risk state and lockdown date to paper_state.
 
-    Also derives is_soft_reduced for backward compatibility until
-    report.py stops reading it.
+    When *derive_soft_reduced* is True, also writes is_soft_reduced
+    derived from the state (enforce mode only).  In shadow mode this
+    must be False so the old logic's is_soft_reduced is not overwritten.
     """
     conn.execute(
         "INSERT OR REPLACE INTO paper_state (key, value) VALUES (?, ?)",
@@ -243,12 +248,12 @@ def save_risk_state(
         conn.execute(
             "DELETE FROM paper_state WHERE key = ?", (_LOCKDOWN_DATE_KEY,)
         )
-    # Backward compat: derive is_soft_reduced from state
-    is_soft = "true" if state == RiskState.SOFT_REDUCED else "false"
-    conn.execute(
-        "INSERT OR REPLACE INTO paper_state (key, value) VALUES (?, ?)",
-        ("is_soft_reduced", is_soft),
-    )
+    if derive_soft_reduced:
+        is_soft = "true" if state == RiskState.SOFT_REDUCED else "false"
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_state (key, value) VALUES (?, ?)",
+            ("is_soft_reduced", is_soft),
+        )
 
 
 # ---------------------------------------------------------------------------

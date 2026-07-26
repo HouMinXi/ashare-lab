@@ -586,6 +586,8 @@ def run_all_risk_checks(
                 "old_flags": old_flags,
                 "shadow_state": sm_result.state.value,
                 "would_do": would_do,
+                "new_state": sm_result.state.value,
+                "new_lockdown_enter_date": sm_result.lockdown_enter_date,
             }
             if sm_result.transition:
                 logger.info(
@@ -616,6 +618,11 @@ def run_all_risk_checks(
             # Override topk from state machine if in SOFT_REDUCED
             if sm_result.topk_override is not None:
                 topk_override = sm_result.topk_override
+            # Carry state info for pipeline persistence
+            shadow_log = {
+                "new_state": sm_result.state.value,
+                "new_lockdown_enter_date": sm_result.lockdown_enter_date,
+            }
     else:
         # No state machine provided -- legacy behavior
         buying_halted = drawdown_halted or daily_overlay_halted

@@ -1334,9 +1334,21 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
         from ashare_lab.paper.risk_state import log_shadow_transition  # noqa: PLC0415
         log_shadow_transition(
             ctx.conn, ctx.trade_date,
-            ctx.risk_result.shadow_log["old_flags"],
-            ctx.risk_result.shadow_log["shadow_state"],
-            ctx.risk_result.shadow_log["would_do"],
+            ctx.risk_result.shadow_log.get("old_flags", {}),
+            ctx.risk_result.shadow_log.get("shadow_state", "normal"),
+            ctx.risk_result.shadow_log.get("would_do", {}),
+        )
+
+    # Persist new risk state (F1: save every run, both modes)
+    if ctx.risk_result.shadow_log is not None and "new_state" in ctx.risk_result.shadow_log:
+        from ashare_lab.paper.risk_state import RiskState, save_risk_state  # noqa: PLC0415
+        new_state = RiskState(ctx.risk_result.shadow_log["new_state"])
+        new_lockdown = ctx.risk_result.shadow_log.get("new_lockdown_enter_date")
+        ctx.risk_state = new_state
+        ctx.lockdown_enter_date = new_lockdown
+        save_risk_state(
+            ctx.conn, new_state, new_lockdown,
+            derive_soft_reduced=not is_shadow,  # F2: only enforce mode
         )
 
 

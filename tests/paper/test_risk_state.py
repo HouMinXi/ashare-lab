@@ -6,7 +6,6 @@ Persistence tests use tmp_path SQLite.
 
 from __future__ import annotations
 
-import datetime as dt
 import sqlite3
 
 import pytest
@@ -199,7 +198,7 @@ class TestPersistence:
         assert lockdown is None
 
     def test_save_derives_is_soft_reduced(self, db):
-        save_risk_state(db, RiskState.SOFT_REDUCED, None)
+        save_risk_state(db, RiskState.SOFT_REDUCED, None, derive_soft_reduced=True)
         row = db.execute(
             "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
         ).fetchone()
@@ -210,11 +209,23 @@ class TestPersistence:
             "INSERT INTO paper_state (key, value) VALUES ('is_soft_reduced', 'true')"
         )
         db.commit()
-        save_risk_state(db, RiskState.NORMAL, None)
+        save_risk_state(db, RiskState.NORMAL, None, derive_soft_reduced=True)
         row = db.execute(
             "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
         ).fetchone()
         assert row["value"] == "false"
+
+    def test_shadow_mode_does_not_derive_soft_reduced(self, db):
+        """F2: shadow mode must not overwrite is_soft_reduced."""
+        db.execute(
+            "INSERT INTO paper_state (key, value) VALUES ('is_soft_reduced', 'true')"
+        )
+        db.commit()
+        save_risk_state(db, RiskState.NORMAL, None, derive_soft_reduced=False)
+        row = db.execute(
+            "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
+        ).fetchone()
+        assert row["value"] == "true"  # unchanged by shadow mode
 
     def test_save_clears_lockdown_date(self, db):
         save_risk_state(db, RiskState.LIQUIDATED, "2026-07-24")
@@ -331,6 +342,90 @@ class TestBugInjection:
         r2 = evaluate_state(ctx2, RiskState.LIQUIDATED, "2026-07-25", config)
         assert r2.state == RiskState.LIQUIDATED  # still locked
         assert r2.forced_sells_all is True
+
+
+# -- F3: Multi-day integration test -----------------------------------------
+
+class TestMultiDayIntegration:
+    """F3: day-N -> day-N+1 evolution through save/load cycle."""
+
+    def test_liquidate_lockdown_recovery(self, db, config):
+        """Day1: enter LIQUIDATED. Day2: still locked. After 5 days + dd<0.10: NORMAL."""
+        # Day 1: dd=0.16 -> LIQUIDATED
+        ctx1 = _ctx(100_000, 84_000, "2026-07-25")
+        r1 = evaluate_state(ctx1, RiskState.BUY_HALT, None, config)
+        assert r1.state == RiskState.LIQUIDATED
+        save_risk_state(db, r1.state, r1.lockdown_enter_date)
+
+        # Day 2: load state -> still LIQUIDATED (1 day < 5)
+        state, lockdown = load_risk_state(db)
+        assert state == RiskState.LIQUIDATED
+        assert lockdown == "2026-07-25"
+        ctx2 = _ctx(100_000, 92_000, "2026-07-28")  # dd=0.08 but lockdown
+        r2 = evaluate_state(ctx2, state, lockdown, config)
+        assert r2.state == RiskState.LIQUIDATED  # still locked
+        save_risk_state(db, r2.state, r2.lockdown_enter_date)
+
+        # Day 3: 5 trading days later, dd=0.09 -> NORMAL
+        state, lockdown = load_risk_state(db)
+        ctx3 = _ctx(100_000, 91_000, "2026-08-01")  # 5 trading days after 07-25
+        r3 = evaluate_state(ctx3, state, lockdown, config)
+        assert r3.state == RiskState.NORMAL
+        assert r3.lockdown_enter_date is None
+        save_risk_state(db, r3.state, r3.lockdown_enter_date)
+
+        # Verify final state persisted correctly
+        final_state, final_lockdown = load_risk_state(db)
+        assert final_state == RiskState.NORMAL
+        assert final_lockdown is None
+
+    def test_state_persists_across_runs(self, db, config):
+        """State survives save/load cycle without re-deriving."""
+        # Save SOFT_REDUCED
+        save_risk_state(db, RiskState.SOFT_REDUCED, None)
+
+        # Load -> still SOFT_REDUCED (not re-derived from dd)
+        state, lockdown = load_risk_state(db)
+        assert state == RiskState.SOFT_REDUCED
+
+        # Evaluate with dd=0.05 (below recovery) -> NORMAL
+        ctx = _ctx(100_000, 95_000, "2026-07-26")
+        r = evaluate_state(ctx, state, lockdown, config)
+        assert r.state == RiskState.NORMAL
+        save_risk_state(db, r.state, r.lockdown_enter_date)
+
+        # Verify persisted
+        final, _ = load_risk_state(db)
+        assert final == RiskState.NORMAL
+
+
+# -- F4: Bug-injection (delete save -> F3 fails) ----------------------------
+
+class TestBugInjectionSave:
+    """F4: removing save_risk_state causes state to not persist."""
+
+    def test_without_save_state_resets_to_migration(self, db, config):
+        """Without save, next load returns migration-day state (NORMAL)."""
+        # Simulate: evaluate -> LIQUIDATED but DO NOT save
+        ctx = _ctx(100_000, 84_000, "2026-07-25")
+        r = evaluate_state(ctx, RiskState.BUY_HALT, None, config)
+        assert r.state == RiskState.LIQUIDATED
+
+        # Without save, load returns NORMAL (default)
+        state, lockdown = load_risk_state(db)
+        assert state == RiskState.NORMAL  # NOT LIQUIDATED
+        assert lockdown is None
+
+    def test_with_save_state_persists(self, db, config):
+        """With save, next load returns the saved state."""
+        ctx = _ctx(100_000, 84_000, "2026-07-25")
+        r = evaluate_state(ctx, RiskState.BUY_HALT, None, config)
+        assert r.state == RiskState.LIQUIDATED
+        save_risk_state(db, r.state, r.lockdown_enter_date)
+
+        state, lockdown = load_risk_state(db)
+        assert state == RiskState.LIQUIDATED
+        assert lockdown == "2026-07-25"
 
 
 # -- Edge cases -------------------------------------------------------------
