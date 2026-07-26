@@ -6,7 +6,7 @@ universe:
   data_quality:
     csi1000_member_count:
       expected: 1000
-      tolerance: 100
+      tolerance: 10
 walk_forward:
   train_start: "2018-01-01"    # absolute earliest allowed train start (safety floor)
   base_train_end: "2020-12-31"

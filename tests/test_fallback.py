@@ -689,7 +689,7 @@ class TestOpenRowExtension:
         (provider / "instruments" / "all.txt").write_text(
             "SH600519\t2020-01-01\t2024-03-01\n", encoding="utf-8"
         )
-        # csi1000.txt with 1000 open rows (gate expects [900, 1100]).
+        # csi1000.txt with 1000 open rows (gate expects [990, 1010]).
         csi_lines = [f"SH{i:06d}\t2020-01-01\t2024-03-01" for i in range(1000)]
         (provider / "instruments" / "csi1000.txt").write_text(
             "\n".join(csi_lines) + "\n", encoding="utf-8"
@@ -778,6 +778,15 @@ class TestIndexMembershipGate:
         inst_dir.mkdir()
         # No csi1000.txt -- should not raise.
         check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_fails_at_1020(self, tmp_path: Path) -> None:
+        """Tight tolerance (±10): 1020 is outside [990, 1010]."""
+        from ashare_lab.data.fallback import check_index_membership
+
+        lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(1020)]
+        inst_dir = self._make_instruments(tmp_path, lines)
+        with pytest.raises(ValueError, match="FAILED"):
+            check_index_membership(inst_dir, "2024-07-25")
 
     def test_gate_fires_through_dump_bin_update(self, tmp_path: Path) -> None:
         """A4: gate fires via _dump_bin_update, not only via cli."""

@@ -325,7 +325,7 @@ def check_index_membership(
     trade_date: str,
     index: str = "csi1000",
     expected: int = 1000,
-    tolerance: int = 100,
+    tolerance: int = 10,
 ) -> None:
     """Verify index member count is within tolerance of expected.
 
@@ -333,8 +333,9 @@ def check_index_membership(
     (start <= trade_date, end >= trade_date or empty). Raises ValueError
     if count is outside [expected - tolerance, expected + tolerance].
 
-    Default values (expected=1000, tolerance=100) match
+    Default values (expected=1000, tolerance=10) match
     baseline.yaml universe.data_quality.csi1000_member_count.
+    Tight tolerance (1%) because chenditc bundles have exact counts.
     Callers may override if config is available.
 
     Silently skips when the index file does not exist (unit-test fixtures
