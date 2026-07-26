@@ -1439,6 +1439,31 @@ def _step9c_nav_hedge_split(ctx: DailyRunContext) -> None:
     )
 
 
+def timing_multiplier(trade_date: str, model: str = "none") -> float:
+    """Return the timing multiplier m for the given trade date and model.
+
+    m scales top-k target weights at order generation (cash allocation),
+    not signal scores.  Supported values: {0, 0.5, 1.0}.
+
+    Currently returns 1.0 for all models (null placeholder).
+    The three null models (N1=MA trend, N2=vol percentile, N3=drawdown
+    state map) are a later order; the seam is here so they plug in
+    without refactoring.
+
+    Args:
+        trade_date: ISO date string (YYYY-MM-DD).
+        model: Model identifier.  "none" = always 1.0.
+
+    Returns:
+        Float multiplier in {0, 0.5, 1.0}.
+    """
+    if model == "none":
+        return 1.0
+    # Future: dispatch to N1/N2/N3 model implementations here
+    logger.warning("Unknown timing model %r, defaulting to m=1.0", model)
+    return 1.0
+
+
 def _step10_signal_generation(ctx: DailyRunContext) -> int:
     """Generate signals, filter candidates, insert buy/sell orders.  Return 2 on error."""
     if ctx.steps == {"settle"}:
@@ -1781,6 +1806,198 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
     ctx.conn.commit()
 
 
+def _step12_book_b(ctx: DailyRunContext) -> None:
+    """Run Book B shadow ledger (fail-open, never affects production).
+
+    Book B is an in-process shadow of Book A: shares ctx.prices,
+    prediction parquet, universe, industry_map, benchmarks.  Owns only
+    its book state (positions, cash, orders, nav) in paper_b.db.
+
+    The timing multiplier m scales target weights at order generation.
+    With m=1.0, Book B must reproduce Book A to the cent (R3).
+    """
+    try:
+        _run_book_b(ctx)
+    except Exception:
+        logger.warning("[book_b] Book B failed for %s, continuing", ctx.trade_date, exc_info=True)
+
+
+def _run_book_b(ctx: DailyRunContext) -> None:
+    """Book B implementation.  Isolated for testability."""
+    book_id = "none"  # future: "n1", "n2", "n3"
+    m = timing_multiplier(ctx.trade_date, model=book_id)
+
+    # Open Book B database
+    db_dir = ctx.db_path.parent if ctx.db_path else Path("data")
+    book_b_path = db_dir / f"paper_b_{book_id}.db"
+    if not book_b_path.exists():
+        # Day 0 bootstrap: copy production DB
+        _bootstrap_book_b(ctx.db_path, book_b_path)
+
+    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    book_conn = get_connection(book_b_path)
+    try:
+        # Load Book B state
+        from ashare_lab.paper.ledger import (  # noqa: PLC0415
+            get_latest_positions, get_latest_cash, get_cooldowns,
+            manage_trailing_cooldown, delete_expired_cooldowns,
+        )
+        book_positions = get_latest_positions(book_conn)
+        book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+        book_cooldown = get_cooldowns(book_conn)
+        book_cooldown = manage_trailing_cooldown(book_cooldown, ctx.trade_date)
+        delete_expired_cooldowns(book_conn, ctx.trade_date)
+
+        # Compute Book B NAV
+        book_total_nav = sum(
+            pos["market_value"] for pos in book_positions.values()
+        ) + book_cash
+
+        # Generate Book B orders (same signals, m-scaled target)
+        from ashare_lab.paper.signal import (  # noqa: PLC0415
+            generate_signals, filter_candidates, topk_dropout_orders,
+        )
+        from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
+
+        signals = generate_signals(ctx.pred_path)
+        filtered_syms = filter_candidates(
+            signals, ctx.universe_symbols, ctx.ipo_listing_syms,
+            ctx.st_names, ctx.market_data,
+            ctx.config.get("universe", {}).get("listing_min_days", 60),
+            ctx.config.get("universe", {}).get("min_avg_turnover_20d", 0.0),
+            ctx.config.get("universe", {}).get("exclude_close_above_cny", 300.0),
+        )
+        filtered_signals = {s: signals[s] for s in filtered_syms}
+
+        effective_topk = ctx.risk_result.topk_override or ctx.paper_cfg["topk"]
+        ipo_held = {
+            s for s in book_positions
+            if ctx.market_data.get(s, {}).get("listing_days", 999)
+            < ctx.paper_cfg.get("listing_min_days", 60)
+        }
+        held_set = set(book_positions.keys()) - ipo_held
+        topk_for_dropout = max(0, effective_topk - len(ipo_held))
+        sell_syms, buy_syms = topk_dropout_orders(
+            filtered_signals, held_set, topk_for_dropout, ctx.paper_cfg.get("n_drop", 1),
+        )
+
+        # Apply risk filters (same as Book A)
+        buy_syms = [
+            s for s in buy_syms
+            if ctx.industry_map.get(s) not in ctx.risk_result.blocked_industries
+            and s not in ctx.risk_result.blocked_rebuys
+        ]
+        if ctx.risk_result.buying_halted:
+            buy_syms = []
+
+        # Compute m-scaled target value
+        if effective_topk <= 0:
+            target_value = 0.0
+            buy_syms = []
+        else:
+            equity_nav = book_total_nav
+            target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"] * m) / effective_topk
+
+        # Generate sell orders
+        forced_sells = ctx.risk_result.forced_sells
+        sell_set = set(sell_syms) | set(forced_sells.keys())
+        desired_sell_qty: dict[str, int] = {}
+        for s in sell_set:
+            if s in sell_syms:
+                desired_sell_qty[s] = book_positions.get(s, {}).get("qty", 0)
+            else:
+                desired_sell_qty[s] = forced_sells[s]
+
+        next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+        for s in sell_set:
+            to_insert = desired_sell_qty[s]
+            if to_insert > 0:
+                insert_order(book_conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
+
+        # Generate buy orders (m-scaled)
+        for s in buy_syms:
+            close_price = ctx.prices.get(s, {}).get("close")
+            if not close_price or close_price <= 0:
+                continue
+            target_qty = round_lots(target_value / close_price, "buy")
+            if target_qty <= 0:
+                continue
+            insert_order(book_conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
+
+        # Settle Book B
+        book_orders = book_conn.execute(
+            "SELECT * FROM orders WHERE trade_date=? AND status='pending'",
+            (next_td_str,),
+        ).fetchall()
+        book_order_dicts = [dict(row) for row in book_orders]
+
+        book_settle = settle_day(
+            book_conn, ctx.trade_date, book_order_dicts, ctx.prices,
+            book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
+        )
+
+        # Record Book B NAV
+        if book_settle:
+            record_nav(
+                book_conn, ctx.trade_date, book_settle.cash,
+                book_settle.market_value, book_settle.total_nav,
+                book_settle.pre_trade_nav, book_settle.post_trade_nav,
+                None, None,  # Book B doesn't track benchmarks separately
+            )
+
+        # Write A/B/C artifact
+        _write_abc_artifact(ctx, book_conn, book_id, m)
+
+        book_conn.commit()
+        logger.info("[book_b] completed for %s (m=%.1f, book_id=%s)", ctx.trade_date, m, book_id)
+    finally:
+        book_conn.close()
+
+
+def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
+    """Day 0 bootstrap: copy production DB to Book B DB."""
+    import shutil  # noqa: PLC0415
+    shutil.copy2(prod_db_path, book_b_path)
+    logger.info("[book_b] bootstrapped %s -> %s", prod_db_path, book_b_path)
+
+
+def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float) -> None:
+    """Write daily A/B/C comparison artifact to experiments/control_books/."""
+    from ashare_lab.paper.ledger import get_latest_positions, get_latest_cash  # noqa: PLC0415
+
+    # Book A NAV (from production)
+    nav_a = ctx.total_nav
+
+    # Book B NAV
+    book_positions = get_latest_positions(book_conn)
+    book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+    nav_b = sum(pos["market_value"] for pos in book_positions.values()) + book_cash
+
+    # Book C (benchmark CSI1000)
+    nav_c = ctx.benchmarks.get("csi1000", 0.0)
+
+    # Excess returns
+    excess_a = nav_a / nav_c - 1.0 if nav_c > 0 else 0.0
+    excess_b = nav_b / nav_c - 1.0 if nav_c > 0 else 0.0
+
+    # Write artifact
+    artifact_dir = Path("experiments/control_books")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "date": ctx.trade_date,
+        "book_id": book_id,
+        "nav_a": round(nav_a, 2),
+        "nav_b": round(nav_b, 2),
+        "nav_c": round(nav_c, 2),
+        "excess_a": round(excess_a, 6),
+        "excess_b": round(excess_b, 6),
+        "m": m,
+    }
+    artifact_path = artifact_dir / f"{ctx.trade_date}_{book_id}.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("[book_b] A/B/C artifact written: %s", artifact_path)
+
+
 def _step13_report(ctx: DailyRunContext) -> None:
     """Deliver WeChat report (non-blocking)."""
     logger.info("[report] entered for %s (steps=%s)", ctx.trade_date, ctx.steps)
@@ -1975,6 +2192,7 @@ def run_daily(
 
     _step11_ipo_processing(ctx)
     _step12_backup_and_finalize(ctx)
+    _step12_book_b(ctx)
     _step13_report(ctx)
     _step14_record_pipeline_run(ctx)
     _step15_graduation(ctx)
