@@ -1,13 +1,21 @@
-"""7-dimension risk control framework for the paper trading engine.
+"""Risk control framework for the paper trading engine.
 
 Dimensions:
-1. Max drawdown circuit breaker (D-35)
-2. Daily loss limit (D-36)
+1. Max drawdown circuit breaker (D-35) -- now driven by state machine
+2. Daily loss limit (D-36) -- daily overlay
 3. Position concentration cap (D-37)
-4. Market regime filter (D-38)
+4. Market regime filter (D-38) -- daily overlay
 5. Trailing stop with cooldown (D-39)
 6. CSRC industry concentration (D-40)
-7. Soft drawdown topk reduction (D-45)
+7. Soft drawdown topk reduction (D-45) -- now driven by state machine
+8. Prediction staleness -- daily overlay
+9. Suspension risk (alert-only)
+
+The drawdown-related dimensions (1, 7) are managed by a persistent
+state machine (risk_state.py) that prevents whipsaw oscillation.
+Daily overlays (2, 4, 8) block buying for one day only and never
+change the persistent state.  In shadow mode the state machine logs
+transitions but the old per-day logic keeps authority.
 
 Each dimension is a pure check function.  run_all_risk_checks aggregates
 them into a single frozen RiskCheckResult.  All thresholds are read from
@@ -22,6 +30,12 @@ import math
 from dataclasses import dataclass, field
 
 from ashare_lab.data.calendar import next_trading_day, trading_days_between
+from ashare_lab.paper.risk_state import (
+    RiskState,
+    RiskStateContext,
+    compute_drawdown,
+    evaluate_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +85,7 @@ class RiskCheckResult:
     topk_override: int | None
     cooldown_entries: dict[str, dict]
     suspension_risk: dict[str, float] = field(default_factory=dict)
+    shadow_log: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -372,14 +387,23 @@ def run_all_risk_checks(
     config: dict,
     trade_date: str,
     pred_date: str | None = None,
+    *,
+    risk_state: RiskState | None = None,
+    lockdown_enter_date: str | None = None,
+    is_shadow: bool = True,
 ) -> RiskCheckResult:
-    """Aggregate all 8 risk dimensions into a single result.
+    """Aggregate all risk dimensions into a single result.
 
     All thresholds are read from *config* (paper.risk section).
     *yesterday_nav* is passed explicitly by the pipeline to avoid
     mis-deriving it after record_nav has already written today's row.
     *trade_date* is required to compute cooldown_until dates.
     *pred_date* is the prediction file date for staleness check.
+
+    When *risk_state* is provided, the persistent state machine
+    replaces the per-day drawdown breaker for buying_halted and
+    forced_sells.  In shadow mode (default) the machine computes
+    and logs but does not affect output.
     """
     # -- Compute total/current NAV --
     total_nav = (
@@ -525,22 +549,82 @@ def run_all_risk_checks(
     }
 
     # -- Merge halt flags --
-    buying_halted = (
-        drawdown_halted or daily_loss_halted
-        or regime_halted or staleness_halted
+    # Daily overlays (per-day, auto-exit, NOT persistent):
+    #   daily_loss, market_regime, staleness
+    daily_overlay_halted = (
+        daily_loss_halted or regime_halted or staleness_halted
     )
 
-    # -- Hard drawdown forced liquidation (emergency override) --
-    # When drawdown_hard fires, force-sell ALL positions (full qty,
-    # overriding any partial sells from concentration or trailing
-    # stop). Previous code only halted buying, leaving portfolio
-    # frozen between 15-20% drawdown with no exit path.
-    if drawdown_halted:
-        for symbol, pos in current_positions.items():
-            forced_sells[symbol] = pos["qty"]
-            logger.warning(
-                "Hard drawdown forced sell: %s x%d",
-                symbol, pos["qty"])
+    # -- Persistent state machine (drawdown-driven) --
+    shadow_log = None
+    if risk_state is not None:
+        sm_ctx = RiskStateContext(
+            peak_nav=peak_nav,
+            current_nav=current_nav,
+            trade_date=trade_date,
+            is_shadow=is_shadow,
+        )
+        sm_result = evaluate_state(
+            sm_ctx, risk_state, lockdown_enter_date, config,
+        )
+
+        if is_shadow:
+            # Shadow mode: record what the machine WOULD do, keep old logic
+            old_flags = {
+                "drawdown_halted": drawdown_halted,
+                "daily_loss_halted": daily_loss_halted,
+                "regime_halted": regime_halted,
+                "staleness_halted": staleness_halted,
+            }
+            would_do = {
+                "buying_halted": sm_result.state != RiskState.NORMAL,
+                "forced_sells_all": sm_result.forced_sells_all,
+                "topk_override": sm_result.topk_override,
+                "transition": sm_result.transition,
+            }
+            shadow_log = {
+                "old_flags": old_flags,
+                "shadow_state": sm_result.state.value,
+                "would_do": would_do,
+            }
+            if sm_result.transition:
+                logger.info(
+                    "[SHADOW] state transition: %s (dd=%.4f)",
+                    sm_result.transition,
+                    compute_drawdown(peak_nav, current_nav),
+                )
+            # Old logic keeps authority in shadow mode
+            buying_halted = drawdown_halted or daily_overlay_halted
+            if drawdown_halted:
+                for symbol, pos in current_positions.items():
+                    forced_sells[symbol] = pos["qty"]
+                    logger.warning(
+                        "Hard drawdown forced sell: %s x%d",
+                        symbol, pos["qty"])
+        else:
+            # Enforce mode: state machine replaces drawdown breaker
+            state_machine_halted = sm_result.state in (
+                RiskState.BUY_HALT, RiskState.LIQUIDATED,
+            )
+            buying_halted = state_machine_halted or daily_overlay_halted
+            if sm_result.forced_sells_all:
+                for symbol, pos in current_positions.items():
+                    forced_sells[symbol] = pos["qty"]
+                    logger.warning(
+                        "State machine forced sell: %s x%d (state=%s)",
+                        symbol, pos["qty"], sm_result.state.value)
+            # Override topk from state machine if in SOFT_REDUCED
+            if sm_result.topk_override is not None:
+                topk_override = sm_result.topk_override
+    else:
+        # No state machine provided -- legacy behavior
+        buying_halted = drawdown_halted or daily_overlay_halted
+        if drawdown_halted:
+            for symbol, pos in current_positions.items():
+                forced_sells[symbol] = pos["qty"]
+                logger.warning(
+                    "Hard drawdown forced sell: %s x%d",
+                    symbol, pos["qty"])
 
     return RiskCheckResult(
         buying_halted=buying_halted,
@@ -550,4 +634,5 @@ def run_all_risk_checks(
         topk_override=topk_override,
         cooldown_entries=cooldown_entries,
         suspension_risk=suspension_risk,
+        shadow_log=shadow_log,
     )

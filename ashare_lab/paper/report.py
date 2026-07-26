@@ -221,34 +221,54 @@ def gather_report_data(
     # Cooldown count
     cooldown_count = conn.execute("SELECT COUNT(*) FROM cooldowns").fetchone()[0]
     
-    # is_soft_reduced
+    # Risk state (from state machine, not recomputed)
+    row_state = conn.execute("SELECT value FROM paper_state WHERE key = 'risk_state'").fetchone()
+    risk_state_str = row_state["value"] if row_state else "normal"
     row_soft = conn.execute("SELECT value FROM paper_state WHERE key = 'is_soft_reduced'").fetchone()
     is_soft_reduced = row_soft and row_soft["value"] == "true"
+    row_lockdown = conn.execute("SELECT value FROM paper_state WHERE key = 'lockdown_enter_date'").fetchone()
+    lockdown_enter_date = row_lockdown["value"] if row_lockdown else None
 
-    # buying_halted
-    current_drawdown_pct = 0.0
-    if peak > 0:
-        current_drawdown_pct = (peak - total_nav) / peak * 100.0
-    
-    risk_cfg = config["paper"]["risk"]
-    drawdown_halted = current_drawdown_pct > risk_cfg["drawdown_hard"] * 100.0
-    daily_loss_halted = daily_return_pct <= -risk_cfg["daily_loss"] * 100.0
-    
-    # regime halted
-    regime_days = risk_cfg.get("market_regime_days", 10)
-    c_rows = conn.execute(
-        "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
-        (trade_date, regime_days + 1)
-    ).fetchall()
-    
-    regime_halted = False
-    if len(c_rows) == regime_days + 1:
-        closes = [float(r[0]) for r in c_rows]
-        closes.reverse()
-        from ashare_lab.paper.risk import check_market_regime
-        regime_halted = check_market_regime(closes, risk_cfg["market_regime_decline"], regime_days)
-        
-    buying_halted = drawdown_halted or daily_loss_halted or regime_halted
+    # Shadow log (if available)
+    shadow_row = conn.execute(
+        "SELECT old_flags_json, shadow_state, would_do_json FROM risk_shadow_log WHERE trade_date = ?",
+        (trade_date,),
+    ).fetchone()
+    shadow_log = None
+    if shadow_row:
+        import json
+        shadow_log = {
+            "old_flags": json.loads(shadow_row["old_flags_json"]),
+            "shadow_state": shadow_row["shadow_state"],
+            "would_do": json.loads(shadow_row["would_do_json"]),
+        }
+
+    # buying_halted: read from shadow old_flags (authoritative for current run)
+    if shadow_log:
+        old_flags = shadow_log["old_flags"]
+        buying_halted = any(old_flags.get(k) for k in (
+            "drawdown_halted", "daily_loss_halted", "regime_halted", "staleness_halted",
+        ))
+    else:
+        # Fallback: recompute (legacy runs without shadow log)
+        current_drawdown_pct = 0.0
+        if peak > 0:
+            current_drawdown_pct = (peak - total_nav) / peak * 100.0
+        risk_cfg = config["paper"]["risk"]
+        drawdown_halted = current_drawdown_pct > risk_cfg["drawdown_hard"] * 100.0
+        daily_loss_halted = daily_return_pct <= -risk_cfg["daily_loss"] * 100.0
+        regime_days = risk_cfg.get("market_regime_days", 10)
+        c_rows = conn.execute(
+            "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
+            (trade_date, regime_days + 1)
+        ).fetchall()
+        regime_halted = False
+        if len(c_rows) == regime_days + 1:
+            closes = [float(r[0]) for r in c_rows]
+            closes.reverse()
+            from ashare_lab.paper.risk import check_market_regime
+            regime_halted = check_market_regime(closes, risk_cfg["market_regime_decline"], regime_days)
+        buying_halted = drawdown_halted or daily_loss_halted or regime_halted
 
     # Hedge sleeve state
     hedge_row = conn.execute(
@@ -284,10 +304,13 @@ def gather_report_data(
         risk_status={
             "buying_halted": buying_halted,
             "is_soft_reduced": is_soft_reduced,
+            "risk_state": risk_state_str,
+            "lockdown_enter_date": lockdown_enter_date,
             "sell_order_count": sell_order_count,
             "cooldown_count": cooldown_count,
-            "drawdown_halted": drawdown_halted,
-            "regime_halted": regime_halted,
+            "drawdown_halted": shadow_log["old_flags"]["drawdown_halted"] if shadow_log else False,
+            "regime_halted": shadow_log["old_flags"]["regime_halted"] if shadow_log else False,
+            "shadow_log": shadow_log,
         },
         industry_distribution=ind_dist,
         hedge_active=hedge_active,
@@ -413,6 +436,20 @@ def format_chinese_report(
         lines.append(f"⚠️ {' | '.join(warnings)}")
     else:
         lines.append("✅ 风控正常")
+
+    risk_state = rs.get("risk_state", "normal")
+    if risk_state != "normal":
+        state_labels = {
+            "soft_reduced": "软减仓态",
+            "buy_halt": "暂停买入态",
+            "liquidated": "清仓锁定态",
+        }
+        label = state_labels.get(risk_state, risk_state)
+        lockdown_date = rs.get("lockdown_enter_date")
+        if lockdown_date:
+            lines.append(f"🔒 风险状态: {label} (锁定起始: {lockdown_date})")
+        else:
+            lines.append(f"🔒 风险状态: {label}")
 
     if ic_nan:
         lines.append("⚠️ 模型自评指标不可用 (IC=nan)")

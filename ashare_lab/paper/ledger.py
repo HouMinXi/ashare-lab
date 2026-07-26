@@ -197,6 +197,14 @@ CREATE INDEX IF NOT EXISTS idx_trades_date
     ON trades (trade_date);
 CREATE INDEX IF NOT EXISTS idx_sentiment_scores_date
     ON sentiment_scores (trade_date);
+
+CREATE TABLE IF NOT EXISTS risk_shadow_log (
+    trade_date      TEXT NOT NULL,
+    old_flags_json  TEXT NOT NULL,
+    shadow_state    TEXT NOT NULL,
+    would_do_json   TEXT NOT NULL,
+    PRIMARY KEY (trade_date)
+);
 """
 
 _INITIAL_STATE_SQL = """\
