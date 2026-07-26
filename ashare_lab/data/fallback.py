@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv as csv_mod
 import datetime as dt
 import logging
+import os
 import struct
 import tempfile
 from pathlib import Path
@@ -316,7 +317,19 @@ def _extend_open_rows_in_file(
                 changed = True
         new_lines.append("\t".join(parts))
     if changed:
-        inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            dir=inst_file.parent, suffix=".tmp"
+        )
+        try:
+            os.close(fd)
+            Path(tmp_path).write_text(
+                "\n".join(new_lines) + "\n", encoding="utf-8"
+            )
+            os.chmod(tmp_path, inst_file.stat().st_mode & 0o7777)
+            os.replace(tmp_path, inst_file)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
 
 
 def check_index_membership(
