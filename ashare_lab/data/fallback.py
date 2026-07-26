@@ -263,31 +263,61 @@ def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
 
 
 def _extend_instrument_end_dates(
-    inst_dir: Path, traded_syms: set[str], latest: str
+    inst_dir: Path, traded_syms: set[str], latest: str  # noqa: ARG001
 ) -> None:
-    """Extend end_date in all.txt for symbols that traded on *latest*.
+    """Extend open membership intervals so the calendar can advance.
 
-    Only touches all.txt (the full-market universe).  Index membership
-    files (csi300/csi500/csi800/csi1000/csiall) are NEVER modified --
-    their membership comes exclusively from the data provider bundle
-    (chenditc swap in update.py).  Extending index files would erase
-    historical removals, causing universe inflation (e.g. csi1000
-    showing 2600 active vs the official 1000).
+    An *open interval* is any row whose end_date equals the file's
+    current MAX end_date at call time.  These rows represent members
+    that have not been explicitly removed by the data provider.
+    Only open intervals are rolled forward to *latest*; closed
+    intervals (end < max_end) are never touched.
+
+    This prevents two failure modes:
+    - Universe inflation: extending every row with end < latest
+      resurrects long-removed members (the original C-order bug).
+    - Empty universe: leaving index files frozen at the bundle date
+      causes active count = 0 on any post-bundle date.
+
+    Applies to all instrument files (all.txt + index membership files).
+
+    Edge case: a member removed exactly on the bundle date is
+    indistinguishable from a current member by this rule (both have
+    end == max_end).  The data provider would need to ship a newer
+    bundle to distinguish them; this is accepted.
     """
-    all_file = inst_dir / "all.txt"
-    if not all_file.exists():
+    for inst_file in sorted(inst_dir.glob("*.txt")):
+        _extend_open_rows_in_file(inst_file, latest)
+
+
+def _extend_open_rows_in_file(inst_file: Path, latest: str) -> None:
+    """Extend rows where end == file's max_end to *latest*.
+
+    Empty end_date means "still active" in qlib convention and is
+    treated as an open interval -- also extended.
+    """
+    if not inst_file.exists():
         return
-    lines = all_file.read_text(encoding="utf-8").splitlines()
+    lines = inst_file.read_text(encoding="utf-8").splitlines()
+    # Pass 1: find max_end (ignoring empty end dates).
+    max_end = ""
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2] and parts[2] > max_end:
+            max_end = parts[2]
+    if max_end and max_end >= latest:
+        return  # already current
+    # Pass 2: extend open rows (end == max_end or empty).
     new_lines: list[str] = []
     changed = False
     for line in lines:
         parts = line.split("\t")
-        if len(parts) == 3 and parts[0] in traded_syms and parts[2] < latest:
+        if len(parts) >= 3 and (parts[2] == max_end or not parts[2]):
             parts[2] = latest
             changed = True
         new_lines.append("\t".join(parts))
     if changed:
-        all_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
 def check_index_membership(
@@ -376,9 +406,14 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     dates_to_add = [d for d in new_dates if d not in existing_dates]
     if not dates_to_add:
         log.info("dump_bin update: all dates already in calendar, skipping")
-        # Gate: still check membership even when no new dates.
-        latest_date = max(new_dates) if new_dates else (max(existing_dates) if existing_dates else None)
+        # Gate: extend open rows + check membership even when no new dates.
+        latest_date = (
+            max(new_dates) if new_dates
+            else (max(existing_dates) if existing_dates else None)
+        )
         if latest_date:
+            _traded = {cf.stem.upper() for cf in csv_files}
+            _extend_instrument_end_dates(inst_dir, _traded, latest_date)
             check_index_membership(inst_dir, latest_date)
         return
     with open(cal_path, "a", encoding="utf-8") as f:
@@ -415,7 +450,10 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
 
     # Gate: always check after data write, even if no new dates
     # (the caller may have written data on a previous partial run).
-    latest_date = max(new_dates) if new_dates else max(existing_dates) if existing_dates else None
+    latest_date = (
+        max(new_dates) if new_dates
+        else max(existing_dates) if existing_dates else None
+    )
     if latest_date:
         check_index_membership(inst_dir, latest_date)
 
