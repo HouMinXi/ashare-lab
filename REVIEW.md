@@ -39,6 +39,18 @@ Files: 7 changed (940 insertions, 52 deletions)
 No confirmed code defects in L1 changes.
 CLAUDE.md symlink finding is a false positive (worktree -> main repo, not self-referential).
 
+## Rework (L1-R1)
+
+PM rejected initial delivery for D1: save_risk_state only called in migration,
+not in daily pipeline path. Rework commit 09359b2 fixes:
+
+- F1: save_risk_state called in _step9_risk_checks every run (both modes)
+- F2: save_risk_state gains derive_soft_reduced param (False in shadow, True in enforce)
+- F3: multi-day integration test (LIQUIDATED -> lockdown holds -> recovery -> NORMAL)
+- F4: bug-injection (without save, state resets; with save, persists)
+
+Tests: 83/83 PASSED (37 new + 46 existing).
+
 ## Advisory items (non-blocking)
 
 1. pipeline.py functions (_step4_load_state, _step9_risk_checks) lack unit tests
