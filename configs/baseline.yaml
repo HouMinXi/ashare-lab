@@ -113,6 +113,10 @@ paper:
     soft_drawdown_recovery: 0.95
     default_topk: 15
     reduced_topk: 7
+    state_machine: shadow   # shadow | enforce (enforce requires G2 gate)
+    halt_buys: 0.12         # dd >= this -> BUY_HALT
+    lockdown_days: 5        # trading days in LIQUIDATED before reentry
+    reentry_dd: 0.10        # dd must be below this to exit LIQUIDATED
   max_stale_trading_days: 3    # reject predictions older than this many trading days
   hedge:
     enabled: false

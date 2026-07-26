@@ -461,6 +461,8 @@ class DailyRunContext:
     cash: float = 0.0
     cooldown_state: dict = field(default_factory=dict)
     is_soft_reduced: bool = False
+    risk_state: "object | None" = None
+    lockdown_enter_date: str | None = None
 
     # Step 5 outputs
     universe_symbols: list = field(default_factory=list)
@@ -640,7 +642,7 @@ def _gate_data_completeness(ctx: DailyRunContext) -> None:
 
 
 def _step4_load_state(ctx: DailyRunContext) -> None:
-    """Load positions, cash, cooldowns, soft-reduce flag from DB."""
+    """Load positions, cash, cooldowns, risk state from DB."""
     ctx.current_positions = get_latest_positions(ctx.conn)
     ctx.cash = get_latest_cash(ctx.conn, ctx.paper_cfg["initial_cash"])
     ctx.cooldown_state = get_cooldowns(ctx.conn)
@@ -650,6 +652,42 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
         s: cd for s, cd in ctx.cooldown_state.items()
         if cd["cooldown_until"] >= ctx.trade_date
     }
+
+    # Load persistent risk state (state machine)
+    from ashare_lab.paper.risk_state import (  # noqa: PLC0415
+        RiskState,
+        ensure_shadow_log_table,
+        load_risk_state,
+        migrate_from_soft_reduced,
+    )
+    ensure_shadow_log_table(ctx.conn)
+    ctx.risk_state, ctx.lockdown_enter_date = load_risk_state(ctx.conn)
+    if ctx.risk_state == RiskState.NORMAL and ctx.lockdown_enter_date is None:
+        # Check if migration is needed (risk_state key absent)
+        row = ctx.conn.execute(
+            "SELECT value FROM paper_state WHERE key = 'risk_state'"
+        ).fetchone()
+        if row is None:
+            # First run with state machine -- migrate from is_soft_reduced
+            # Compute current dd for initial state derivation
+            nav_rows = ctx.conn.execute(
+                "SELECT trade_date, total_nav FROM nav ORDER BY trade_date ASC"
+            ).fetchall()
+            nav_history = [dict(r) for r in nav_rows]
+            if nav_history:
+                peak = max(r["total_nav"] for r in nav_history)
+                current = nav_history[-1]["total_nav"]
+                dd = (peak - current) / peak if peak > 0 else 0.0
+            else:
+                dd = 0.0
+            ctx.risk_state = migrate_from_soft_reduced(
+                ctx.conn, dd, ctx.trade_date,
+            )
+            if ctx.risk_state == RiskState.LIQUIDATED:
+                ctx.lockdown_enter_date = ctx.trade_date
+            ctx.conn.commit()
+
+    # Backward compat: load is_soft_reduced (derived from risk_state)
     row = ctx.conn.execute(
         "SELECT value FROM paper_state WHERE key='is_soft_reduced'"
     ).fetchone()
@@ -657,10 +695,6 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
         ctx.is_soft_reduced = row["value"] == "true"
     else:
         ctx.is_soft_reduced = False
-        ctx.conn.execute(
-            "INSERT INTO paper_state (key, value) VALUES ('is_soft_reduced', 'false')"
-        )
-        ctx.conn.commit()
 
 
 def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
@@ -1277,11 +1311,15 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
     nav_history = [dict(r) for r in nav_rows]
     yesterday_nav = float(nav_history[-2]["total_nav"]) if len(nav_history) >= 2 else ctx.total_nav
 
+    is_shadow = ctx.risk_cfg.get("state_machine", "shadow") == "shadow"
     ctx.risk_result = run_all_risk_checks(
         nav_history, yesterday_nav, ctx.current_positions, ctx.prices,
         ctx.csi1000_closes_11d, ctx.industry_map, ctx.cooldown_state, ctx.cash,
         ctx.is_soft_reduced, ctx.risk_cfg, ctx.trade_date,
         pred_date=ctx.predictions_date_str,
+        risk_state=ctx.risk_state,
+        lockdown_enter_date=ctx.lockdown_enter_date,
+        is_shadow=is_shadow,
     )
     ctx.is_soft_reduced = ctx.risk_result.topk_override is not None
     ctx.conn.execute(
@@ -1290,6 +1328,28 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
     )
     for symbol, entry in ctx.risk_result.cooldown_entries.items():
         set_cooldown(ctx.conn, symbol, entry["cooldown_until"], entry["holding_high"])
+
+    # Persist shadow log if present
+    if ctx.risk_result.shadow_log is not None:
+        from ashare_lab.paper.risk_state import log_shadow_transition  # noqa: PLC0415
+        log_shadow_transition(
+            ctx.conn, ctx.trade_date,
+            ctx.risk_result.shadow_log.get("old_flags", {}),
+            ctx.risk_result.shadow_log.get("shadow_state", "normal"),
+            ctx.risk_result.shadow_log.get("would_do", {}),
+        )
+
+    # Persist new risk state (F1: save every run, both modes)
+    if ctx.risk_result.shadow_log is not None and "new_state" in ctx.risk_result.shadow_log:
+        from ashare_lab.paper.risk_state import RiskState, save_risk_state  # noqa: PLC0415
+        new_state = RiskState(ctx.risk_result.shadow_log["new_state"])
+        new_lockdown = ctx.risk_result.shadow_log.get("new_lockdown_enter_date")
+        ctx.risk_state = new_state
+        ctx.lockdown_enter_date = new_lockdown
+        save_risk_state(
+            ctx.conn, new_state, new_lockdown,
+            derive_soft_reduced=not is_shadow,  # F2: only enforce mode
+        )
 
 
 def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
