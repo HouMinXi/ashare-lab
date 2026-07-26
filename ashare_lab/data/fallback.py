@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv as csv_mod
 import datetime as dt
 import logging
+import os
 import struct
 import tempfile
 from pathlib import Path
@@ -265,29 +266,70 @@ def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
 def _extend_instrument_end_dates(
     inst_dir: Path, traded_syms: set[str], latest: str
 ) -> None:
-    """Extend end_date in all.txt for symbols that traded on *latest*.
+    """Extend open membership intervals so the calendar can advance.
 
-    Only touches all.txt (the full-market universe).  Index membership
-    files (csi300/csi500/csi800/csi1000/csiall) are NEVER modified --
-    their membership comes exclusively from the data provider bundle
-    (chenditc swap in update.py).  Extending index files would erase
-    historical removals, causing universe inflation (e.g. csi1000
-    showing 2600 active vs the official 1000).
+    An *open interval* is any row whose end_date equals the file's
+    current MAX end_date at call time AND whose symbol traded on
+    *latest*.  Only open intervals are rolled forward; closed
+    intervals (end < max_end) are never touched.
+
+    The traded_syms filter prevents universe inflation: a stock
+    removed on the bundle date (end == max_end) is suspended and
+    does not appear in traded_syms, so it is not extended.
+
+    Applies to all instrument files (all.txt + index membership files).
     """
-    all_file = inst_dir / "all.txt"
-    if not all_file.exists():
+    for inst_file in sorted(inst_dir.glob("*.txt")):
+        _extend_open_rows_in_file(inst_file, traded_syms, latest)
+
+
+def _extend_open_rows_in_file(
+    inst_file: Path, traded_syms: set[str], latest: str
+) -> None:
+    """Extend rows where end == file's max_end to *latest*.
+
+    Only extends rows whose symbol is in *traded_syms*.  This prevents
+    extending a stock that was removed on the bundle date (end ==
+    max_end but suspended, so not in traded_syms).
+
+    Empty end_date means "still active" in qlib convention and is
+    treated as an open interval -- also extended.
+    """
+    if not inst_file.exists():
         return
-    lines = all_file.read_text(encoding="utf-8").splitlines()
+    lines = inst_file.read_text(encoding="utf-8").splitlines()
+    # Pass 1: find max_end (ignoring empty end dates).
+    max_end = ""
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[2] and parts[2] > max_end:
+            max_end = parts[2]
+    if max_end and max_end >= latest:
+        return  # already current
+    # Pass 2: extend open rows (end == max_end or empty) that traded.
     new_lines: list[str] = []
     changed = False
     for line in lines:
         parts = line.split("\t")
-        if len(parts) == 3 and parts[0] in traded_syms and parts[2] < latest:
-            parts[2] = latest
-            changed = True
+        if len(parts) >= 3 and (parts[2] == max_end or not parts[2]):
+            if parts[0] in traded_syms:
+                parts[2] = latest
+                changed = True
         new_lines.append("\t".join(parts))
     if changed:
-        all_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            dir=inst_file.parent, suffix=".tmp"
+        )
+        try:
+            os.close(fd)
+            Path(tmp_path).write_text(
+                "\n".join(new_lines) + "\n", encoding="utf-8"
+            )
+            os.chmod(tmp_path, inst_file.stat().st_mode & 0o7777)
+            os.replace(tmp_path, inst_file)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
 
 
 def check_index_membership(
@@ -295,7 +337,7 @@ def check_index_membership(
     trade_date: str,
     index: str = "csi1000",
     expected: int = 1000,
-    tolerance: int = 100,
+    tolerance: int = 10,
 ) -> None:
     """Verify index member count is within tolerance of expected.
 
@@ -303,8 +345,9 @@ def check_index_membership(
     (start <= trade_date, end >= trade_date or empty). Raises ValueError
     if count is outside [expected - tolerance, expected + tolerance].
 
-    Default values (expected=1000, tolerance=100) match
+    Default values (expected=1000, tolerance=10) match
     baseline.yaml universe.data_quality.csi1000_member_count.
+    Tight tolerance (1%) because chenditc bundles have exact counts.
     Callers may override if config is available.
 
     Silently skips when the index file does not exist (unit-test fixtures
@@ -376,9 +419,14 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     dates_to_add = [d for d in new_dates if d not in existing_dates]
     if not dates_to_add:
         log.info("dump_bin update: all dates already in calendar, skipping")
-        # Gate: still check membership even when no new dates.
-        latest_date = max(new_dates) if new_dates else (max(existing_dates) if existing_dates else None)
+        # Gate: extend open rows + check membership even when no new dates.
+        latest_date = (
+            max(new_dates) if new_dates
+            else (max(existing_dates) if existing_dates else None)
+        )
         if latest_date:
+            _traded = {cf.stem.upper() for cf in csv_files}
+            _extend_instrument_end_dates(inst_dir, _traded, latest_date)
             check_index_membership(inst_dir, latest_date)
         return
     with open(cal_path, "a", encoding="utf-8") as f:
@@ -415,7 +463,10 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
 
     # Gate: always check after data write, even if no new dates
     # (the caller may have written data on a previous partial run).
-    latest_date = max(new_dates) if new_dates else max(existing_dates) if existing_dates else None
+    latest_date = (
+        max(new_dates) if new_dates
+        else max(existing_dates) if existing_dates else None
+    )
     if latest_date:
         check_index_membership(inst_dir, latest_date)
 

@@ -499,28 +499,27 @@ class TestDumpBinUpdate:
         assert vals[1] == pytest.approx(10.5)
 
     def test_extends_instrument_end_date(self, tmp_path: Path) -> None:
-        """R1: only all.txt is extended; index files are NEVER touched."""
+        """Open-row-only: both all.txt and index files are extended."""
         from ashare_lab.data.fallback import _dump_bin_update
 
-        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
-        # Add a csi1000.txt with a stale end_date to prove it is NOT extended.
-        # Use 1000 members so the gate passes (the gate runs after extension).
+        symbols = [f"SH{i:06d}" for i in range(1000)]
+        provider = self._make_qlib_dir(tmp_path, symbols, ["2024-03-01"])
+        # Add a csi1000.txt with open rows (end == max_end = 2023-12-31).
         csi1000 = provider / "instruments" / "csi1000.txt"
-        csi_lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(999)]
-        csi_lines.append("SH600519\t2020-01-01\t2023-12-31")
+        csi_lines = [f"{sym}\t2020-01-01\t2023-12-31" for sym in symbols]
         csi1000.write_text("\n".join(csi_lines) + "\n", encoding="utf-8")
         csv_dir = tmp_path / "csvs"
-        self._make_csv(csv_dir, "SH600519", "2024-03-04")
+        for sym in symbols:
+            self._make_csv(csv_dir, sym, "2024-03-04")
 
         _dump_bin_update(csv_dir, provider)
 
-        # all.txt: end_date extended to trade date.
+        # all.txt: open rows (end == max_end) extended to trade date.
         all_inst = (provider / "instruments" / "all.txt").read_text()
         assert "2024-03-04" in all_inst
-        # csi1000.txt: end_date UNCHANGED (index files never modified).
+        # csi1000.txt: open rows also extended.
         csi_inst = csi1000.read_text()
-        assert "2023-12-31" in csi_inst
-        assert "2024-03-04" not in csi_inst
+        assert "2024-03-04" in csi_inst
 
     def test_no_csvs_raises(self, tmp_path: Path) -> None:
         from ashare_lab.data.fallback import _dump_bin_update
@@ -556,6 +555,212 @@ class TestDumpBinUpdate:
         size_after_second = (provider / "features" / "sh600519" / "close.day.bin").stat().st_size
 
         assert size_after_first == size_after_second
+
+
+class TestOpenRowExtension:
+    """T1-T4: open-row-only end-date extension (C2 work order)."""
+
+    @staticmethod
+    def _make_inst_dir(tmp_path: Path, all_lines: list[str],
+                       index_lines: list[str] | None = None) -> Path:
+        inst_dir = tmp_path / "instruments"
+        inst_dir.mkdir(parents=True, exist_ok=True)
+        (inst_dir / "all.txt").write_text("\n".join(all_lines) + "\n", encoding="utf-8")
+        if index_lines is not None:
+            (inst_dir / "csi1000.txt").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+        return inst_dir
+
+    def test_open_row_extended_closed_row_unchanged(self, tmp_path: Path) -> None:
+        """T1: open rows (end == max_end) are extended; closed rows (end < max_end) are not."""
+        from ashare_lab.data.fallback import _extend_instrument_end_dates
+
+        all_lines = [
+            "SYM_A\t2020-01-01\t2026-07-23",  # open (end == max_end)
+            "SYM_B\t2020-01-01\t2026-06-15",  # closed (end < max_end)
+        ]
+        index_lines = [
+            "SYM_A\t2020-01-01\t2026-07-23",  # open
+            "SYM_B\t2020-01-01\t2026-06-15",  # closed
+        ]
+        inst_dir = self._make_inst_dir(tmp_path, all_lines, index_lines)
+
+        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # extended
+        assert "SYM_B\t2020-01-01\t2026-06-15" in all_txt  # unchanged
+
+        csi_txt = (inst_dir / "csi1000.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in csi_txt  # extended
+        assert "SYM_B\t2020-01-01\t2026-06-15" in csi_txt  # unchanged
+
+    def test_chained_extension(self, tmp_path: Path) -> None:
+        """T2: chained extension 07-23 -> 07-24 -> 07-27."""
+        from ashare_lab.data.fallback import _extend_instrument_end_dates
+
+        lines = ["SYM_A\t2020-01-01\t2026-07-23"]
+        inst_dir = self._make_inst_dir(tmp_path, list(lines), list(lines))
+
+        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt
+
+        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-27")
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-27" in all_txt
+
+        csi_txt = (inst_dir / "csi1000.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-27" in csi_txt
+
+    def test_bug_injection_extend_all_rows(self, tmp_path: Path) -> None:
+        """T3: bug-injection -- revert to 'extend all end < latest' and watch T1 fail."""
+        from ashare_lab.data import fallback as fb
+
+        all_lines = [
+            "SYM_A\t2020-01-01\t2026-07-23",  # open
+            "SYM_B\t2020-01-01\t2026-06-15",  # closed
+        ]
+        inst_dir = self._make_inst_dir(tmp_path, all_lines, None)
+
+        # Inject bug: replace open-row-only with extend-all-end<latest.
+        orig = fb._extend_open_rows_in_file
+        def _buggy_extend(inst_file, traded_syms, latest):
+            lines = inst_file.read_text(encoding="utf-8").splitlines()
+            new_lines = []
+            changed = False
+            for line in lines:
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[2] < latest:
+                    parts[2] = latest
+                    changed = True
+                new_lines.append("\t".join(parts))
+            if changed:
+                inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        fb._extend_open_rows_in_file = _buggy_extend
+
+        # Run buggy code and check result directly (no try/except).
+        fb._extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+        all_txt = (inst_dir / "all.txt").read_text()
+        bug_detected = "SYM_B\t2020-01-01\t2026-07-24" in all_txt
+        fb._extend_open_rows_in_file = orig
+
+        # Restore fixture.
+        (inst_dir / "all.txt").write_text(
+            "\n".join(all_lines) + "\n", encoding="utf-8"
+        )
+
+        # Verify bug was detected (closed row was extended by buggy code).
+        assert bug_detected, "bug injection did not trigger: closed row was not extended"
+
+        # Verify correct behavior after restore.
+        fb._extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # open row extended
+        assert "SYM_B\t2020-01-01\t2026-06-15" in all_txt  # closed row preserved
+
+    def test_empty_end_date_treated_as_open(self, tmp_path: Path) -> None:
+        """Rows with empty end_date (still active) are extended."""
+        from ashare_lab.data.fallback import _extend_instrument_end_dates
+
+        all_lines = [
+            "SYM_A\t2020-01-01\t",           # empty end = still active
+            "SYM_B\t2020-01-01\t2026-07-23",  # explicit open
+        ]
+        inst_dir = self._make_inst_dir(tmp_path, all_lines, None)
+
+        _extend_instrument_end_dates(inst_dir, {"SYM_A", "SYM_B"}, "2026-07-24")
+
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # empty -> extended
+        assert "SYM_B\t2020-01-01\t2026-07-24" in all_txt  # open -> extended
+
+    def test_not_traded_symbol_not_extended(self, tmp_path: Path) -> None:
+        """T7: symbol with end == max_end but NOT in traded_syms is not extended.
+
+        This prevents extending a stock removed on the bundle date:
+        the removed stock is suspended, not in traded_syms, so its
+        open interval is left as-is.
+        """
+        from ashare_lab.data.fallback import _extend_instrument_end_dates
+
+        all_lines = [
+            "SYM_A\t2020-01-01\t2026-07-23",  # open, traded today
+            "SYM_B\t2020-01-01\t2026-07-23",  # open, NOT traded (removed/suspended)
+        ]
+        inst_dir = self._make_inst_dir(tmp_path, all_lines, None)
+
+        # Only SYM_A is in traded_syms.
+        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # traded -> extended
+        assert "SYM_B\t2020-01-01\t2026-07-23" in all_txt  # not traded -> unchanged
+
+    def test_early_return_path_extends(self, tmp_path: Path) -> None:
+        """T4: early-return path in _dump_bin_update still extends open rows."""
+        from ashare_lab.data.fallback import _dump_bin_update
+        from ashare_lab.data.fallback import _write_csvs as _wc
+
+        symbols = [f"SH{i:06d}" for i in range(1000)]
+
+        # Create qlib dir with date 2024-03-01 already in calendar.
+        provider = tmp_path / "cn_data"
+        (provider / "calendars").mkdir(parents=True)
+        (provider / "instruments").mkdir(parents=True)
+        (provider / "calendars" / "day.txt").write_text("2024-03-01\n", encoding="utf-8")
+
+        # all.txt with open rows.
+        all_lines = [f"{sym}\t2020-01-01\t2024-03-01" for sym in symbols]
+        (provider / "instruments" / "all.txt").write_text(
+            "\n".join(all_lines) + "\n", encoding="utf-8"
+        )
+        # csi1000.txt with 1000 open rows (gate expects [990, 1010]).
+        csi_lines = [f"{sym}\t2020-01-01\t2024-03-01" for sym in symbols]
+        (provider / "instruments" / "csi1000.txt").write_text(
+            "\n".join(csi_lines) + "\n", encoding="utf-8"
+        )
+
+        # Create feature dirs and binary files for all symbols.
+        for sym in symbols:
+            feat = provider / "features" / sym.lower()
+            feat.mkdir(parents=True)
+            for field in ("open", "close", "high", "low", "volume", "factor", "change"):
+                with open(feat / f"{field}.day.bin", "wb") as f:
+                    f.write(struct.pack("<f", 1.0))
+
+        # CSV with SAME date (2024-03-01) -- dates_to_add will be empty,
+        # triggering the early-return path.
+        csv_dir = tmp_path / "csvs"
+        csv_dir.mkdir()
+        for sym in symbols:
+            (csv_dir / f"{sym.lower()}.csv").write_text(
+                "date,open,high,low,close,volume,factor,change\n"
+                "2024-03-01,10.0,11.0,9.0,10.5,1000.0,1.0,0.05\n",
+                encoding="utf-8",
+            )
+
+        # First call: early-return (calendar already has 2024-03-01).
+        _dump_bin_update(csv_dir, provider)
+
+        # Now manually set end dates back to simulate a stale state
+        # (e.g., after a bundle swap that reset instrument files).
+        stale_lines = [f"{sym}\t2020-01-01\t2024-02-28" for sym in symbols]
+        (provider / "instruments" / "all.txt").write_text(
+            "\n".join(stale_lines) + "\n", encoding="utf-8"
+        )
+        (provider / "instruments" / "csi1000.txt").write_text(
+            "\n".join(stale_lines) + "\n", encoding="utf-8"
+        )
+
+        # Second call: early-return (dates_to_add empty) but open rows
+        # need extension (max_end=02-28 < latest=03-01).
+        _dump_bin_update(csv_dir, provider)
+
+        # Verify: open rows should be extended on early-return path.
+        all_txt = (provider / "instruments" / "all.txt").read_text()
+        assert "2024-03-01" in all_txt  # extended from 02-28 to 03-01
+        csi_txt = (provider / "instruments" / "csi1000.txt").read_text()
+        assert "2024-03-01" in csi_txt  # index file also extended
 
 
 class TestIndexMembershipGate:
@@ -599,6 +804,15 @@ class TestIndexMembershipGate:
         inst_dir.mkdir()
         # No csi1000.txt -- should not raise.
         check_index_membership(inst_dir, "2024-07-25")
+
+    def test_gate_fails_at_1020(self, tmp_path: Path) -> None:
+        """Tight tolerance (±10): 1020 is outside [990, 1010]."""
+        from ashare_lab.data.fallback import check_index_membership
+
+        lines = [f"SH{i:06d}\t2020-01-01\t" for i in range(1020)]
+        inst_dir = self._make_instruments(tmp_path, lines)
+        with pytest.raises(ValueError, match="FAILED"):
+            check_index_membership(inst_dir, "2024-07-25")
 
     def test_gate_fires_through_dump_bin_update(self, tmp_path: Path) -> None:
         """A4: gate fires via _dump_bin_update, not only via cli."""
