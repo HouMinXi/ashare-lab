@@ -1898,7 +1898,37 @@ def _run_book_b(ctx: DailyRunContext) -> None:
             equity_nav = book_total_nav
             target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"] * m) / effective_topk
 
-        # Generate sell orders
+        # PHASE 1: Settle yesterday's Book B orders (T+1)
+        # Orders placed yesterday (trade_date <= today) settle with today's prices.
+        # This mirrors Book A's _step8_settle flow (pipeline.py:1230-1236).
+        pending_orders = [
+            dict(r) for r in book_conn.execute(
+                "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
+                "suspension_carry_day FROM orders "
+                "WHERE status IN ('pending','carry') AND trade_date <= ?",
+                (ctx.trade_date,),
+            ).fetchall()
+        ]
+
+        if pending_orders:
+            book_settle = settle_day(
+                book_conn, ctx.trade_date, pending_orders, ctx.prices,
+                book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
+            )
+            if book_settle:
+                record_nav(
+                    book_conn, ctx.trade_date, book_settle.cash,
+                    book_settle.market_value, book_settle.total_nav,
+                    book_settle.pre_trade_nav, book_settle.post_trade_nav,
+                    None, None,
+                )
+                book_positions = get_latest_positions(book_conn)
+                book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+
+        # PHASE 2: Generate next-day orders (not settled today)
+        # These orders have trade_date=next_td and settle on the NEXT run.
+        next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
+
         forced_sells = ctx.risk_result.forced_sells
         sell_set = set(sell_syms) | set(forced_sells.keys())
         desired_sell_qty: dict[str, int] = {}
@@ -1908,13 +1938,11 @@ def _run_book_b(ctx: DailyRunContext) -> None:
             else:
                 desired_sell_qty[s] = forced_sells[s]
 
-        next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
         for s in sell_set:
             to_insert = desired_sell_qty[s]
             if to_insert > 0:
                 insert_order(book_conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
 
-        # Generate buy orders (m-scaled)
         for s in buy_syms:
             close_price = ctx.prices.get(s, {}).get("close")
             if not close_price or close_price <= 0:
@@ -1923,27 +1951,6 @@ def _run_book_b(ctx: DailyRunContext) -> None:
             if target_qty <= 0:
                 continue
             insert_order(book_conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
-
-        # Settle Book B
-        book_orders = book_conn.execute(
-            "SELECT * FROM orders WHERE trade_date=? AND status='pending'",
-            (next_td_str,),
-        ).fetchall()
-        book_order_dicts = [dict(row) for row in book_orders]
-
-        book_settle = settle_day(
-            book_conn, ctx.trade_date, book_order_dicts, ctx.prices,
-            book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
-        )
-
-        # Record Book B NAV
-        if book_settle:
-            record_nav(
-                book_conn, ctx.trade_date, book_settle.cash,
-                book_settle.market_value, book_settle.total_nav,
-                book_settle.pre_trade_nav, book_settle.post_trade_nav,
-                None, None,  # Book B doesn't track benchmarks separately
-            )
 
         # Write A/B/C artifact
         _write_abc_artifact(ctx, book_conn, book_id, m)

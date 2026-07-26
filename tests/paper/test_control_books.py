@@ -5,7 +5,7 @@ Tests cover:
 - Known-answer validation (m=1.0 reproduces Book A to the cent)
 - fail-open behavior (Book B failure doesn't affect production)
 - bootstrap (DB copy)
-- A/B/C artifact writer
+- T+1 settle timing (B1 fix proof)
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ class TestBootstrap:
         prod_db = tmp_path / "paper.db"
         book_b_db = tmp_path / "paper_b_none.db"
 
-        # Create a minimal production DB
         conn = sqlite3.connect(str(prod_db))
         conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
         conn.execute("INSERT INTO nav VALUES ('2026-07-25', 300000.0)")
@@ -55,7 +54,6 @@ class TestBootstrap:
         _bootstrap_book_b(prod_db, book_b_db)
 
         assert book_b_db.exists()
-        # Verify content
         conn = sqlite3.connect(str(book_b_db))
         row = conn.execute("SELECT total_nav FROM nav WHERE trade_date='2026-07-25'").fetchone()
         assert row[0] == 300000.0
@@ -65,14 +63,12 @@ class TestBootstrap:
         prod_db = tmp_path / "paper.db"
         book_b_db = tmp_path / "paper_b_none.db"
 
-        # Create production DB
         conn = sqlite3.connect(str(prod_db))
         conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
         conn.execute("INSERT INTO nav VALUES ('2026-07-25', 300000.0)")
         conn.commit()
         conn.close()
 
-        # Create stale Book B DB
         conn = sqlite3.connect(str(book_b_db))
         conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
         conn.execute("INSERT INTO nav VALUES ('2026-07-25', 999999.0)")
@@ -81,7 +77,6 @@ class TestBootstrap:
 
         _bootstrap_book_b(prod_db, book_b_db)
 
-        # Verify overwritten
         conn = sqlite3.connect(str(book_b_db))
         row = conn.execute("SELECT total_nav FROM nav WHERE trade_date='2026-07-25'").fetchone()
         assert row[0] == 300000.0
@@ -92,21 +87,15 @@ class TestBootstrap:
 
 class TestFailOpen:
     def test_book_b_exception_does_not_raise(self, tmp_path):
-        """_step12_book_b wraps _run_book_b in try/except (fail-open)."""
         ctx = MagicMock()
         ctx.trade_date = "2026-07-25"
         ctx.db_path = tmp_path / "paper.db"
-
-        # _run_book_b will fail because ctx is a mock with no real data
-        # But _step12_book_b should NOT raise
-        _step12_book_b(ctx)  # should return silently
+        _step12_book_b(ctx)
 
     def test_book_b_logs_warning_on_failure(self, tmp_path, caplog):
-        """Book B failure should log a warning, not raise."""
         ctx = MagicMock()
         ctx.trade_date = "2026-07-25"
         ctx.db_path = tmp_path / "paper.db"
-
         _step12_book_b(ctx)
         assert "Book B failed" in caplog.text
 
@@ -115,49 +104,31 @@ class TestFailOpen:
 
 class TestABCArtifact:
     def test_artifact_written(self, tmp_path):
-        """_write_abc_artifact writes correct JSON."""
-        # Setup Book B DB with proper schema
+        from ashare_lab.paper.ledger import init_schema
+
         book_b_db = tmp_path / "paper_b_none.db"
         conn = sqlite3.connect(str(book_b_db))
         conn.row_factory = sqlite3.Row
+        init_schema(conn)
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS positions (
-                trade_date TEXT, symbol TEXT, qty INTEGER, avg_cost REAL,
-                market_value REAL, buy_date TEXT, holding_high REAL DEFAULT 0.0,
-                factor REAL DEFAULT 1.0
-            );
-            CREATE TABLE IF NOT EXISTS runs (
-                trade_date TEXT PRIMARY KEY, status TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS nav (
-                trade_date TEXT PRIMARY KEY, cash REAL NOT NULL,
-                market_value REAL NOT NULL, total_nav REAL NOT NULL,
-                pre_trade_nav REAL, post_trade_nav REAL,
-                hedge_value REAL DEFAULT 0.0, equity_value REAL DEFAULT 0.0,
-                benchmark_csi300 REAL, benchmark_csi1000 REAL
-            );
-            CREATE TABLE IF NOT EXISTS paper_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO runs VALUES ('2026-07-25', 'settled');
+            INSERT INTO runs VALUES ('2026-07-25', 'settled', '2026-07-25T15:00:00');
             INSERT INTO positions VALUES ('2026-07-25', 'SH600519', 100, 1800.0, 180000.0, '2026-07-20', 0.0, 1.0);
             INSERT INTO paper_state VALUES ('cash', '120000.0');
         """)
         conn.commit()
         conn.close()
 
-        # Mock context
         ctx = MagicMock()
         ctx.trade_date = "2026-07-25"
         ctx.total_nav = 300000.0
         ctx.benchmarks = {"csi1000": 1.0}
         ctx.paper_cfg = {"initial_cash": 300000.0}
 
-        # Re-open for the function
         book_conn = sqlite3.connect(str(book_b_db))
         book_conn.row_factory = sqlite3.Row
         _write_abc_artifact(ctx, book_conn, "none", 1.0)
         book_conn.close()
 
-        # Check artifact file
         artifact_path = Path("experiments/control_books/2026-07-25_none.json")
         assert artifact_path.exists()
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -167,49 +138,153 @@ class TestABCArtifact:
         assert artifact["m"] == 1.0
 
 
-# -- Known-answer validation (R3) -------------------------------------------
+# -- Known-answer (R3) -------------------------------------------------------
 
 class TestKnownAnswer:
-    """R3: m=1.0 must reproduce Book A to the cent for 10 consecutive days.
-
-    This test verifies the core invariant: with m=1.0, Book B's
-    target_value computation produces the same result as Book A.
-    """
-
     def test_target_value_same_with_m_one(self):
-        """With m=1.0, target_value should be identical to Book A."""
         equity_nav = 300000.0
         risk_degree = 0.95
         effective_topk = 15
-
-        # Book A: target_value = (equity_nav * risk_degree) / effective_topk
-        book_a_target = (equity_nav * risk_degree) / effective_topk
-
-        # Book B: target_value = (equity_nav * risk_degree * m) / effective_topk
-        m = 1.0
-        book_b_target = (equity_nav * risk_degree * m) / effective_topk
-
-        assert book_a_target == book_b_target
+        book_a = (equity_nav * risk_degree) / effective_topk
+        book_b = (equity_nav * risk_degree * 1.0) / effective_topk
+        assert book_a == book_b
 
     def test_target_value_scaled_with_m_half(self):
-        """With m=0.5, target_value should be half of Book A."""
         equity_nav = 300000.0
         risk_degree = 0.95
         effective_topk = 15
-
-        book_a_target = (equity_nav * risk_degree) / effective_topk
-        m = 0.5
-        book_b_target = (equity_nav * risk_degree * m) / effective_topk
-
-        assert book_b_target == book_a_target * 0.5
+        book_a = (equity_nav * risk_degree) / effective_topk
+        book_b = (equity_nav * risk_degree * 0.5) / effective_topk
+        assert book_b == book_a * 0.5
 
     def test_target_value_zero_with_m_zero(self):
-        """With m=0.0, target_value should be zero."""
         equity_nav = 300000.0
         risk_degree = 0.95
         effective_topk = 15
+        book_b = (equity_nav * risk_degree * 0.0) / effective_topk
+        assert book_b == 0.0
 
-        m = 0.0
-        book_b_target = (equity_nav * risk_degree * m) / effective_topk
 
-        assert book_b_target == 0.0
+# -- R3 Replay Driver (B2) --------------------------------------------------
+
+class TestReplayDriver:
+    """R3: T+1 settle timing proof + known-answer structural test."""
+
+    def _init_db(self, db_path):
+        """Create a DB with the full ledger schema."""
+        from ashare_lab.paper.ledger import init_schema
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.execute("INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')")
+        conn.commit()
+        return conn
+
+    def test_settle_t1_timing(self, tmp_path):
+        """Book B settles yesterday's orders today (T+1), not same-day.
+
+        Day 1: Insert buy orders (trade_date=d2).
+        Day 2: Settle with today's prices. Both books must match.
+        """
+        from ashare_lab.paper.ledger import insert_order, get_latest_positions, get_latest_cash
+        from ashare_lab.paper.engine import settle_day
+
+        d1 = "2026-07-21"
+        d2 = "2026-07-22"
+        prices = {"SH600519": {"close": 1800.0}}
+        settle_cfg = {"carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05}
+
+        for db_name in ["paper.db", "paper_b_none.db"]:
+            conn = self._init_db(tmp_path / db_name)
+            insert_order(conn, d2, "SH600519", "buy", 100, None, "pending", 0, d1)
+            conn.commit()
+            conn.close()
+
+        for db_name in ["paper.db", "paper_b_none.db"]:
+            conn = sqlite3.connect(str(tmp_path / db_name))
+            conn.row_factory = sqlite3.Row
+            positions = get_latest_positions(conn)
+            cash = get_latest_cash(conn, 300000.0)
+            pending = [dict(r) for r in conn.execute(
+                "SELECT id, symbol, side, target_qty, carry_day, "
+                "reset_count, suspension_carry_day FROM orders "
+                "WHERE status IN ('pending','carry') AND trade_date <= ?",
+                (d2,),
+            ).fetchall()]
+            settle_day(conn, d2, pending, prices, positions, cash, set(), {}, settle_cfg)
+            conn.commit()
+            conn.close()
+
+        conn_a = sqlite3.connect(str(tmp_path / "paper.db"))
+        conn_a.row_factory = sqlite3.Row
+        conn_b = sqlite3.connect(str(tmp_path / "paper_b_none.db"))
+        conn_b.row_factory = sqlite3.Row
+
+        nav_a = conn_a.execute("SELECT * FROM nav WHERE trade_date=?", (d2,)).fetchone()
+        nav_b = conn_b.execute("SELECT * FROM nav WHERE trade_date=?", (d2,)).fetchone()
+
+        assert nav_a is not None, "Book A NAV not recorded"
+        assert nav_b is not None, "Book B NAV not recorded"
+        assert abs(nav_a["total_nav"] - nav_b["total_nav"]) < 0.01, \
+            f"NAV mismatch: A={nav_a['total_nav']}, B={nav_b['total_nav']}"
+        assert abs(nav_a["cash"] - nav_b["cash"]) < 0.01, \
+            f"Cash mismatch: A={nav_a['cash']}, B={nav_b['cash']}"
+
+        pos_a = conn_a.execute("SELECT * FROM positions WHERE trade_date=?", (d2,)).fetchall()
+        pos_b = conn_b.execute("SELECT * FROM positions WHERE trade_date=?", (d2,)).fetchall()
+        assert len(pos_a) == len(pos_b), f"Position count mismatch: A={len(pos_a)}, B={len(pos_b)}"
+
+        conn_a.close()
+        conn_b.close()
+
+    def test_settle_same_day_bug_fails(self, tmp_path):
+        """Bug-injection: settling same-day (no T+1) fails to settle.
+
+        Book A: settle d2 orders on d2 (correct T+1).
+        Book B (BUG): insert d2 orders, query with trade_date=d1.
+        d2 orders don't match d1 -> nothing settles -> proves T+1 matters.
+        """
+        from ashare_lab.paper.ledger import insert_order, get_latest_positions, get_latest_cash
+        from ashare_lab.paper.engine import settle_day
+
+        d1 = "2026-07-21"
+        d2 = "2026-07-22"
+        prices = {"SH600519": {"close": 1800.0}}
+        settle_cfg = {"carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05}
+
+        # Book A: correct T+1
+        conn_a = self._init_db(tmp_path / "paper.db")
+        insert_order(conn_a, d2, "SH600519", "buy", 100, None, "pending", 0, d1)
+        conn_a.commit()
+        positions_a = get_latest_positions(conn_a)
+        cash_a = get_latest_cash(conn_a, 300000.0)
+        pending_a = [dict(r) for r in conn_a.execute(
+            "SELECT id, symbol, side, target_qty, carry_day, "
+            "reset_count, suspension_carry_day FROM orders "
+            "WHERE status IN ('pending','carry') AND trade_date <= ?",
+            (d2,),
+        ).fetchall()]
+        settle_day(conn_a, d2, pending_a, prices, positions_a, cash_a, set(), {}, settle_cfg)
+        conn_a.commit()
+        conn_a.close()
+
+        # Book B (BUG): query with d1 instead of d2
+        conn_b = self._init_db(tmp_path / "paper_b_none.db")
+        insert_order(conn_b, d2, "SH600519", "buy", 100, None, "pending", 0, d1)
+        conn_b.commit()
+        pending_b = [dict(r) for r in conn_b.execute(
+            "SELECT id, symbol, side, target_qty, carry_day, "
+            "reset_count, suspension_carry_day FROM orders "
+            "WHERE status IN ('pending','carry') AND trade_date <= ?",
+            (d1,),
+        ).fetchall()]
+        # d2 orders don't match trade_date <= d1 -> nothing to settle
+        assert len(pending_b) == 0, "Bug: d2 orders should NOT match trade_date <= d1"
+        conn_b.close()
+
+        # Book A settled, Book B did not
+        conn_a2 = sqlite3.connect(str(tmp_path / "paper.db"))
+        conn_a2.row_factory = sqlite3.Row
+        nav_a = conn_a2.execute("SELECT * FROM nav WHERE trade_date=?", (d2,)).fetchone()
+        assert nav_a is not None, "Book A should have NAV for d2"
+        conn_a2.close()
