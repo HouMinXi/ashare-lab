@@ -263,35 +263,33 @@ def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
 
 
 def _extend_instrument_end_dates(
-    inst_dir: Path, traded_syms: set[str], latest: str  # noqa: ARG001
+    inst_dir: Path, traded_syms: set[str], latest: str
 ) -> None:
     """Extend open membership intervals so the calendar can advance.
 
     An *open interval* is any row whose end_date equals the file's
-    current MAX end_date at call time.  These rows represent members
-    that have not been explicitly removed by the data provider.
-    Only open intervals are rolled forward to *latest*; closed
+    current MAX end_date at call time AND whose symbol traded on
+    *latest*.  Only open intervals are rolled forward; closed
     intervals (end < max_end) are never touched.
 
-    This prevents two failure modes:
-    - Universe inflation: extending every row with end < latest
-      resurrects long-removed members (the original C-order bug).
-    - Empty universe: leaving index files frozen at the bundle date
-      causes active count = 0 on any post-bundle date.
+    The traded_syms filter prevents universe inflation: a stock
+    removed on the bundle date (end == max_end) is suspended and
+    does not appear in traded_syms, so it is not extended.
 
     Applies to all instrument files (all.txt + index membership files).
-
-    Edge case: a member removed exactly on the bundle date is
-    indistinguishable from a current member by this rule (both have
-    end == max_end).  The data provider would need to ship a newer
-    bundle to distinguish them; this is accepted.
     """
     for inst_file in sorted(inst_dir.glob("*.txt")):
-        _extend_open_rows_in_file(inst_file, latest)
+        _extend_open_rows_in_file(inst_file, traded_syms, latest)
 
 
-def _extend_open_rows_in_file(inst_file: Path, latest: str) -> None:
+def _extend_open_rows_in_file(
+    inst_file: Path, traded_syms: set[str], latest: str
+) -> None:
     """Extend rows where end == file's max_end to *latest*.
+
+    Only extends rows whose symbol is in *traded_syms*.  This prevents
+    extending a stock that was removed on the bundle date (end ==
+    max_end but suspended, so not in traded_syms).
 
     Empty end_date means "still active" in qlib convention and is
     treated as an open interval -- also extended.
@@ -307,14 +305,15 @@ def _extend_open_rows_in_file(inst_file: Path, latest: str) -> None:
             max_end = parts[2]
     if max_end and max_end >= latest:
         return  # already current
-    # Pass 2: extend open rows (end == max_end or empty).
+    # Pass 2: extend open rows (end == max_end or empty) that traded.
     new_lines: list[str] = []
     changed = False
     for line in lines:
         parts = line.split("\t")
         if len(parts) >= 3 and (parts[2] == max_end or not parts[2]):
-            parts[2] = latest
-            changed = True
+            if parts[0] in traded_syms:
+                parts[2] = latest
+                changed = True
         new_lines.append("\t".join(parts))
     if changed:
         inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")

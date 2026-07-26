@@ -502,14 +502,15 @@ class TestDumpBinUpdate:
         """Open-row-only: both all.txt and index files are extended."""
         from ashare_lab.data.fallback import _dump_bin_update
 
-        provider = self._make_qlib_dir(tmp_path, ["SH600519"], ["2024-03-01"])
+        symbols = [f"SH{i:06d}" for i in range(1000)]
+        provider = self._make_qlib_dir(tmp_path, symbols, ["2024-03-01"])
         # Add a csi1000.txt with open rows (end == max_end = 2023-12-31).
         csi1000 = provider / "instruments" / "csi1000.txt"
-        csi_lines = [f"SH{i:06d}\t2020-01-01\t2023-12-31" for i in range(999)]
-        csi_lines.append("SH600519\t2020-01-01\t2023-12-31")
+        csi_lines = [f"{sym}\t2020-01-01\t2023-12-31" for sym in symbols]
         csi1000.write_text("\n".join(csi_lines) + "\n", encoding="utf-8")
         csv_dir = tmp_path / "csvs"
-        self._make_csv(csv_dir, "SH600519", "2024-03-04")
+        for sym in symbols:
+            self._make_csv(csv_dir, sym, "2024-03-04")
 
         _dump_bin_update(csv_dir, provider)
 
@@ -623,7 +624,7 @@ class TestOpenRowExtension:
 
         # Inject bug: replace open-row-only with extend-all-end<latest.
         orig = fb._extend_open_rows_in_file
-        def _buggy_extend(inst_file, latest):
+        def _buggy_extend(inst_file, traded_syms, latest):
             lines = inst_file.read_text(encoding="utf-8").splitlines()
             new_lines = []
             changed = False
@@ -637,23 +638,21 @@ class TestOpenRowExtension:
                 inst_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         fb._extend_open_rows_in_file = _buggy_extend
 
-        try:
-            fb._extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
-            all_txt = (inst_dir / "all.txt").read_text()
-            # Bug: closed row SYM_B is also extended (should NOT be).
-            assert "SYM_B\t2020-01-01\t2026-06-15" in all_txt, \
-                "closed row should NOT be extended -- bug injection should cause this FAIL"
-            # If we reach here, the assertion passed = bug NOT detected.
-            pytest.fail("bug injection did not trigger: closed row was not extended")
-        except AssertionError:
-            pass  # Expected: closed row WAS extended = bug detected.
-        finally:
-            fb._extend_open_rows_in_file = orig
+        # Run buggy code and check result directly (no try/except).
+        fb._extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+        all_txt = (inst_dir / "all.txt").read_text()
+        bug_detected = "SYM_B\t2020-01-01\t2026-07-24" in all_txt
+        fb._extend_open_rows_in_file = orig
 
-        # Restore fixture and verify correct behavior.
+        # Restore fixture.
         (inst_dir / "all.txt").write_text(
             "\n".join(all_lines) + "\n", encoding="utf-8"
         )
+
+        # Verify bug was detected (closed row was extended by buggy code).
+        assert bug_detected, "bug injection did not trigger: closed row was not extended"
+
+        # Verify correct behavior after restore.
         fb._extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
         all_txt = (inst_dir / "all.txt").read_text()
         assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # open row extended
@@ -669,15 +668,40 @@ class TestOpenRowExtension:
         ]
         inst_dir = self._make_inst_dir(tmp_path, all_lines, None)
 
-        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+        _extend_instrument_end_dates(inst_dir, {"SYM_A", "SYM_B"}, "2026-07-24")
 
         all_txt = (inst_dir / "all.txt").read_text()
         assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # empty -> extended
         assert "SYM_B\t2020-01-01\t2026-07-24" in all_txt  # open -> extended
 
+    def test_not_traded_symbol_not_extended(self, tmp_path: Path) -> None:
+        """T7: symbol with end == max_end but NOT in traded_syms is not extended.
+
+        This prevents extending a stock removed on the bundle date:
+        the removed stock is suspended, not in traded_syms, so its
+        open interval is left as-is.
+        """
+        from ashare_lab.data.fallback import _extend_instrument_end_dates
+
+        all_lines = [
+            "SYM_A\t2020-01-01\t2026-07-23",  # open, traded today
+            "SYM_B\t2020-01-01\t2026-07-23",  # open, NOT traded (removed/suspended)
+        ]
+        inst_dir = self._make_inst_dir(tmp_path, all_lines, None)
+
+        # Only SYM_A is in traded_syms.
+        _extend_instrument_end_dates(inst_dir, {"SYM_A"}, "2026-07-24")
+
+        all_txt = (inst_dir / "all.txt").read_text()
+        assert "SYM_A\t2020-01-01\t2026-07-24" in all_txt  # traded -> extended
+        assert "SYM_B\t2020-01-01\t2026-07-23" in all_txt  # not traded -> unchanged
+
     def test_early_return_path_extends(self, tmp_path: Path) -> None:
         """T4: early-return path in _dump_bin_update still extends open rows."""
         from ashare_lab.data.fallback import _dump_bin_update
+        from ashare_lab.data.fallback import _write_csvs as _wc
+
+        symbols = [f"SH{i:06d}" for i in range(1000)]
 
         # Create qlib dir with date 2024-03-01 already in calendar.
         provider = tmp_path / "cn_data"
@@ -685,45 +709,47 @@ class TestOpenRowExtension:
         (provider / "instruments").mkdir(parents=True)
         (provider / "calendars" / "day.txt").write_text("2024-03-01\n", encoding="utf-8")
 
-        # all.txt with open row (end = 2024-03-01, same as calendar).
+        # all.txt with open rows.
+        all_lines = [f"{sym}\t2020-01-01\t2024-03-01" for sym in symbols]
         (provider / "instruments" / "all.txt").write_text(
-            "SH600519\t2020-01-01\t2024-03-01\n", encoding="utf-8"
+            "\n".join(all_lines) + "\n", encoding="utf-8"
         )
         # csi1000.txt with 1000 open rows (gate expects [990, 1010]).
-        csi_lines = [f"SH{i:06d}\t2020-01-01\t2024-03-01" for i in range(1000)]
+        csi_lines = [f"{sym}\t2020-01-01\t2024-03-01" for sym in symbols]
         (provider / "instruments" / "csi1000.txt").write_text(
             "\n".join(csi_lines) + "\n", encoding="utf-8"
         )
 
-        # Create feature dirs and binary files.
-        feat = provider / "features" / "sh600519"
-        feat.mkdir(parents=True)
-        for field in ("open", "close", "high", "low", "volume", "factor", "change"):
-            with open(feat / f"{field}.day.bin", "wb") as f:
-                f.write(struct.pack("<f", 1.0))
+        # Create feature dirs and binary files for all symbols.
+        for sym in symbols:
+            feat = provider / "features" / sym.lower()
+            feat.mkdir(parents=True)
+            for field in ("open", "close", "high", "low", "volume", "factor", "change"):
+                with open(feat / f"{field}.day.bin", "wb") as f:
+                    f.write(struct.pack("<f", 1.0))
 
         # CSV with SAME date (2024-03-01) -- dates_to_add will be empty,
         # triggering the early-return path.
         csv_dir = tmp_path / "csvs"
         csv_dir.mkdir()
-        (csv_dir / "sh600519.csv").write_text(
-            "date,open,high,low,close,volume,factor,change\n"
-            "2024-03-01,10.0,11.0,9.0,10.5,1000.0,1.0,0.05\n",
-            encoding="utf-8",
-        )
+        for sym in symbols:
+            (csv_dir / f"{sym.lower()}.csv").write_text(
+                "date,open,high,low,close,volume,factor,change\n"
+                "2024-03-01,10.0,11.0,9.0,10.5,1000.0,1.0,0.05\n",
+                encoding="utf-8",
+            )
 
-        # First call: normal path, extends open rows + adds to calendar.
-        # (calendar already has 2024-03-01, so this is actually early-return too)
+        # First call: early-return (calendar already has 2024-03-01).
         _dump_bin_update(csv_dir, provider)
 
         # Now manually set end dates back to simulate a stale state
         # (e.g., after a bundle swap that reset instrument files).
+        stale_lines = [f"{sym}\t2020-01-01\t2024-02-28" for sym in symbols]
         (provider / "instruments" / "all.txt").write_text(
-            "SH600519\t2020-01-01\t2024-02-28\n", encoding="utf-8"
+            "\n".join(stale_lines) + "\n", encoding="utf-8"
         )
-        csi_stale = [f"SH{i:06d}\t2020-01-01\t2024-02-28" for i in range(1000)]
         (provider / "instruments" / "csi1000.txt").write_text(
-            "\n".join(csi_stale) + "\n", encoding="utf-8"
+            "\n".join(stale_lines) + "\n", encoding="utf-8"
         )
 
         # Second call: early-return (dates_to_add empty) but open rows
