@@ -164,8 +164,8 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     trade_date       TEXT NOT NULL,
     status           TEXT NOT NULL
-                     CHECK(status IN ('success','error','stale')),
-    duration_s       REAL NOT NULL,
+                     CHECK(status IN ('running','success','error','stale','halted')),
+    duration_s       REAL NOT NULL DEFAULT 0.0,
     error_msg        TEXT,
     predictions_date TEXT,
     created_at       TEXT NOT NULL
@@ -241,6 +241,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # is ever reached if we left it after.
     _migrate_audit_table(conn, "reports")
     _migrate_audit_table(conn, "pipeline_runs")
+    _migrate_pipeline_runs_check(conn)
 
     conn.executescript(_SCHEMA_SQL)
     conn.execute(
@@ -324,6 +325,51 @@ def _migrate_audit_table(conn: sqlite3.Connection, table: str) -> None:
             raise
 
 
+def _migrate_pipeline_runs_check(conn: sqlite3.Connection) -> None:
+    """Extend pipeline_runs CHECK constraint to allow 'running' and 'halted'.
+
+    SQLite cannot ALTER a CHECK constraint, so we recreate the table
+    atomically.  Idempotent: skips if 'running' is already allowed.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='pipeline_runs'"
+    ).fetchone()
+    if row is None:
+        return
+    if "'running'" in row[0]:
+        return  # already migrated
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "CREATE TABLE pipeline_runs_new ("
+            "  id               INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  trade_date       TEXT NOT NULL,"
+            "  status           TEXT NOT NULL"
+            "                   CHECK(status IN"
+            "                     ('running','success','error','stale','halted')),"
+            "  duration_s       REAL NOT NULL DEFAULT 0.0,"
+            "  error_msg        TEXT,"
+            "  predictions_date TEXT,"
+            "  created_at       TEXT NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO pipeline_runs_new "
+            "SELECT * FROM pipeline_runs"
+        )
+        conn.execute("DROP TABLE pipeline_runs")
+        conn.execute("ALTER TABLE pipeline_runs_new RENAME TO pipeline_runs")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pipeline_runs_td_created "
+            "ON pipeline_runs(trade_date, created_at DESC, id DESC)"
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def _extract_create_table(schema_sql: str, table: str) -> str:
     """Extract the CREATE TABLE statement for *table* from a multi-statement schema.
 
@@ -393,6 +439,44 @@ def insert_pipeline_run(
         "(trade_date, status, duration_s, error_msg, predictions_date, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (trade_date, status, duration_s, error_msg, predictions_date, created_at),
+    )
+
+
+def open_pipeline_run(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    predictions_date: str | None,
+) -> int:
+    """Insert a 'running' row and return its id.
+
+    The caller stores the id on ctx and later calls close_pipeline_run()
+    to update the same row to the final status.
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO pipeline_runs "
+        "(trade_date, status, duration_s, error_msg, predictions_date, created_at) "
+        "VALUES (?, 'running', 0.0, NULL, ?, ?)",
+        (trade_date, predictions_date, created_at),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def close_pipeline_run(
+    conn: sqlite3.Connection,
+    row_id: int,
+    status: str,
+    duration_s: float,
+    error_msg: str | None = None,
+) -> None:
+    """Update a previously-opened pipeline_runs row to its final status.
+
+    Status must be one of: 'success', 'error', 'stale', 'halted'.
+    """
+    conn.execute(
+        "UPDATE pipeline_runs SET status=?, duration_s=?, error_msg=? WHERE id=?",
+        (status, duration_s, error_msg, row_id),
     )
 
 

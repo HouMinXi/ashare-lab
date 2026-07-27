@@ -70,6 +70,8 @@ from ashare_lab.paper.ledger import (
     log_settle_change,
     record_nav,
     record_run,
+    open_pipeline_run,
+    close_pipeline_run,
     set_cooldown,
     snapshot_positions,
     update_order,
@@ -448,6 +450,7 @@ class DailyRunContext:
     pred_path: "Path | None"
     start_time: float
     predictions_date_str: str
+    pipeline_run_id: int | None = None
 
     # Step 1 outputs
     config: dict = field(default_factory=dict)
@@ -535,7 +538,7 @@ def _step2_idempotency(ctx: DailyRunContext) -> int:
                 "the ledger, then re-run with --force.",
                 ctx.trade_date,
             )
-            _try_record_pipeline_run(
+            _close_pipeline_run(
                 ctx, "error",
                 f"{ctx.trade_date} marked ledger_error, refusing auto-retry",
             )
@@ -575,13 +578,13 @@ def _try_baostock_fallback(ctx: DailyRunContext, chenditc_exc: Exception) -> int
             return 0
         logger.error("baostock fallback partial (rc=%d)", rc)
         record_run(ctx.conn, ctx.trade_date, "error")
-        _try_record_pipeline_run(ctx, "error", f"chenditc+baostock both partial: {chenditc_exc}")
+        _close_pipeline_run(ctx, "error", f"chenditc+baostock both partial: {chenditc_exc}")
         ctx.conn.commit()
         return 2
     except Exception as fb_exc:
         logger.error("baostock fallback also failed: %s", fb_exc, exc_info=True)
         record_run(ctx.conn, ctx.trade_date, "error")
-        _try_record_pipeline_run(ctx, "error", f"chenditc: {chenditc_exc}; baostock: {fb_exc}")
+        _close_pipeline_run(ctx, "error", f"chenditc: {chenditc_exc}; baostock: {fb_exc}")
         ctx.conn.commit()
         return 2
 
@@ -704,7 +707,7 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
     except ImportError as exc:
         logger.error("qlib not available, cannot run pipeline")
         record_run(ctx.conn, ctx.trade_date, "error")
-        _try_record_pipeline_run(ctx, "error", str(exc))
+        _close_pipeline_run(ctx, "error", str(exc))
         ctx.conn.commit()
         return 2
 
@@ -1286,7 +1289,7 @@ def _step8_settle(ctx: DailyRunContext) -> int | None:
         # marks this date as needing manual repair, not just a transient
         # failure -- see the idempotency check in _step2_idempotency.
         record_run(ctx.conn, ctx.trade_date, "ledger_error")
-        _try_record_pipeline_run(
+        _close_pipeline_run(
             ctx, "error",
             f"settle identity check failed: drift={drift:.2f}",
         )
@@ -1565,7 +1568,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
                 ctx.pred_path,
             )
             record_run(ctx.conn, ctx.trade_date, "error")
-            _try_record_pipeline_run(ctx, "error", "prediction file not found")
+            _close_pipeline_run(ctx, "error", "prediction file not found")
             ctx.conn.commit()
             return 2
 
@@ -1581,7 +1584,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
     except (FileNotFoundError, ValueError) as e:
         logger.error("Signal generation failed for %s: %s", ctx.trade_date, e)
         record_run(ctx.conn, ctx.trade_date, "error")
-        _try_record_pipeline_run(ctx, "error", str(e))
+        _close_pipeline_run(ctx, "error", str(e))
         ctx.conn.commit()
         return 2
 
@@ -2158,18 +2161,11 @@ def _step13_report(ctx: DailyRunContext) -> None:
 
 
 def _step14_record_pipeline_run(ctx: DailyRunContext) -> None:
-    """Record pipeline run metadata (non-blocking)."""
+    """Close the pipeline_runs row as success or stale."""
     stale_flag = os.environ.get("ASHARE_USE_STALE", "")
-    use_stale = stale_flag == "1"
-    try:
-        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-        duration_s = time.monotonic() - ctx.start_time
-        status = "stale" if use_stale else "success"
-        insert_pipeline_run(ctx.conn, ctx.trade_date, status, duration_s, None, ctx.predictions_date_str)
-    except Exception:
-        logger.warning("Failed to record pipeline_run", exc_info=True)
-    finally:
-        ctx.conn.commit()
+    status = "stale" if stale_flag == "1" else "success"
+    _close_pipeline_run(ctx, status)
+    ctx.conn.commit()
 
 
 def _step15_graduation(ctx: DailyRunContext) -> None:
@@ -2190,17 +2186,16 @@ def _step15_graduation(ctx: DailyRunContext) -> None:
         logger.warning("Graduation check failed", exc_info=True)
 
 
-def _try_record_pipeline_run(ctx: DailyRunContext, status: str, error_msg: str) -> None:
-    """Best-effort pipeline run record on error paths."""
+def _close_pipeline_run(ctx: DailyRunContext, status: str, error_msg: str | None = None) -> None:
+    """Close the open pipeline_runs row to its final status."""
+    if ctx.pipeline_run_id is None:
+        return
     try:
-        from ashare_lab.paper.ledger import insert_pipeline_run  # noqa: PLC0415
-        insert_pipeline_run(
-            ctx.conn, ctx.trade_date, status,
-            time.monotonic() - ctx.start_time,
-            error_msg, ctx.predictions_date_str,
-        )
+        duration_s = time.monotonic() - ctx.start_time
+        close_pipeline_run(ctx.conn, ctx.pipeline_run_id, status, duration_s, error_msg)
+        ctx.conn.commit()
     except Exception:
-        logger.warning("Failed to record pipeline_run", exc_info=True)
+        logger.warning("Failed to close pipeline_run id=%s", ctx.pipeline_run_id, exc_info=True)
 
 
 def run_daily(
@@ -2246,49 +2241,72 @@ def run_daily(
 
     _step1_init(ctx)
 
-    rc = _step2_idempotency(ctx)
-    if rc == 0:   # already settled -- return early
+    # Open pipeline_runs row (fail-open: if insert fails, continue without recording)
+    try:
+        ctx.pipeline_run_id = open_pipeline_run(
+            ctx.conn, ctx.trade_date, ctx.predictions_date_str,
+        )
+    except Exception:
+        logger.warning("Failed to open pipeline_run, continuing without recording", exc_info=True)
+
+    try:
+        rc = _step2_idempotency(ctx)
+        if rc == 0:   # already settled -- close as success
+            _close_pipeline_run(ctx, "success")
+            return 0
+        if rc == 2:
+            return 2
+
+        rc = _step3_data_update(ctx)
+        if rc in (1, 2):
+            return rc
+
+        try:
+            _gate_data_completeness(ctx)
+        except RuntimeError as exc:
+            _close_pipeline_run(ctx, "halted", str(exc))
+            raise
+
+        _step4_load_state(ctx)
+
+        rc = _step5_fetch_prices_and_universe(ctx)
+        if rc == 2:
+            return 2
+
+        try:
+            _gate_price_sanity(ctx)
+        except RuntimeError as exc:
+            _close_pipeline_run(ctx, "halted", str(exc))
+            raise
+
+        _step6_adjustfactor(ctx)
+        _step7_csi1000_exits(ctx)
+        _prefetch_hedge_prices_for_settle(ctx)
+        rc = _step8_settle(ctx)
+        if rc == 2:
+            _close_pipeline_run(ctx, "error", "settle failed")
+            return 2
+        _step9_risk_checks(ctx)
+        _step9b_hedge_sleeve(ctx)
+        _step9c_nav_hedge_split(ctx)
+
+        rc = _step10_signal_generation(ctx)
+        if rc == 2:
+            return 2
+
+        _step11_ipo_processing(ctx)
+        _step12_backup_and_finalize(ctx)
+        _step12_book_b(ctx)
+        _step13_report(ctx)
+        _step14_record_pipeline_run(ctx)
+        _step15_graduation(ctx)
+
+        logger.info("Pipeline completed for %s", trade_date)
         return 0
-    if rc == 2:
-        return 2
 
-    rc = _step3_data_update(ctx)
-    if rc in (1, 2):
-        return rc
-
-    _gate_data_completeness(ctx)
-
-    _step4_load_state(ctx)
-
-    rc = _step5_fetch_prices_and_universe(ctx)
-    if rc == 2:
-        return 2
-
-    _gate_price_sanity(ctx)
-
-    _step6_adjustfactor(ctx)
-    _step7_csi1000_exits(ctx)
-    _prefetch_hedge_prices_for_settle(ctx)
-    rc = _step8_settle(ctx)
-    if rc == 2:
-        return 2
-    _step9_risk_checks(ctx)
-    _step9b_hedge_sleeve(ctx)
-    _step9c_nav_hedge_split(ctx)
-
-    rc = _step10_signal_generation(ctx)
-    if rc == 2:
-        return 2
-
-    _step11_ipo_processing(ctx)
-    _step12_backup_and_finalize(ctx)
-    _step12_book_b(ctx)
-    _step13_report(ctx)
-    _step14_record_pipeline_run(ctx)
-    _step15_graduation(ctx)
-
-    logger.info("Pipeline completed for %s", trade_date)
-    return 0
+    except Exception:
+        _close_pipeline_run(ctx, "error", "uncaught exception")
+        raise
 
 
 
