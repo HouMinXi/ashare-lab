@@ -413,6 +413,40 @@ class TestRunBookBPhase1Phase2:
 
         conn_check.close()
 
+    def test_generate_signals_called_with_date_and_pred_path_kwarg(self, tmp_path):
+        """generate_signals must be called as (trade_date, pred_path=...).
+
+        Regression: the first production run passed ctx.pred_path as the
+        positional trade_date, building a '<date>.parquet.parquet' path and
+        crashing Book B on day one.
+        """
+        from ashare_lab.paper.ledger import init_schema, get_connection
+        from ashare_lab.paper.pipeline import _run_book_b
+
+        d2, d3 = "2026-07-22", "2026-07-23"
+
+        prod_db = tmp_path / "paper.db"
+        conn = sqlite3.connect(str(prod_db))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.close()
+        book_b_db = tmp_path / "paper_b_none.db"
+        conn_b = get_connection(book_b_db)
+        init_schema(conn_b)
+        conn_b.close()
+
+        import pandas as pd
+        pred_path = tmp_path / "predictions" / f"{d2}.parquet"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
+
+        ctx = self._make_ctx(tmp_path, d2, pred_path)
+        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
+             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}) as mock_gs:
+            _run_book_b(ctx)
+
+        mock_gs.assert_called_once_with(d2, pred_path=ctx.pred_path)
+
     def test_no_pending_orders_skips_settle(self, tmp_path):
         """_run_book_b with no pending orders skips Phase 1 settle."""
         from ashare_lab.paper.ledger import init_schema, get_connection

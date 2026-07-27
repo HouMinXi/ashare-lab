@@ -1969,7 +1969,7 @@ def _run_book_b(ctx: DailyRunContext) -> None:
             generate_signals, filter_candidates, topk_dropout_orders,
         )
 
-        signals = generate_signals(ctx.pred_path)
+        signals = generate_signals(ctx.trade_date, pred_path=ctx.pred_path)
         candidate_syms = [s for s in signals if s in ctx.universe_symbols and s not in ctx.ipo_listing_syms and s not in ctx.st_names]
         filtered_syms = filter_candidates(
             candidate_syms, ctx.market_data,
