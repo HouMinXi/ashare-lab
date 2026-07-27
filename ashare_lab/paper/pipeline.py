@@ -1445,23 +1445,110 @@ def timing_multiplier(trade_date: str, model: str = "none") -> float:
     m scales top-k target weights at order generation (cash allocation),
     not signal scores.  Supported values: {0, 0.5, 1.0}.
 
-    Currently returns 1.0 for all models (null placeholder).
-    The three null models (N1=MA trend, N2=vol percentile, N3=drawdown
-    state map) are a later order; the seam is here so they plug in
-    without refactoring.
+    Supported models:
+      "none" = always 1.0 (Book A behavior)
+      "n1"   = CSI1000 20d MA trend filter
+      "n2"   = 20d realized volatility percentile
+      "n3"   = drawdown state map
 
     Args:
         trade_date: ISO date string (YYYY-MM-DD).
-        model: Model identifier.  "none" = always 1.0.
+        model: Model identifier.
 
     Returns:
         Float multiplier in {0, 0.5, 1.0}.
     """
     if model == "none":
         return 1.0
-    # Future: dispatch to N1/N2/N3 model implementations here
-    logger.warning("Unknown timing model %r, defaulting to m=1.0", model)
-    return 1.0
+
+    if model not in ("n1", "n2", "n3"):
+        logger.warning("Unknown timing model %r, defaulting to m=1.0", model)
+        return 1.0
+
+    try:
+        closes = _fetch_csi1000_closes_for_timing(trade_date)
+        if closes is None or closes.empty:
+            logger.warning("[timing] No CSI1000 data for %s, m=1.0", trade_date)
+            return 1.0
+
+        from ashare_lab.research.timing_nulls import (  # noqa: PLC0415
+            ma_trend_multiplier,
+            vol_percentile_multiplier,
+            drawdown_state_multiplier,
+        )
+
+        fn = {
+            "n1": ma_trend_multiplier,
+            "n2": vol_percentile_multiplier,
+            "n3": drawdown_state_multiplier,
+        }[model]
+        m_series = fn(closes)
+
+        if trade_date not in m_series.index:
+            logger.warning(
+                "[timing] trade_date %s not in m series (model=%s), m=1.0",
+                trade_date, model,
+            )
+            return 1.0
+
+        m = float(m_series.loc[trade_date])
+        logger.info("[timing] %s on %s: m=%.1f", model, trade_date, m)
+        return m
+
+    except Exception:
+        logger.warning("[timing] %s failed for %s, m=1.0", model, trade_date, exc_info=True)
+        return 1.0
+
+
+def _fetch_csi1000_closes_for_timing(trade_date: str):
+    """Fetch CSI1000 close series for timing null models.
+
+    Returns Series indexed by trading date with enough history for all
+    nulls (N2/N3 need 252 days).  Uses qlib subprocess, same source
+    as regime data fetch.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    # Need 300 trading days (~420 calendar days) for N2/N3 warmup
+    start_date = (dt.date.fromisoformat(trade_date) - dt.timedelta(days=500)).isoformat()
+
+    _script = """
+import qlib, json, sys
+from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
+from qlib.data import D
+start_d, end_d = sys.argv[1], sys.argv[2]
+raw = D.features(instruments=["SH000852"], fields=["$close"],
+                 start_time=start_d, end_time=end_d)
+if raw is not None and not raw.empty:
+    result = {}
+    for idx, val in zip(raw.index, raw["$close"].values):
+        date_str = str(idx[1].date()) if hasattr(idx[1], "date") else str(idx[1])
+        result[date_str] = float(val)
+    print(json.dumps(result))
+else:
+    print("{}")
+"""
+    try:
+        _r = subprocess.run(
+            [sys.executable, "-c", _script, start_date, trade_date],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(PROJECT_ROOT),
+        )
+        if _r.returncode == 0 and _r.stdout.strip():
+            data = json.loads(_r.stdout.strip())
+            if data:
+                closes = pd.Series(data, dtype=float)
+                closes.index = pd.to_datetime(closes.index)
+                closes = closes.sort_index()
+                logger.info("[timing] fetched %d CSI1000 closes for %s", len(closes), trade_date)
+                return closes
+    except subprocess.TimeoutExpired:
+        logger.warning("[timing] CSI1000 fetch timed out")
+    except Exception as exc:
+        logger.warning("[timing] CSI1000 fetch error: %s", exc)
+
+    return None
 
 
 def _step10_signal_generation(ctx: DailyRunContext) -> int:
