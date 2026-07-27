@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,26 +28,6 @@ _MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
 # -- Alert infrastructure (fail-open, stdlib only) --------------------------
 _ALERT_SENT_THIS_RUN = False  # rate-sanity: one alert per predict run
-
-_BRIDGE_TOKEN_PATHS = (
-    r"H:\.secrets\bridge-token",  # gpu-win
-    os.path.expanduser("~/.secrets/bridge-token"),  # POSIX
-)
-
-
-def _bridge_token() -> str:
-    """Read the alert-bridge shared token: env first, then token file."""
-    tok = os.environ.get("X_BRIDGE_TOKEN", "").strip()
-    if tok:
-        return tok
-    for p in _BRIDGE_TOKEN_PATHS:
-        try:
-            with open(p, encoding="utf-8") as f:
-                return f.read().strip()
-        except OSError:
-            continue
-    return ""
-
 
 def _send_alert(text: str) -> None:
     """Send a plain-text alert via the shared bridge module. Fail-open.

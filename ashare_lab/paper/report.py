@@ -726,8 +726,12 @@ def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, rep
             return False
         logger.info("[deliver] bridge chunk %d/%d sent", i + 1, len(chunks))
 
-    insert_report(conn, trade_date, mode, report_text, "alert_bridge", "sent")
-    conn.commit()
+    try:
+        insert_report(conn, trade_date, mode, report_text, "alert_bridge", "sent")
+        conn.commit()
+    except Exception as exc:
+        logger.warning("[deliver] bridge DB write failed: %s", exc)
+        return False
     logger.info("[deliver] all %d chunks sent via alert-bridge", len(chunks))
     return True
 
