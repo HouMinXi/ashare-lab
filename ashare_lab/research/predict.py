@@ -51,39 +51,20 @@ def _bridge_token() -> str:
 
 
 def _send_alert(text: str) -> None:
-    """Send a plain-text alert via alert-bridge POST /alert. Fail-open.
+    """Send a plain-text alert via the shared bridge module. Fail-open.
 
-    Uses stdlib urllib to avoid importing aiohttp/requests in the predict
-    path. Transport: alert-bridge :8377/alert, the same proven path
-    surflare alerts use (it forwards to hermes-gateway with its own
-    credentials). hermes-gateway :8642 direct is NOT usable here -- it
-    requires an API_SERVER_KEY this project does not have (verified by
-    real-send test 2026-07-25). Token comes from X_BRIDGE_TOKEN env or a
-    bridge-token file (see _BRIDGE_TOKEN_PATHS); without it the alert is
-    skipped with a warning. One alert per predict run (module-level
-    _ALERT_SENT_THIS_RUN flag, set only after a successful send).
+    One alert per predict run (module-level _ALERT_SENT_THIS_RUN flag,
+    set only after a successful send).  Transport and token resolution
+    live in ashare_lab.bridge.
     """
     global _ALERT_SENT_THIS_RUN  # noqa: PLW0603
     if _ALERT_SENT_THIS_RUN:
         return
 
-    import urllib.request  # noqa: PLC0415
+    from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
 
-    token = _bridge_token()
-    if not token:
-        log.warning("alert: no bridge token available, skipping alert")
-        return
-
-    url = os.environ.get("GATEWAY_URL", "http://192.168.100.10:8377/alert")
-    headers = {"Content-Type": "application/json", "X-Bridge-Token": token}
-    payload = json.dumps({"title": "ashare-predict", "body": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            log.info("alert sent: %s", resp.read().decode("utf-8")[:100])
-        _ALERT_SENT_THIS_RUN = True  # only after successful send
-    except Exception as exc:
-        log.warning("alert failed (non-fatal): %s", exc)
+    if send_bridge_alert("ashare-predict", text):
+        _ALERT_SENT_THIS_RUN = True
 
 
 # ---------------------------------------------------------------------------

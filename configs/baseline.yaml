@@ -171,6 +171,10 @@ paper:
     llm_api_key_pass: "api/omniroute"
     llm_timeout: 300
     llm_extra_body: {"stream": false}
+    # Primary delivery channel: "alert_bridge" (default) or "ilink" (legacy).
+    # alert_bridge uses the shared ashare_lab.bridge module (POST :8377/alert).
+    # ilink uses the direct WeChat iLink API (ret=-2 is revivable by messaging the bot).
+    delivery_channel: "alert_bridge"
     ilink_timeout: 15
     ilink_max_message_length: 4000
     ilink_chunk_delay: 0.3

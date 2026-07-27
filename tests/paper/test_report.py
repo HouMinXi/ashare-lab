@@ -1,7 +1,7 @@
 """Unit tests for report generation and delivery."""
 
 import json
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, AsyncMock
 import pytest
 from ashare_lab.paper.report import (
     ReportData, gather_report_data, format_chinese_report,
@@ -224,7 +224,8 @@ def test_send_pushplus(mock_post):
 @patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
 def test_deliver_report_ilink_success(mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
+    cfg = {"paper": {"report": {"delivery_channel": "ilink"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
 
@@ -234,7 +235,8 @@ def test_deliver_report_ilink_success(mock_ilink, mock_sec, db_conn):
 def test_deliver_report_ilink_retry(mock_sleep, mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
     mock_ilink.side_effect = [Exception("fail"), None]
-    assert deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}}) == "sent"
+    cfg = {"paper": {"report": {"delivery_channel": "ilink"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "ilink"
 
@@ -245,7 +247,7 @@ def test_deliver_report_retry_resumes_from_sent_chunk(mock_sleep, mock_ilink, mo
     """Retry must resume from the last successfully sent chunk, not from 0."""
     mock_sec.return_value = "token"
     # Use enough text to produce multiple chunks.
-    cfg = {"paper": {"report": {"ilink_max_message_length": 20}}}
+    cfg = {"paper": {"report": {"delivery_channel": "ilink", "ilink_max_message_length": 20}}}
     text = "A" * 60  # -> 3 chunks of 20
 
     call_count = {"n": 0}
@@ -312,7 +314,8 @@ def test_deliver_report_saves_always(db_conn):
 @patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
 def test_deliver_report_splits(mock_ilink, mock_sec, db_conn):
     mock_sec.return_value = "token"
-    deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, {"paper":{"report":{"ilink_max_message_length":4000}}})
+    cfg = {"paper": {"report": {"delivery_channel": "ilink", "ilink_max_message_length": 4000}}}
+    deliver_report(db_conn, "2025-01-06", "simple", "x" * 5000, cfg)
     assert mock_ilink.call_count == 1
     # Verify chunks arg has 2 elements
     chunks_arg = mock_ilink.call_args[0][0]
@@ -356,3 +359,88 @@ def test_cli_report_args():
 def test_generate_and_send_report_no_nav_row(db_conn, paper_config):
     rc = generate_and_send_report("2025-01-06", db_conn, {"paper": paper_config})
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# alert-bridge delivery tests (P2)
+# ---------------------------------------------------------------------------
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_bridge_success(mock_bridge, db_conn):
+    """Bridge success -> via='alert_bridge', no iLink call."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "report text", cfg) == "sent"
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert r["delivered_via"] == "alert_bridge"
+    mock_bridge.assert_called_once()
+    assert mock_bridge.call_args[0][0] == "A股日报 2025-01-06"
+    assert mock_bridge.call_args[0][1] == "report text"
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=False)
+@patch("ashare_lab.paper.report.send_serverchan", return_value=True)
+@patch("ashare_lab.paper.report._get_secret", return_value="sc_token")
+def test_deliver_report_bridge_fallback(mock_sec, mock_sc, mock_bridge, db_conn):
+    """Bridge down -> falls through to serverchan."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge", "fallback_service": "serverchan"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert r["delivered_via"] == "serverchan"
+    mock_bridge.assert_called_once()
+    mock_sc.assert_called_once()
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_bridge_chunking(mock_bridge, db_conn):
+    """Long report is chunked, each chunk sent with part indicator."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge", "ilink_max_message_length": 10}}}
+    text = "A" * 25  # -> 3 chunks of 10, 10, 5
+    assert deliver_report(db_conn, "2025-01-06", "simple", text, cfg) == "sent"
+    assert mock_bridge.call_count == 3
+    titles = [c[0][0] for c in mock_bridge.call_args_list]
+    assert titles[0] == "A股日报 2025-01-06 (1/3)"
+    assert titles[1] == "A股日报 2025-01-06 (2/3)"
+    assert titles[2] == "A股日报 2025-01-06 (3/3)"
+
+
+@patch("ashare_lab.bridge.send_bridge_alert")
+def test_deliver_report_bridge_partial_failure(mock_bridge, db_conn):
+    """Second chunk fails -> falls through to fallback."""
+    mock_bridge.side_effect = [True, False]
+    with patch("ashare_lab.paper.report.send_serverchan", return_value=True), \
+         patch("ashare_lab.paper.report._get_secret", return_value="sc_token"):
+        cfg = {"paper": {"report": {"delivery_channel": "alert_bridge", "ilink_max_message_length": 10, "fallback_service": "serverchan"}}}
+        assert deliver_report(db_conn, "2025-01-06", "simple", "A" * 15, cfg) == "sent"
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert r["delivered_via"] == "serverchan"
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_bridge_single_chunk_title(mock_bridge, db_conn):
+    """Single chunk: title without part indicator."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    deliver_report(db_conn, "2025-01-06", "simple", "short", cfg)
+    title = mock_bridge.call_args[0][0]
+    assert title == "A股日报 2025-01-06"
+    assert "(" not in title
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_bridge_send_necessary(mock_bridge, db_conn):
+    """Deleting bridge call -> via='alert_bridge' test must still pass (normal path).
+
+    Injection: patch _deliver_via_bridge to return False -> falls to fallback.
+    """
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert r["delivered_via"] == "alert_bridge"
+
+    with patch("ashare_lab.paper.report._deliver_via_bridge", return_value=False), \
+         patch("ashare_lab.paper.report.send_serverchan", return_value=True), \
+         patch("ashare_lab.paper.report._get_secret", return_value="sc_token"):
+        cfg2 = {"paper": {"report": {"delivery_channel": "alert_bridge", "fallback_service": "serverchan"}}}
+        result = deliver_report(db_conn, "2025-01-07", "simple", "text", cfg2)
+        assert result == "sent"
+        r2 = db_conn.execute("SELECT * FROM reports WHERE trade_date='2025-01-07' ORDER BY created_at DESC LIMIT 1").fetchone()
+        assert r2["delivered_via"] == "serverchan"
