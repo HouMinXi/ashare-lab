@@ -55,10 +55,11 @@ def test_gather_report_data_pending_orders(populated_db, paper_config):
 def test_gather_report_data_risk_status(populated_db, paper_config):
     rd = gather_report_data(populated_db, "2025-01-06", {}, {}, {"paper": paper_config})
     rs = rd.risk_status
-    assert rs["buying_halted"] is True  # 3% drawdown > 0.15 hard config? No, hard config is 15%. Wait.
-    # Actually daily loss is 3%, which is equal to 3% config (<= -0.03).
-    # Regime is halted because we inserted declining closes.
-    assert rs["regime_halted"] is True
+    assert rs["buying_halted"] is True  # daily loss 3% breaches the 3% config
+    # Pre-shadow-era DB (no risk_shadow_log rows): regime/drawdown flags
+    # were not computed at run time, so the report must show None, not a
+    # recomputed value.
+    assert rs["regime_halted"] is None
     assert rs["is_soft_reduced"] is False
     assert rs["sell_order_count"] == 1
     assert rs["cooldown_count"] == 1
