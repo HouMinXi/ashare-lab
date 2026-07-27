@@ -2187,13 +2187,19 @@ def _step15_graduation(ctx: DailyRunContext) -> None:
 
 
 def _close_pipeline_run(ctx: DailyRunContext, status: str, error_msg: str | None = None) -> None:
-    """Close the open pipeline_runs row to its final status."""
+    """Close the open pipeline_runs row to its final status.
+
+    Sets pipeline_run_id to None after successful close so the generic
+    uncaught-exception handler cannot overwrite a deliberate close
+    (close-once semantics).
+    """
     if ctx.pipeline_run_id is None:
         return
     try:
         duration_s = time.monotonic() - ctx.start_time
         close_pipeline_run(ctx.conn, ctx.pipeline_run_id, status, duration_s, error_msg)
         ctx.conn.commit()
+        ctx.pipeline_run_id = None  # close-once: prevent overwrite
     except Exception:
         logger.warning("Failed to close pipeline_run id=%s", ctx.pipeline_run_id, exc_info=True)
 
@@ -2304,8 +2310,8 @@ def run_daily(
         logger.info("Pipeline completed for %s", trade_date)
         return 0
 
-    except Exception:
-        _close_pipeline_run(ctx, "error", "uncaught exception")
+    except Exception as exc:
+        _close_pipeline_run(ctx, "error", f"uncaught exception: {exc}")
         raise
 
 

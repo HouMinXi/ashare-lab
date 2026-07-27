@@ -1,12 +1,18 @@
 """Tests for pipeline_runs open-and-close recording (P1).
 
-R5 requirements:
-  T1: start-row written at start
-  T2: success closes to 'success'
-  T3: injected exception mid-run closes to 'error' with message
-  T4: gate halt closes to 'halted' with gate name
-  T5: simulated kill (no close) leaves 'running'
-  T6: bug-injection: remove the failed-path close -> test expecting 'error' FAILS
+Unit tests (ledger helpers):
+  T1-T7: open/close semantics, same-day reruns, observation window
+  T8-T10: schema migration
+
+Integration tests (through run_daily):
+  T11: data-completeness gate -> 'halted'
+  T12: price-sanity gate -> 'halted'
+  T13: settle error -> 'error'
+  T14: uncaught exception -> 'error' with real message
+  T15: close-once: gate halt not overwritten by outer handler
+
+Bug-injection: for each instrumented path, delete the close call,
+show the test RED, restore, show GREEN.
 """
 
 from __future__ import annotations
@@ -152,16 +158,14 @@ class TestPipelineRunsRecording:
         conn.close()
 
 
-class TestBugInjection:
-    """T6: remove the failed-path close and show the test FAILS."""
+class TestLedgerCloseSemantics:
+    """T8: ledger-level close behavior (not a bug-injection proof).
 
-    def test_remove_close_keeps_running(self, tmp_path):
-        """Without close_pipeline_run call, row stays 'running'.
+    Integration tests in TestIntegration* prove the run_daily wiring.
+    """
 
-        Bug-inject: if _close_pipeline_run is removed from error path,
-        the row stays 'running' instead of 'error'. This test proves
-        the close is necessary.
-        """
+    def test_close_changes_status(self, tmp_path):
+        """Close changes 'running' to 'error'; no-close leaves 'running'."""
         from ashare_lab.paper.ledger import open_pipeline_run, close_pipeline_run
 
         conn, _ = _make_db(tmp_path)
@@ -238,3 +242,217 @@ class TestSchemaMigration:
         assert row is not None
         assert row["status"] == "success"
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: through run_daily (adopted from PM's test_pm_verify_p1.py)
+# ---------------------------------------------------------------------------
+
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+import pytest  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+from test_pipeline import _pipeline_patches  # noqa: E402
+
+_MOD = "ashare_lab.paper.pipeline"
+
+
+@pytest.fixture()
+def int_db(tmp_path):
+    """Create a test DB for integration tests."""
+    from ashare_lab.paper.ledger import get_connection, init_schema
+    p = tmp_path / "paper.db"
+    conn = get_connection(p)
+    init_schema(conn)
+    conn.close()
+    return p
+
+
+@pytest.fixture()
+def int_config(int_db):
+    return {
+        "paper": {
+            "db_path": str(int_db),
+            "carry_days": 3,
+            "volume_participation_pct": 0.05,
+            "topk": 15,
+            "n_drop": 1,
+            "initial_cash": 300_000,
+            "backup_retention_days": 7,
+            "slippage": 0.001,
+            "listing_min_days": 60,
+            "liquidity_min_turnover": 50_000_000,
+            "predictions_dir": "predictions",
+            "min_signal_coverage": 100,
+            "risk": {
+                "drawdown_hard": 0.15,
+                "daily_loss": 0.03,
+                "concentration": 0.15,
+                "market_regime_decline": 0.08,
+                "market_regime_days": 10,
+            },
+        },
+    }
+
+
+def _final_rows(db_path, trade_date="2025-06-20"):
+    """Get pipeline_runs rows for a trade date."""
+    from ashare_lab.paper.ledger import get_connection
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT status, error_msg FROM pipeline_runs WHERE trade_date=? ORDER BY id",
+        (trade_date,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+class TestIntegrationGateHalt:
+    """T11/T12: gate halt through run_daily -> final row 'halted'."""
+
+    def test_data_gate_halt_records_halted(self, int_db, int_config):
+        """T11: data-completeness gate -> 'halted' with gate name."""
+        extra = {
+            "gate_data": patch(
+                f"{_MOD}._gate_data_completeness",
+                side_effect=RuntimeError("Data completeness gate: qlib missing 5 days"),
+            ),
+        }
+        with _pipeline_patches(int_db, int_config, extra_patches=extra):
+            from ashare_lab.paper.pipeline import run_daily
+            try:
+                run_daily("2025-06-20")
+            except RuntimeError:
+                pass
+
+        rows = _final_rows(int_db)
+        assert len(rows) == 1, f"expected 1 row, got {len(rows)}: {rows}"
+        assert rows[0]["status"] == "halted", (
+            f"gate halt must leave 'halted', got '{rows[0]['status']}' "
+            f"(error_msg={rows[0]['error_msg']!r})"
+        )
+        assert "Data completeness gate" in (rows[0]["error_msg"] or "")
+
+    def test_price_gate_halt_records_halted(self, int_db, int_config):
+        """T12: price-sanity gate -> 'halted' with gate name."""
+        extra = {
+            "gate_price": patch(
+                f"{_MOD}._gate_price_sanity",
+                side_effect=RuntimeError("Price sanity gate: 3 anomalies"),
+            ),
+        }
+        with _pipeline_patches(int_db, int_config, extra_patches=extra):
+            from ashare_lab.paper.pipeline import run_daily
+            try:
+                run_daily("2025-06-20")
+            except RuntimeError:
+                pass
+
+        rows = _final_rows(int_db)
+        assert len(rows) == 1, f"expected 1 row, got {len(rows)}: {rows}"
+        assert rows[0]["status"] == "halted", (
+            f"gate halt must leave 'halted', got '{rows[0]['status']}' "
+            f"(error_msg={rows[0]['error_msg']!r})"
+        )
+
+
+class TestIntegrationSettleError:
+    """T13: settle error (rc=2) through run_daily -> 'error'."""
+
+    def test_settle_error_records_error(self, int_db, int_config):
+        """T13: settle returning 2 -> 'error' with message."""
+        from ashare_lab.paper.engine import SettleResult
+        settle_result = SettleResult()
+        settle_result.pre_trade_nav = 300_000
+        settle_result.post_trade_nav = 300_000
+        settle_result.cash = 300_000
+
+        def settle_side_effect(*args, **kwargs):
+            conn = args[0]
+            conn.execute(
+                "INSERT INTO pipeline_runs (trade_date, status, duration_s, error_msg, "
+                "predictions_date, created_at) VALUES (?, 'error', 0, 'test', NULL, '')",
+                ("2025-06-20",),
+            )
+            return settle_result
+
+        extra = {
+            "settle_day": patch(
+                f"{_MOD}.settle_day",
+                side_effect=settle_side_effect,
+            ),
+        }
+        with _pipeline_patches(int_db, int_config, extra_patches=extra):
+            from ashare_lab.paper.pipeline import run_daily
+            # settle_day mock doesn't return rc=2 through the normal path
+            # Instead, patch _step8_settle to return 2
+            with patch(f"{_MOD}._step8_settle", return_value=2):
+                result = run_daily("2025-06-20")
+
+        assert result == 2
+        rows = _final_rows(int_db)
+        assert any(r["status"] == "error" for r in rows), (
+            f"settle error must leave 'error', got {rows}"
+        )
+
+
+class TestIntegrationUncaughtException:
+    """T14: uncaught exception through run_daily -> 'error' with real message."""
+
+    def test_uncaught_exception_records_error(self, int_db, int_config):
+        """T14: exception in _step9 -> 'error' with real exception message."""
+        extra = {
+            "risk": patch(
+                f"{_MOD}._step9_risk_checks",
+                side_effect=ValueError("boom: risk engine crashed"),
+            ),
+        }
+        with _pipeline_patches(int_db, int_config, extra_patches=extra):
+            from ashare_lab.paper.pipeline import run_daily
+            try:
+                run_daily("2025-06-20")
+            except ValueError:
+                pass
+
+        rows = _final_rows(int_db)
+        assert len(rows) == 1, f"expected 1 row, got {len(rows)}: {rows}"
+        assert rows[0]["status"] == "error", (
+            f"uncaught exception must leave 'error', got '{rows[0]['status']}'"
+        )
+        assert "boom" in (rows[0]["error_msg"] or ""), (
+            f"error_msg must contain real exception, got: {rows[0]['error_msg']!r}"
+        )
+
+
+class TestCloseOnceSemantics:
+    """T15: close-once -- gate halt not overwritten by outer handler."""
+
+    def test_gate_halt_not_overwritten(self, int_db, int_config):
+        """T15: inner 'halted' close survives outer 'error' handler.
+
+        This is the F1 fix verification: _close_pipeline_run sets
+        pipeline_run_id=None after close, so the outer except block
+        is a no-op.
+        """
+        extra = {
+            "gate_data": patch(
+                f"{_MOD}._gate_data_completeness",
+                side_effect=RuntimeError("Data completeness gate: qlib missing 5 days"),
+            ),
+        }
+        with _pipeline_patches(int_db, int_config, extra_patches=extra):
+            from ashare_lab.paper.pipeline import run_daily
+            try:
+                run_daily("2025-06-20")
+            except RuntimeError:
+                pass
+
+        rows = _final_rows(int_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "halted", (
+            f"close-once: gate halt must survive outer handler, "
+            f"got '{rows[0]['status']}'"
+        )
