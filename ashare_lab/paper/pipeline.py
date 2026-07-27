@@ -1840,8 +1840,9 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         # Load Book B state
         from ashare_lab.paper.ledger import (  # noqa: PLC0415
             get_latest_positions, get_latest_cash, get_cooldowns,
-            manage_trailing_cooldown, delete_expired_cooldowns,
+            delete_expired_cooldowns,
         )
+        from ashare_lab.paper.risk import manage_trailing_cooldown  # noqa: PLC0415
         book_positions = get_latest_positions(book_conn)
         book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
         book_cooldown = get_cooldowns(book_conn)
@@ -1860,9 +1861,9 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
 
         signals = generate_signals(ctx.pred_path)
+        candidate_syms = [s for s in signals if s in ctx.universe_symbols and s not in ctx.ipo_listing_syms and s not in ctx.st_names]
         filtered_syms = filter_candidates(
-            signals, ctx.universe_symbols, ctx.ipo_listing_syms,
-            ctx.st_names, ctx.market_data,
+            candidate_syms, ctx.market_data,
             ctx.config.get("universe", {}).get("listing_min_days", 60),
             ctx.config.get("universe", {}).get("min_avg_turnover_20d", 0.0),
             ctx.config.get("universe", {}).get("exclude_close_above_cny", 300.0),
@@ -1911,19 +1912,12 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         ]
 
         if pending_orders:
-            book_settle = settle_day(
+            settle_day(
                 book_conn, ctx.trade_date, pending_orders, ctx.prices,
                 book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
             )
-            if book_settle:
-                record_nav(
-                    book_conn, ctx.trade_date, book_settle.cash,
-                    book_settle.market_value, book_settle.total_nav,
-                    book_settle.pre_trade_nav, book_settle.post_trade_nav,
-                    None, None,
-                )
-                book_positions = get_latest_positions(book_conn)
-                book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+            book_positions = get_latest_positions(book_conn)
+            book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
 
         # PHASE 2: Generate next-day orders (not settled today)
         # These orders have trade_date=next_td and settle on the NEXT run.

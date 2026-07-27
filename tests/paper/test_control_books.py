@@ -10,8 +10,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
+import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -288,3 +290,169 @@ class TestReplayDriver:
         nav_a = conn_a2.execute("SELECT * FROM nav WHERE trade_date=?", (d2,)).fetchone()
         assert nav_a is not None, "Book A should have NAV for d2"
         conn_a2.close()
+
+
+class TestRunBookBPhase1Phase2:
+    """Direct test of _run_book_b Phase 1 (settle yesterday) + Phase 2 (generate today).
+
+    This is the B1 fix coverage: verifies _run_book_b correctly separates
+    settle (trade_date <= today) from order generation (trade_date = next_td).
+    """
+
+    def _make_ctx(self, tmp_path, trade_date, pred_path):
+        """Build a minimal DailyRunContext for _run_book_b."""
+        from ashare_lab.paper.pipeline import DailyRunContext
+
+        ctx = DailyRunContext.__new__(DailyRunContext)
+        ctx.trade_date = trade_date
+        ctx.db_path = tmp_path / "paper.db"
+        ctx.paper_cfg = {
+            "initial_cash": 300000.0, "topk": 15, "n_drop": 1,
+            "listing_min_days": 60,
+        }
+        ctx.config = {
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0, "exclude_close_above_cny": 300.0},
+            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
+        }
+        ctx.risk_result = MagicMock(
+            buying_halted=False, forced_sells={},
+            blocked_industries=set(), blocked_rebuys=set(),
+            topk_override=None, cooldown_entries={},
+        )
+        ctx.prices = {"SH600519": {"close": 180.0}}
+        ctx.pred_path = pred_path
+        ctx.universe_symbols = ["SH600519"]
+        ctx.ipo_listing_syms = set()
+        ctx.st_names = set()
+        ctx.market_data = {
+            "SH600519": {"close": 180.0, "listing_days": 100, "avg_turnover_20d": 100_000_000.0},
+        }
+        ctx.industry_map = {}
+        ctx.benchmarks = {"csi1000": 1.0}
+        ctx.hedge_state = None
+        ctx.hedge_symbols = set()
+        ctx.total_nav = 300000.0
+        ctx.current_positions = {}
+        ctx.cash = 300000.0
+        return ctx
+
+    def test_phase1_settles_yesterday_phase2_generates_today(self, tmp_path):
+        """_run_book_b Phase 1 settles d1 orders, Phase 2 inserts d2 orders.
+
+        Day 1: Insert pending order (trade_date=d2) into Book B DB.
+        Day 2: Call _run_book_b(ctx_d2).
+        Verify:
+        - d2 order is settled (status != pending)
+        - New d3 order is inserted (pending, not settled)
+        """
+        from ashare_lab.paper.ledger import init_schema, insert_order, get_connection
+        from ashare_lab.paper.pipeline import _run_book_b
+
+        d1 = "2026-07-21"
+        d2 = "2026-07-22"
+        d3 = "2026-07-23"  # next trading day after d2
+
+        # Create production DB (needed for bootstrap)
+        prod_db = tmp_path / "paper.db"
+        conn = sqlite3.connect(str(prod_db))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.execute("INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')")
+        conn.commit()
+        conn.close()
+
+        # Create Book B DB with a pending order for d2 (placed on d1)
+        book_b_db = tmp_path / "paper_b_none.db"
+        conn_b = get_connection(book_b_db)
+        init_schema(conn_b)
+        conn_b.execute("INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')")
+        insert_order(conn_b, d2, "SH600519", "buy", 100, None, "pending", 0, d1)
+        conn_b.commit()
+        conn_b.close()
+
+        # Create prediction parquet for d2
+        import pandas as pd
+        pred_path = tmp_path / "predictions" / f"{d2}.parquet"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
+
+        # Build ctx for d2
+        ctx = self._make_ctx(tmp_path, d2, pred_path)
+
+        # Patch next_trading_day to return d3, and generate_signals to return fixed data
+        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
+             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            _run_book_b(ctx)
+
+        # Debug: check all orders
+        conn_debug = get_connection(book_b_db)
+        all_orders = conn_debug.execute("SELECT trade_date, status FROM orders").fetchall()
+        print(f"\nDEBUG all orders: {[(r['trade_date'], r['status']) for r in all_orders]}")
+        conn_debug.close()
+
+        # Verify: d2 orders should be settled (Phase 1)
+        conn_check = get_connection(book_b_db)
+        d2_orders = conn_check.execute(
+            "SELECT status FROM orders WHERE trade_date=?",
+            (d2,),
+        ).fetchall()
+        for row in d2_orders:
+            assert row["status"] != "pending", \
+                f"d2 order should be settled, got status={row['status']}"
+
+        # Verify: d3 orders should exist and be pending (Phase 2)
+        d3_orders = conn_check.execute(
+            "SELECT status FROM orders WHERE trade_date=?",
+            (d3,),
+        ).fetchall()
+        assert len(d3_orders) > 0, "Phase 2 should have inserted d3 orders"
+        for row in d3_orders:
+            assert row["status"] == "pending", \
+                f"d3 order should be pending, got status={row['status']}"
+
+        conn_check.close()
+
+    def test_no_pending_orders_skips_settle(self, tmp_path):
+        """_run_book_b with no pending orders skips Phase 1 settle."""
+        from ashare_lab.paper.ledger import init_schema, get_connection
+        from ashare_lab.paper.pipeline import _run_book_b
+
+        d2 = "2026-07-22"
+        d3 = "2026-07-23"
+
+        # Create empty Book B DB (no pending orders)
+        prod_db = tmp_path / "paper.db"
+        conn = sqlite3.connect(str(prod_db))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.execute("INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')")
+        conn.commit()
+        conn.close()
+
+        book_b_db = tmp_path / "paper_b_none.db"
+        conn_b = get_connection(book_b_db)
+        init_schema(conn_b)
+        conn_b.execute("INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')")
+        conn_b.commit()
+        conn_b.close()
+
+        import pandas as pd
+        pred_path = tmp_path / "predictions" / f"{d2}.parquet"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
+
+        ctx = self._make_ctx(tmp_path, d2, pred_path)
+
+        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
+             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            _run_book_b(ctx)
+
+        # Verify: no d2 orders to settle, but d3 orders generated
+        conn_check = get_connection(book_b_db)
+        d3_orders = conn_check.execute(
+            "SELECT status FROM orders WHERE trade_date=?",
+            (d3,),
+        ).fetchall()
+        assert len(d3_orders) > 0, "Phase 2 should have inserted d3 orders"
+        conn_check.close()
