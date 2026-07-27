@@ -456,3 +456,147 @@ class TestRunBookBPhase1Phase2:
         ).fetchall()
         assert len(d3_orders) > 0, "Phase 2 should have inserted d3 orders"
         conn_check.close()
+
+
+class TestSettleBeforeCompute:
+    """F2: Phase 1 settle must happen BEFORE computing NAV/target_value.
+
+    On a day with a pending SELL that fills, buy target_value must use
+    the post-settle cash (higher), not pre-settle cash (lower).
+    """
+
+    def test_post_settle_cash_used_for_buy_target(self, tmp_path):
+        """A filled sell in Phase 1 increases cash; buy target must reflect that.
+
+        Setup: cash=300000, pending SELL 500xSH600519 @ close=180.0
+        Phase 1 settle: cash -> 300000 + 500*180*(1-0.001) = 389910
+        Phase 2: target_value = 389910 * 0.95 / 5 = 74082.9
+        buy SH600600: round_lots(74082.9 / 180.0) = 400
+
+        Pre-fix ordering (NAV computed before settle) would use 300000:
+        target_value = 300000 * 0.95 / 5 = 57000
+        buy SH600600: round_lots(57000 / 180.0) = 300
+
+        Bug-inject: run test, assert 400 -> FAIL pre-fix, PASS post-fix.
+        """
+        from ashare_lab.paper.ledger import (
+            init_schema, get_connection, insert_order,
+        )
+        from ashare_lab.paper.pipeline import DailyRunContext, _run_book_b
+
+        d1 = "2026-07-21"
+        d2 = "2026-07-22"
+        d3 = "2026-07-23"
+
+        # -- Production DB (minimal, just for bootstrap copy) --
+        prod_db = tmp_path / "paper.db"
+        conn = sqlite3.connect(str(prod_db))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')",
+        )
+        conn.commit()
+        conn.close()
+
+        # -- Book B DB: cash + held position + pending sell --
+        book_b_db = tmp_path / "paper_b_none.db"
+        conn_b = get_connection(book_b_db)
+        init_schema(conn_b)
+        conn_b.execute(
+            "INSERT OR IGNORE INTO paper_state (key, value) VALUES ('cash', '300000.0')",
+        )
+        # Pending sell: SH600519, 500 shares, trade_date=d2 (inserted d1)
+        insert_order(conn_b, d2, "SH600519", "sell", 500, None, "pending", 0, d1)
+        # Held position (for settle to match)
+        conn_b.execute(
+            "INSERT INTO positions "
+            "(trade_date, symbol, qty, avg_cost, market_value, buy_date) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (d1, "SH600519", 500, 180.0, 500 * 180.0, d1),
+        )
+        conn_b.commit()
+        conn_b.close()
+
+        # -- Predictions --
+        import pandas as pd
+        pred_path = tmp_path / "predictions" / f"{d2}.parquet"
+        pred_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({
+            "instrument": ["SH600519", "SH600600"],
+            "score": [0.7, 0.9],
+        }).to_parquet(pred_path)
+
+        # -- Context --
+        ctx = DailyRunContext.__new__(DailyRunContext)
+        ctx.trade_date = d2
+        ctx.db_path = tmp_path / "paper.db"
+        ctx.paper_cfg = {
+            "initial_cash": 300000.0, "topk": 5, "n_drop": 1,
+            "listing_min_days": 60,
+        }
+        ctx.config = {
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {
+                "listing_min_days": 60, "min_avg_turnover_20d": 0.0,
+                "exclude_close_above_cny": 300.0,
+            },
+            "carry_days": 3, "slippage": 0.001,
+            "volume_participation_pct": 0.05,
+        }
+        ctx.risk_result = MagicMock(
+            buying_halted=False, forced_sells={},
+            blocked_industries=set(), blocked_rebuys=set(),
+            topk_override=None, cooldown_entries={},
+        )
+        ctx.prices = {
+            "SH600519": {"close": 180.0, "volume": 50000},
+            "SH600600": {"close": 180.0, "volume": 50000},
+        }
+        ctx.pred_path = pred_path
+        ctx.universe_symbols = ["SH600519", "SH600600"]
+        ctx.ipo_listing_syms = set()
+        ctx.st_names = set()
+        ctx.market_data = {
+            "SH600519": {"listing_days": 999, "avg_turnover_20d": 5000, "close": 180.0},
+            "SH600600": {"listing_days": 999, "avg_turnover_20d": 5000, "close": 180.0},
+        }
+        ctx.industry_map = {}
+        ctx.benchmarks = {}
+
+        with unittest.mock.patch(
+            "ashare_lab.paper.pipeline.next_trading_day",
+            return_value=dt.date.fromisoformat(d3),
+        ), unittest.mock.patch(
+            "ashare_lab.paper.signal.generate_signals",
+            return_value={"SH600519": 0.7, "SH600600": 0.9},
+        ):
+            _run_book_b(ctx)
+
+        # Verify: buy for SH600600 should use post-settle cash (389910)
+        # target_value = 389910 * 0.95 / 5 = 74082.9
+        # round_lots(74082.9 / 180.0) = 400
+        #
+        # Pre-fix (NAV before settle): target_value = 300000 * 0.95 / 5 = 57000
+        # round_lots(57000 / 180.0) = 300
+        conn_check = get_connection(book_b_db)
+        buy_600600 = conn_check.execute(
+            "SELECT target_qty FROM orders WHERE symbol=? AND side='buy' AND trade_date=?",
+            ("SH600600", d3),
+        ).fetchone()
+        assert buy_600600 is not None, "Should have a buy order for SH600600"
+        assert buy_600600["target_qty"] == 400, (
+            f"Expected 400 (post-settle cash), got {buy_600600['target_qty']} "
+            f"(300 = pre-settle cash = bug)"
+        )
+
+        # Verify SELL was settled (status != pending)
+        sell_status = conn_check.execute(
+            "SELECT status FROM orders WHERE symbol=? AND side='sell'",
+            ("SH600519",),
+        ).fetchone()
+        assert sell_status is not None
+        assert sell_status["status"] == "filled", (
+            f"SELL should be filled, got {sell_status['status']}"
+        )
+        conn_check.close()

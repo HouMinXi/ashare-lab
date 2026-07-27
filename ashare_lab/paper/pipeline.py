@@ -1849,7 +1849,30 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         book_cooldown = manage_trailing_cooldown(book_cooldown, ctx.trade_date)
         delete_expired_cooldowns(book_conn, ctx.trade_date)
 
-        # Compute Book B NAV
+        # PHASE 1: Settle yesterday's Book B orders (T+1)
+        # Must happen BEFORE computing NAV/signals/target_value,
+        # mirroring Book A's flow: _step8_settle -> _step10_signals.
+        from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
+
+        pending_orders = [
+            dict(r) for r in book_conn.execute(
+                "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
+                "suspension_carry_day FROM orders "
+                "WHERE status IN ('pending','carry') AND trade_date <= ?",
+                (ctx.trade_date,),
+            ).fetchall()
+        ]
+
+        if pending_orders:
+            settle_day(
+                book_conn, ctx.trade_date, pending_orders, ctx.prices,
+                book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
+            )
+            # Reload post-settle state
+            book_positions = get_latest_positions(book_conn)
+            book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+
+        # Compute Book B NAV from post-settle state
         book_total_nav = sum(
             pos["market_value"] for pos in book_positions.values()
         ) + book_cash
@@ -1858,7 +1881,6 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         from ashare_lab.paper.signal import (  # noqa: PLC0415
             generate_signals, filter_candidates, topk_dropout_orders,
         )
-        from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
 
         signals = generate_signals(ctx.pred_path)
         candidate_syms = [s for s in signals if s in ctx.universe_symbols and s not in ctx.ipo_listing_syms and s not in ctx.st_names]
@@ -1891,33 +1913,13 @@ def _run_book_b(ctx: DailyRunContext) -> None:
         if ctx.risk_result.buying_halted:
             buy_syms = []
 
-        # Compute m-scaled target value
+        # Compute m-scaled target value from post-settle NAV
         if effective_topk <= 0:
             target_value = 0.0
             buy_syms = []
         else:
             equity_nav = book_total_nav
             target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"] * m) / effective_topk
-
-        # PHASE 1: Settle yesterday's Book B orders (T+1)
-        # Orders placed yesterday (trade_date <= today) settle with today's prices.
-        # This mirrors Book A's _step8_settle flow (pipeline.py:1230-1236).
-        pending_orders = [
-            dict(r) for r in book_conn.execute(
-                "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
-                "suspension_carry_day FROM orders "
-                "WHERE status IN ('pending','carry') AND trade_date <= ?",
-                (ctx.trade_date,),
-            ).fetchall()
-        ]
-
-        if pending_orders:
-            settle_day(
-                book_conn, ctx.trade_date, pending_orders, ctx.prices,
-                book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
-            )
-            book_positions = get_latest_positions(book_conn)
-            book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
 
         # PHASE 2: Generate next-day orders (not settled today)
         # These orders have trade_date=next_td and settle on the NEXT run.
