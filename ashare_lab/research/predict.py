@@ -285,6 +285,81 @@ def _update_diversity_history(
         log.debug("Failed to update diversity history", exc_info=True)
 
 
+def _resolve_model_path(
+    trade_date: str,
+    model_path: Path | None,
+    windows: list[dict],
+    cfg: dict,
+    models_dir: Path,
+) -> tuple[Path, dict]:
+    """Resolve the model path and window for a trade date.
+
+    Returns (model_path, window_dict).  May fire _send_alert for genuine
+    missing-model situations; deliberately mismatches (expected_live_model)
+    are logged at INFO only.
+    """
+    window: dict | None = None
+
+    for w in windows:
+        if w["test_start"] <= trade_date <= w["test_end"]:
+            window = w
+            break
+
+    if window is None:
+        if windows and trade_date > windows[-1]["test_end"]:
+            window = windows[-1]
+            if model_path is None:
+                model_path = models_dir / "latest.pt"
+        elif not windows or trade_date < windows[0]["test_start"]:
+            raise ValueError(
+                "no trained model covers %s "
+                "(earliest test_start=%s)"
+                % (trade_date, windows[0]["test_start"] if windows else "N/A")
+            )
+
+    window_id: int = window["window_id"]
+
+    if model_path is None:
+        model_path = models_dir / f"w{window_id}.pt"
+        if not model_path.exists():
+            fallback = models_dir / "latest.pt"
+            if fallback.exists():
+                expected = cfg.get("research", {}).get("expected_live_model")
+                # Check if latest.pt points to the expected model
+                # (e.g. latest.pt -> w10.pt and expected == "w10")
+                # Use resolve() to follow symlinks; if latest.pt is a
+                # regular file (not a symlink), stem will be "latest"
+                # which won't match any expected model -> alert fires.
+                fallback_target = fallback.resolve().stem
+                if (
+                    expected
+                    and f"w{window_id}" != expected
+                    and fallback_target == expected
+                ):
+                    log.info(
+                        "window model w%d.pt not deployed "
+                        "(expected_live_model=%s), using %s",
+                        window_id, expected, fallback.name,
+                    )
+                else:
+                    log.warning("w%d.pt missing, falling back to latest.pt", window_id)
+                    _send_alert(
+                        f"[predict] model fallback: w{window_id}.pt missing, "
+                        f"using {fallback.name} on {trade_date}. "
+                        f"Action: train w{window_id}.pt"
+                    )
+                model_path = fallback
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            "model file %s does not exist "
+            "(models are gitignored; train on the GPU host or sync them)"
+            % model_path
+        )
+
+    return model_path, window
+
+
 def predict_for_date(
     trade_date: str,
     model_path: Path | None = None,
@@ -333,50 +408,10 @@ def predict_for_date(
     from ashare_lab.research.train import ALPHA158_WARMUP_START  # noqa: PLC0415
 
     # -- 1. Window selection (resolves both window dict and model path) ----
-    windows = get_all_windows()
-    window: dict | None = None
-
-    for w in windows:
-        if w["test_start"] <= trade_date <= w["test_end"]:
-            window = w
-            break
-
-    if window is None:
-        if windows and trade_date > windows[-1]["test_end"]:
-            # Live / out-of-sample: use the highest trained main window.
-            window = windows[-1]
-            if model_path is None:
-                model_path = MODELS_DIR / "latest.pt"
-        elif not windows or trade_date < windows[0]["test_start"]:
-            raise ValueError(
-                "no trained model covers %s "
-                "(earliest test_start=%s)"
-                % (trade_date, windows[0]["test_start"] if windows else "N/A")
-            )
-
+    model_path, window = _resolve_model_path(
+        trade_date, model_path, get_all_windows(), load_config(), MODELS_DIR,
+    )
     window_id: int = window["window_id"]
-
-    if model_path is None:
-        model_path = MODELS_DIR / f"w{window_id}.pt"
-        if not model_path.exists():
-            # Window's model not yet trained; fall back to latest.pt
-            fallback = MODELS_DIR / "latest.pt"
-            if fallback.exists():
-                log.warning("w%d.pt missing, falling back to latest.pt", window_id)
-                model_path = fallback
-                _send_alert(
-                    f"[predict] model fallback: w{window_id}.pt missing, "
-                    f"using {fallback.name} on {trade_date}. "
-                    f"Action: train w{window_id}.pt"
-                )
-            # else: let the FileNotFoundError below fire with the original path
-
-    if not model_path.exists():
-        raise FileNotFoundError(
-            "model file %s does not exist "
-            "(models are gitignored; train on the GPU host or sync them)"
-            % model_path
-        )
 
     # -- Model freshness check --
     model_age_days = (time.time() - model_path.stat().st_mtime) / 86400

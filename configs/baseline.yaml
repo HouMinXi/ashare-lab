@@ -87,6 +87,12 @@ slippage_fragility:
   rel_drop_threshold: 0.50
   # treat abs(excess) <= this as flat (no float-noise sign flip)
   abs_tol: 0.0005
+research:
+  # Expected live model name (without .pt). When predict's computed window
+  # model differs but latest.pt resolves to this value, the mismatch is
+  # deliberate (e.g. w11 shelved, KEEP w10) -- log.info only, no alert.
+  # Update this value when swapping the live model; no code edits needed.
+  expected_live_model: "w10"
 paper:
   db_path: "paper.db"
   carry_days: 3
