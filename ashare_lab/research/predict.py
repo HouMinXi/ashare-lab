@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import filecmp
 import json
 import logging
 import math
@@ -325,16 +326,18 @@ def _resolve_model_path(
             fallback = models_dir / "latest.pt"
             if fallback.exists():
                 expected = cfg.get("research", {}).get("expected_live_model")
-                # Check if latest.pt points to the expected model
-                # (e.g. latest.pt -> w10.pt and expected == "w10")
-                # Use resolve() to follow symlinks; if latest.pt is a
-                # regular file (not a symlink), stem will be "latest"
-                # which won't match any expected model -> alert fires.
-                fallback_target = fallback.resolve().stem
-                if (
+                # Check if latest.pt contains the expected model.
+                # Works for both symlinks (X500) and regular-file copies (gpu-win).
+                expected_file = models_dir / f"{expected}.pt" if expected else None
+                is_expected = (
                     expected
+                    and expected_file is not None
+                    and expected_file.exists()
+                    and filecmp.cmp(str(fallback), str(expected_file), shallow=False)
+                )
+                if (
+                    is_expected
                     and f"w{window_id}" != expected
-                    and fallback_target == expected
                 ):
                     log.info(
                         "window model w%d.pt not deployed "

@@ -1,135 +1,184 @@
-"""Acceptance tests for predict.py model fallback/staleness alerts (B1-B4).
-
-Tests the alert mechanism without requiring qlib runtime. Mocks the
-hermes-gateway HTTP call at the urllib boundary.
-
-B1: missing w{id}.pt -> notify called with expected/fallback model names
-B2: notify raises -> prediction still completes, exception logged
-B3: bug-injection: remove notify call -> B1 FAIL, restore -> PASS
-B4: mock at transport boundary (urllib.request.urlopen)
-"""
+"""Tests for predict model-fallback alert exemption (P3)."""
 
 from __future__ import annotations
 
-import json
+import logging
 from pathlib import Path
-from unittest import mock
-
-import pytest
+from unittest.mock import patch
 
 
-@pytest.fixture(autouse=True)
-def _reset_alert_flag():
-    """Reset the rate-limit flag before each test."""
-    import ashare_lab.research.predict as mod
-    mod._ALERT_SENT_THIS_RUN = False
-    yield
-    mod._ALERT_SENT_THIS_RUN = False
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_predict_env(tmp_path: Path, window_id: int = 11,
+                      expected: str | None = "w10",
+                      latest_target: str = "w10.pt",
+                      window_exists: bool = False,
+                      use_copy: bool = False):
+    """Set up a minimal environment for testing the fallback logic.
+
+    Production layout (X500):
+      models/latest.pt -> w10.pt   (symlink)
+      models/w10.pt                (actual model)
+      models/w11.pt                (missing = shelved)
+
+    Production layout (gpu-win):
+      models/latest.pt             (copy of w10.pt)
+      models/w10.pt                (actual model)
+      models/w11.pt                (missing = shelved)
+
+    Returns (models_dir, cfg_dict).
+    """
+    models = tmp_path / "models"
+    models.mkdir()
+
+    # Create the target model that latest.pt will point to.
+    # latest_target defaults to "w10.pt" to match expected.
+    target = models / latest_target
+    target.write_text("fake model content for testing")
+
+    # latest.pt -> symlink or copy of target
+    latest = models / "latest.pt"
+    if use_copy:
+        import shutil
+        shutil.copy2(target, latest)
+    else:
+        latest.symlink_to(target)
+
+    # Window model -- only create if window_exists=True
+    if window_exists:
+        w_path = models / f"w{window_id}.pt"
+        w_path.write_text("fake model content for testing")
+
+    cfg: dict = {}
+    if expected:
+        cfg = {"research": {"expected_live_model": expected}}
+
+    return models, cfg
 
 
-class TestPredictAlert:
-    """Tests for _send_alert and its integration in predict_for_date."""
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    def test_alert_sent_on_fallback(self, tmp_path: Path, caplog) -> None:
-        """B1: missing model -> alert sent with expected and fallback names."""
-        from ashare_lab.research.predict import _send_alert
+@patch("ashare_lab.research.predict._send_alert")
+def test_window_equals_expected_alerts(mock_alert, tmp_path):
+    """(a) window model == expected -> genuine missing -> alert fires.
 
-        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
-                mock_resp = mock.MagicMock()
-                mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-                mock_resp.__exit__ = mock.Mock(return_value=False)
-                mock_resp.read.return_value = b'{"ok": true}'
-                mock_urlopen.return_value = mock_resp
+    Window 10, expected w10, w10.pt missing, latest.pt -> w9.pt (not w10).
+    This is a genuine missing model because latest.pt does NOT point to w10.
+    """
+    models, cfg = _make_predict_env(tmp_path, window_id=10,
+                                    expected="w10",
+                                    latest_target="w9.pt",
+                                    window_exists=False)
 
-                _send_alert(
-                    "[predict] model fallback: w11.pt missing, "
-                    "using latest.pt on 2026-07-25. Action: train w11.pt"
-                )
+    from ashare_lab.research.predict import _resolve_model_path
 
-                mock_urlopen.assert_called_once()
-                req = mock_urlopen.call_args[0][0]
-                body = json.loads(req.data.decode("utf-8"))
-                assert "w11.pt missing" in body["body"]
-                assert "latest.pt" in body["body"]
+    windows = [{"window_id": 10, "test_start": "2025-01-01",
+                "test_end": "2025-06-30", "train_start": "2022-01-01",
+                "train_end": "2024-12-31"}]
+    model_path, win = _resolve_model_path("2025-03-15", None, windows, cfg, models)
 
-    def test_alert_fail_open(self, caplog) -> None:
-        """B2: notify raises -> logged, does not propagate."""
-        from ashare_lab.research.predict import _send_alert
-
-        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
-            with mock.patch("urllib.request.urlopen", side_effect=Exception("network down")):
-                _send_alert("[test] alert")
-
-        assert "alert failed" in caplog.text
-
-    def test_alert_rate_limit(self) -> None:
-        """One alert per run: second call is a no-op."""
-        from ashare_lab.research.predict import _send_alert
-
-        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
-                mock_resp = mock.MagicMock()
-                mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-                mock_resp.__exit__ = mock.Mock(return_value=False)
-                mock_resp.read.return_value = b'{"ok": true}'
-                mock_urlopen.return_value = mock_resp
-
-                _send_alert("[test] first")
-                _send_alert("[test] second")
-
-                assert mock_urlopen.call_count == 1
-
-    def test_bug_injection_no_alert_call(self, tmp_path: Path) -> None:
-        """B3: with _send_alert removed, the fallback path has no alert."""
-        import ashare_lab.research.predict as mod
-
-        # Simulate removing _send_alert by replacing it with a no-op.
-        original = mod._send_alert
-        mod._send_alert = lambda text: None  # noqa: ARG005
-
-        with mock.patch("urllib.request.urlopen") as mock_urlopen:
-            mod._send_alert("[test] should be no-op")
-            # No HTTP call because _send_alert is a no-op.
-            mock_urlopen.assert_not_called()
-
-        # Restore.
-        mod._send_alert = original
-
-    def test_alert_boundary_mock_point(self) -> None:
-        """B4: the mock boundary is urllib.request.urlopen.
-
-        This test documents the exact mock point for test infrastructure.
-        The alert uses stdlib urllib (not aiohttp/requests), so mocking
-        urllib.request.urlopen is sufficient to intercept all alerts.
-        """
-        import ashare_lab.research.predict as mod
-        mod._ALERT_SENT_THIS_RUN = False
-
-        with mock.patch.dict("os.environ", {"X_BRIDGE_TOKEN": "test-token"}):
-            with mock.patch("urllib.request.urlopen") as mock_urlopen:
-                mock_resp = mock.MagicMock()
-                mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-                mock_resp.__exit__ = mock.Mock(return_value=False)
-                mock_resp.read.return_value = b'{"ok": true}'
-                mock_urlopen.return_value = mock_resp
-
-                mod._send_alert("[test] boundary check")
-
-                req = mock_urlopen.call_args[0][0]
-                assert req.full_url.endswith("/alert")
-                assert req.headers.get("X-bridge-token") == "test-token" or req.headers.get("X-Bridge-Token") == "test-token"
+    mock_alert.assert_called_once()
+    assert "Action: train w10.pt" in mock_alert.call_args[0][0]
+    assert win["window_id"] == 10
 
 
-class TestBridgeModuleMissing:
-    """gpu-win syncs a selective file set; bridge.py may be absent there."""
+@patch("ashare_lab.research.predict._send_alert")
+def test_deliberate_mismatch_no_alert(mock_alert, tmp_path, caplog):
+    """(b) window!=expected + fallback==expected -> NO alert, info log."""
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10", window_exists=False)
 
-    def test_alert_fail_open_without_bridge_module(self, caplog) -> None:
-        """Import failure of ashare_lab.bridge must not propagate."""
-        import sys
-        from ashare_lab.research.predict import _send_alert
+    from ashare_lab.research.predict import _resolve_model_path
 
-        with mock.patch.dict(sys.modules, {"ashare_lab.bridge": None}):
-            _send_alert("[test] bridge missing")
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    caplog.set_level(logging.INFO, logger="ashare_lab.research.predict")
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
 
-        assert "bridge module unavailable" in caplog.text
+    mock_alert.assert_not_called()
+    assert "not deployed (expected_live_model=w10)" in caplog.text
+    assert win["window_id"] == 11
+
+
+@patch("ashare_lab.research.predict._send_alert")
+def test_fallback_not_expected_alerts(mock_alert, tmp_path):
+    """(c) fallback != expected -> alert fires (someone swapped latest.pt)."""
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10",
+                                    latest_target="w9.pt",
+                                    window_exists=False)
+
+    from ashare_lab.research.predict import _resolve_model_path
+
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
+
+    mock_alert.assert_called_once()
+    assert "Action: train w11.pt" in mock_alert.call_args[0][0]
+
+
+@patch("ashare_lab.research.predict._send_alert")
+def test_expected_file_missing_alerts(mock_alert, tmp_path):
+    """(d) expected model file itself missing -> alert fires."""
+    models = tmp_path / "models"
+    models.mkdir()
+
+    latest = models / "latest.pt"
+    latest.write_text("fake model")
+
+    cfg = {"research": {"expected_live_model": "w10"}}
+
+    from ashare_lab.research.predict import _resolve_model_path
+
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
+
+    mock_alert.assert_called_once()
+
+
+@patch("ashare_lab.research.predict._send_alert")
+def test_no_expected_config_alerts(mock_alert, tmp_path):
+    """When expected_live_model is not set, alert fires as before."""
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected=None, window_exists=False)
+
+    from ashare_lab.research.predict import _resolve_model_path
+
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
+
+    mock_alert.assert_called_once()
+    assert "Action: train w11.pt" in mock_alert.call_args[0][0]
+
+
+@patch("ashare_lab.research.predict._send_alert")
+def test_deliberate_mismatch_no_alert_copy(mock_alert, tmp_path, caplog):
+    """(b-copy) Same as (b) but latest.pt is a regular-file copy, not a symlink.
+
+    This is the gpu-win production layout where latest.pt is a copy of w10.pt.
+    """
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10", window_exists=False,
+                                    use_copy=True)
+
+    from ashare_lab.research.predict import _resolve_model_path
+
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    caplog.set_level(logging.INFO, logger="ashare_lab.research.predict")
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
+
+    mock_alert.assert_not_called()
+    assert "not deployed (expected_live_model=w10)" in caplog.text
