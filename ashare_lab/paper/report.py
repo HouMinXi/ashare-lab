@@ -707,6 +707,16 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
 
     # --- Fallback: serverchan / pushplus registry ---
     fb_name = rcfg.get("fallback_service", "serverchan")
+
+    # Dedup: skip if already sent for this (trade_date, mode)
+    already = conn.execute(
+        "SELECT COUNT(*) FROM reports WHERE trade_date=? AND mode=? AND delivery_status='sent'",
+        (trade_date, mode),
+    ).fetchone()[0]
+    if already > 0:
+        logger.info("[deliver] already sent for %s/%s, skipping fallback", trade_date, mode)
+        return "sent"
+
     logger.info("[deliver] trying fallback=%s", fb_name)
     fb_entry = _FALLBACK_PUSH.get(fb_name)
     if fb_entry:
