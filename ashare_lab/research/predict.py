@@ -45,7 +45,13 @@ def _send_alert(text: str) -> None:
     if _ALERT_SENT_THIS_RUN:
         return
 
-    from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+    try:
+        from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+    except Exception:
+        # gpu-win receives a selective file sync; a missing bridge module
+        # must never break prediction (alerting is advisory by design).
+        log.warning("alert skipped: bridge module unavailable", exc_info=True)
+        return
 
     if send_bridge_alert("ashare-predict", text):
         _ALERT_SENT_THIS_RUN = True

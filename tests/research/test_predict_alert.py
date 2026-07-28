@@ -119,3 +119,17 @@ class TestPredictAlert:
                 req = mock_urlopen.call_args[0][0]
                 assert req.full_url.endswith("/alert")
                 assert req.headers.get("X-bridge-token") == "test-token" or req.headers.get("X-Bridge-Token") == "test-token"
+
+
+class TestBridgeModuleMissing:
+    """gpu-win syncs a selective file set; bridge.py may be absent there."""
+
+    def test_alert_fail_open_without_bridge_module(self, caplog) -> None:
+        """Import failure of ashare_lab.bridge must not propagate."""
+        import sys
+        from ashare_lab.research.predict import _send_alert
+
+        with mock.patch.dict(sys.modules, {"ashare_lab.bridge": None}):
+            _send_alert("[test] bridge missing")
+
+        assert "bridge module unavailable" in caplog.text
