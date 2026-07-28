@@ -88,6 +88,7 @@ sync_code_to_gpu() {
     # matrix_runner and matrix configs may not exist on fresh deploys.
     cp "$REPO/ashare_lab/research/matrix_runner.py" "$STAGING/ashare_lab/research/" 2>/dev/null || true
     cp "$REPO/ashare_lab/config.py" "$STAGING/ashare_lab/"
+    cp "$REPO/ashare_lab/bridge.py" "$STAGING/ashare_lab/"
     touch "$STAGING/ashare_lab/__init__.py"
     touch "$STAGING/ashare_lab/research/__init__.py"
     cp "$REPO/configs/baseline.yaml" "$STAGING/configs/"
