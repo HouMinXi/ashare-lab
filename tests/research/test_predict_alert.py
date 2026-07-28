@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,7 +42,6 @@ def _make_predict_env(tmp_path: Path, window_id: int = 11,
     # latest.pt -> symlink or copy of target
     latest = models / "latest.pt"
     if use_copy:
-        import shutil
         shutil.copy2(target, latest)
     else:
         latest.symlink_to(target)
@@ -182,3 +182,36 @@ def test_deliberate_mismatch_no_alert_copy(mock_alert, tmp_path, caplog):
 
     mock_alert.assert_not_called()
     assert "not deployed (expected_live_model=w10)" in caplog.text
+
+
+@patch("ashare_lab.research.predict._send_alert")
+def test_copy_layout_differing_content_alerts(mock_alert, tmp_path):
+    """(b-copy-diff) latest.pt is a regular-file copy of a DIFFERENT model.
+
+    Layout: w10.pt (content A), latest.pt = copy of w9.pt (content B),
+    expected_live_model="w10", window_id=11, w11.pt absent.
+    filecmp finds byte-content differs -> alert fires.
+    """
+    models = tmp_path / "models"
+    models.mkdir()
+
+    # w10.pt -- the expected live model (content A)
+    (models / "w10.pt").write_text("content A: real w10 model data")
+
+    # w9.pt -- a different model (content B), used as the source for latest.pt
+    (models / "w9.pt").write_text("content B: older w9 model data")
+
+    # latest.pt is a regular-file copy of w9.pt (content B)
+    shutil.copy2(models / "w9.pt", models / "latest.pt")
+
+    cfg = {"research": {"expected_live_model": "w10"}}
+
+    from ashare_lab.research.predict import _resolve_model_path
+
+    windows = [{"window_id": 11, "test_start": "2025-07-01",
+                "test_end": "2025-12-31", "train_start": "2022-07-01",
+                "train_end": "2025-06-30"}]
+    model_path, win = _resolve_model_path("2025-09-15", None, windows, cfg, models)
+
+    mock_alert.assert_called_once()
+    assert "w11.pt missing" in mock_alert.call_args[0][0]

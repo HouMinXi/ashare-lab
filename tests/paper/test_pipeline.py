@@ -377,6 +377,38 @@ class TestDataStaleSkip:
         assert row is not None
         assert row["status"] == "skipped_stale"
 
+    def test_stale_closes_pipeline_run(
+        self, db_path: Path, base_config: dict
+    ) -> None:
+        """rc==1 must close the pipeline_runs row as 'stale', not leave it 'running'."""
+        update_mod = MagicMock()
+        update_mod.daily_refresh = MagicMock(return_value=1)
+        update_mod._read_calendar_last_date = MagicMock(return_value=None)
+
+        with (
+            patch(f"{_MOD}.load_config", return_value=base_config),
+            patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
+            patch(f"{_MOD}.is_day_settled", return_value=False),
+            patch.dict(
+                sys.modules,
+                {"ashare_lab.data.update": update_mod},
+            ),
+        ):
+            from ashare_lab.paper.pipeline import run_daily
+            today = dt.date.today().isoformat()
+            rc = run_daily(today)
+        assert rc == 1
+
+        conn = get_connection(db_path)
+        row = conn.execute(
+            "SELECT status FROM pipeline_runs WHERE trade_date=? "
+            "ORDER BY id DESC LIMIT 1",
+            (today,),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["status"] == "stale"
+
 
 class TestPipelineOrder:
     """D-11-ext: settle is called BEFORE signal generation."""

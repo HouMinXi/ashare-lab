@@ -2264,8 +2264,11 @@ def run_daily(
             return 2
 
         rc = _step3_data_update(ctx)
-        if rc in (1, 2):
-            return rc
+        if rc == 2:
+            return 2
+        if rc == 1:
+            _close_pipeline_run(ctx, "stale", f"data stale for {ctx.trade_date}, skipping")
+            return 1
 
         try:
             _gate_data_completeness(ctx)
