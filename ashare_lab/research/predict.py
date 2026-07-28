@@ -14,6 +14,8 @@ runtime.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import json
 import logging
 import math
@@ -23,6 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import numpy as np
 
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
