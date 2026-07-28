@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import secrets
 import struct
 import subprocess
@@ -605,9 +606,20 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
         return result
 
 
+def _is_dry_run() -> bool:
+    """Check if dry-run mode is enabled via ASHARE_DRY_RUN environment variable.
+
+    Returns True only for explicit truthy values: "1", "true", "yes" (case-insensitive).
+    Empty string, "0", "false", "no" return False.
+    """
+    val = os.environ.get("ASHARE_DRY_RUN", "").strip().lower()
+    return val in ("1", "true", "yes")
 
 
 def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bool:
+    if _is_dry_run():
+        logger.info("[dry-run] pushplus send skipped: %s", title)
+        return True
     try:
         import requests
         resp = requests.post(
@@ -622,6 +634,9 @@ def send_pushplus(token: str, title: str, content: str, timeout: int = 15) -> bo
 
 
 def send_serverchan(key: str, title: str, content: str, timeout: int = 15) -> bool:
+    if _is_dry_run():
+        logger.info("[dry-run] serverchan send skipped: %s", title)
+        return True
     try:
         import requests
         resp = requests.post(

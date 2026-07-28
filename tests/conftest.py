@@ -8,6 +8,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _ashare_dry_run(monkeypatch):
+    """Prevent real HTTP sends to push services during tests.
+
+    Sets ASHARE_DRY_RUN=1 so send_serverchan/send_pushplus skip actual
+    HTTP calls.  Tests that need to verify the real HTTP path must
+    explicitly ``monkeypatch.delenv("ASHARE_DRY_RUN")``.
+
+    Note: iLink and alert_bridge paths are always mocked in tests via
+    @patch, so they don't need this guard.
+    """
+    monkeypatch.setenv("ASHARE_DRY_RUN", "1")
+
+
+@pytest.fixture(autouse=True)
 def _no_mock_artifacts(request):
     """Fail if a test creates MagicMock-named filesystem artifacts.
 

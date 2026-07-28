@@ -1,6 +1,7 @@
 """Unit tests for report generation and delivery."""
 
 import json
+import logging
 from unittest.mock import patch, AsyncMock
 import pytest
 from ashare_lab.paper.report import (
@@ -214,7 +215,8 @@ async def test_send_text_ilink_headers_payload(mock_post):
     assert body["msg"]["item_list"][0]["text_item"]["text"] == "txt"
 
 @patch("requests.post")
-def test_send_pushplus(mock_post):
+def test_send_pushplus(mock_post, monkeypatch):
+    monkeypatch.delenv("ASHARE_DRY_RUN", raising=False)
     mock_post.return_value.json.return_value = {"code": 200}
     assert send_pushplus("tok", "title", "content") is True
     kwargs = mock_post.call_args[1]
@@ -270,12 +272,57 @@ def test_deliver_report_retry_resumes_from_sent_chunk(mock_sleep, mock_ilink, mo
     assert resume_log == [1], f"retry should resume from chunk 1, got {resume_log}"
 
 @patch("requests.post")
-def test_send_serverchan(mock_post):
+def test_send_serverchan(mock_post, monkeypatch):
+    monkeypatch.delenv("ASHARE_DRY_RUN", raising=False)
     mock_post.return_value.json.return_value = {"code": 0}
     assert send_serverchan("SCTxxx", "title", "content") is True
     args = mock_post.call_args
     assert "sctapi.ftqq.com/SCTxxx.send" in args[0][0]
     assert args[1]["data"]["text"] == "title"
+
+def test_send_serverchan_dry_run(monkeypatch, caplog):
+    """ASHARE_DRY_RUN=1 prevents real HTTP calls and logs skip."""
+    caplog.set_level(logging.INFO, logger="ashare_lab.paper.report")
+    monkeypatch.setenv("ASHARE_DRY_RUN", "1")
+    assert send_serverchan("SCTxxx", "title", "content") is True
+    assert "[dry-run] serverchan send skipped: title" in caplog.text
+
+def test_send_pushplus_dry_run(monkeypatch, caplog):
+    """ASHARE_DRY_RUN=1 prevents real HTTP calls and logs skip."""
+    caplog.set_level(logging.INFO, logger="ashare_lab.paper.report")
+    monkeypatch.setenv("ASHARE_DRY_RUN", "1")
+    assert send_pushplus("tok", "title", "content") is True
+    assert "[dry-run] pushplus send skipped: title" in caplog.text
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "", " "])
+@patch("requests.post")
+def test_send_serverchan_dry_run_off(mock_post, monkeypatch, caplog, val):
+    """Falsy ASHARE_DRY_RUN values do NOT trigger dry-run."""
+    caplog.set_level(logging.INFO, logger="ashare_lab.paper.report")
+    monkeypatch.setenv("ASHARE_DRY_RUN", val)
+    mock_post.return_value.json.return_value = {"code": 0}
+    result = send_serverchan("SCTxxx", "title", "content")
+    assert result is True  # mock returns code=0
+    mock_post.assert_called_once()  # HTTP was actually called
+    assert "dry-run" not in caplog.text  # no dry-run log
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "", " "])
+@patch("requests.post")
+def test_send_pushplus_dry_run_off(mock_post, monkeypatch, caplog, val):
+    """Falsy ASHARE_DRY_RUN values do NOT trigger dry-run for pushplus."""
+    caplog.set_level(logging.INFO, logger="ashare_lab.paper.report")
+    monkeypatch.setenv("ASHARE_DRY_RUN", val)
+    mock_post.return_value.json.return_value = {"code": 200}
+    result = send_pushplus("tok", "title", "content")
+    assert result is True  # mock returns code=200
+    mock_post.assert_called_once()  # HTTP was actually called
+    assert "dry-run" not in caplog.text  # no dry-run log
+
+@pytest.mark.parametrize("val", ["1", "true", "yes", "True", "YES"])
+def test_send_serverchan_dry_run_truthy(monkeypatch, val):
+    """All truthy ASHARE_DRY_RUN values trigger dry-run."""
+    monkeypatch.setenv("ASHARE_DRY_RUN", val)
+    assert send_serverchan("SCTxxx", "title", "content") is True
 
 @patch("ashare_lab.paper.report._get_secret")
 @patch("ashare_lab.paper.report._send_via_ilink", new_callable=AsyncMock)
