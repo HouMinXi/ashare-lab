@@ -481,3 +481,107 @@ class TestTurnoverBugInjection:
         assert len(buy_calls) == 5, (
             f"Cap bypassed: expected 5 buys, got {len(buy_calls)}"
         )
+
+
+# -------------------------------------------------------------------
+# Book B integration test
+# -------------------------------------------------------------------
+
+
+class TestBookBCapIntegration:
+    """Book B turnover cap integration test."""
+
+    def test_book_b_cap_independent(self, tmp_path):
+        """Book B cap binds based on its own NAV, independent of Book A."""
+        from ashare_lab.paper.pipeline import _run_book_b, DailyRunContext
+        from ashare_lab.paper.ledger import init_schema, get_connection, snapshot_positions, record_nav
+        from unittest.mock import MagicMock, patch
+        from ashare_lab.paper.risk import RiskCheckResult
+
+        # Create prod DB with positions (invested_ratio > 0.30, no ramp)
+        prod_db = tmp_path / "paper.db"
+        prod_conn = get_connection(prod_db)
+        init_schema(prod_conn)
+        snapshot_positions(prod_conn, "2025-06-19", {
+            "SH600001": {"qty": 1000, "avg_cost": 10.0, "market_value": 11000.0},
+            "SH600002": {"qty": 2000, "avg_cost": 20.0, "market_value": 42000.0},
+            "SH600003": {"qty": 3000, "avg_cost": 30.0, "market_value": 93000.0},
+            "SH600004": {"qty": 1500, "avg_cost": 40.0, "market_value": 64000.0},
+        })
+        record_nav(prod_conn, "2025-06-19", 90000.0, 210000.0, 300000.0,
+                   None, None, None, None)
+        prod_conn.commit()
+        prod_conn.close()
+
+        config = {
+            "paper": {
+                "db_path": str(prod_db),
+                "topk": 15, "n_drop": 1, "initial_cash": 300_000,
+                "listing_min_days": 0, "liquidity_min_turnover": 0,
+                "turnover_cap": 0.20,
+                "turnover_ramp_invested_ratio": 0.0,
+            },
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"exclude_close_above_cny": 300},
+        }
+        prices = {f"SH60000{i}": {"close": 10.0 + i, "change": 0.01,
+                                   "volume": 1e6, "factor": 1.0,
+                                   "threshold": 0.099}
+                  for i in range(1, 6)}
+        signals = {f"SH60000{i}": 0.95 - i * 0.05 for i in range(1, 6)}
+
+        (tmp_path / "predictions").mkdir(exist_ok=True)
+        (tmp_path / "predictions" / "2025-06-20.parquet").touch()
+
+        ctx = DailyRunContext(
+            trade_date="2025-06-20", force=False, steps=None,
+            pred_path=tmp_path / "predictions" / "2025-06-20.parquet",
+            start_time=0.0, predictions_date_str="2025-06-20",
+        )
+        ctx.conn = prod_conn
+        ctx.config = config
+        ctx.paper_cfg = config["paper"]
+        ctx.db_path = prod_db
+        ctx.prices = prices
+        ctx.current_positions = {}
+        ctx.cash = 300_000.0
+        ctx.total_nav = 300_000.0
+        ctx.risk_result = RiskCheckResult(
+            buying_halted=False, forced_sells={},
+            blocked_industries=set(), blocked_rebuys=set(),
+            topk_override=None, cooldown_entries={},
+            suspension_risk={}, shadow_log=None,
+        )
+        ctx.hedge_state = MagicMock(active=False)
+        ctx.hedge_symbols = set()
+        ctx.market_data = {s: {"close": prices[s]["close"],
+                                "listing_days": 999,
+                                "avg_turnover_20d": 1e9}
+                           for s in prices}
+        ctx.universe_symbols = list(prices.keys())
+        ctx.ipo_listing_syms = set()
+        ctx.st_names = set()
+        ctx.benchmarks = {"csi300": 4000.0, "csi1000": 6000.0}
+
+        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value=signals):
+            _run_book_b(ctx)
+
+        # Query Book B DB for inserted orders
+        book_b_path = tmp_path / "paper_b_none.db"
+        assert book_b_path.exists(), "Book B DB not created"
+        book_conn = get_connection(book_b_path)
+        orders = book_conn.execute(
+            "SELECT symbol, side, target_qty FROM orders WHERE side='buy'"
+        ).fetchall()
+        book_conn.close()
+
+        assert len(orders) == 5, f"Expected 5 buy orders, got {len(orders)}"
+        for row in orders:
+            sym = row["symbol"]
+            qty = row["target_qty"]
+            price = prices[sym]["close"]
+            uncapped_qty = int(19000 / price // 100) * 100
+            assert qty < uncapped_qty, (
+                f"{sym}: Book B capped {qty} should be < uncapped {uncapped_qty}"
+            )
