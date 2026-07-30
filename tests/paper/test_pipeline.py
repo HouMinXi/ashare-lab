@@ -1094,8 +1094,11 @@ class TestWriteAbcArtifactNavB:
             "INSERT INTO nav (trade_date, cash, market_value, total_nav) VALUES (?, ?, ?, ?)",
             ("2025-01-06", 50000.0, 23000.0, 73000.0),
         )
-        # Mark as settled so get_latest_positions works
-        record_run(book_conn, "2025-01-06", "settled")
+        # Production reality: book_b never calls record_run, so "latest
+        # settled" resolves to an earlier date whose positions are empty.
+        # Marking anything earlier settled must NOT let the artifact see
+        # today's positions via get_latest_positions.
+        record_run(book_conn, "2025-01-05", "settled")
         book_conn.commit()
 
         # Context: minimal

@@ -319,6 +319,7 @@ def cmd_paper_report(args: argparse.Namespace) -> int:
         rc = generate_and_send_report(
             trade_date, conn, config,
             dry_run=getattr(args, "dry_run", False),
+            force=getattr(args, "force", False),
         )
         conn.commit()
         return rc
@@ -429,6 +430,7 @@ def main() -> int:
     p_report = paper_sub.add_parser("report", help="generate and send daily report")
     p_report.add_argument("--date", help="trade date YYYY-MM-DD (default: latest settled)")
     p_report.add_argument("--dry-run", action="store_true", help="generate only, skip delivery")
+    p_report.add_argument("--force", action="store_true", help="bypass dedup and re-send")
 
     p_sentiment = paper_sub.add_parser("sentiment", help="run sentiment veto check")
     p_sentiment.add_argument("--date", help="trade date YYYY-MM-DD (default: latest settled)")
