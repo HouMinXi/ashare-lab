@@ -124,6 +124,11 @@ paper:
     lockdown_days: 5        # trading days in LIQUIDATED before reentry
     reentry_dd: 0.10        # dd must be below this to exit LIQUIDATED
   max_stale_trading_days: 3    # reject predictions older than this many trading days
+  # L3: daily turnover budget (cap discretionary buy value as % of equity NAV)
+  turnover_cap: 0.20           # normal cap (20% of equity NAV per day)
+  turnover_ramp_cap: 0.50      # cold-start / re-entry cap (50%)
+  turnover_ramp_days: 5        # ramp duration in trading days
+  turnover_ramp_invested_ratio: 0.30  # ramp active while market_value/equity_nav < this
   hedge:
     enabled: false
     activate_dd: 0.03
