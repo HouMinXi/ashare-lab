@@ -683,10 +683,27 @@ async def _send_via_ilink(chunks: list[str], chat_id: str, token: str,
                 await asyncio.sleep(delay)
 
 
-def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict) -> str:
-    logger.info("[deliver] start for %s (mode=%s, text_len=%d)", trade_date, mode, len(report_text))
+def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict, *, force: bool = False) -> str:
+    logger.info("[deliver] start for %s (mode=%s, text_len=%d, force=%s)", trade_date, mode, len(report_text), force)
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
+
+    # Dedup: skip if already sent for this (trade_date, mode).
+    # Covers both primary and fallback paths. force=True bypasses.
+    if not force:
+        already = conn.execute(
+            "SELECT COUNT(*) FROM reports WHERE trade_date=? AND mode=? AND delivery_status='sent'",
+            (trade_date, mode),
+        ).fetchone()[0]
+        if already > 0:
+            logger.info("[deliver] already sent for %s/%s, skipping", trade_date, mode)
+            conn.execute(
+                "UPDATE reports SET delivery_status='skipped_dedup' "
+                "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+                (trade_date, mode),
+            )
+            conn.commit()
+            return "skipped"
 
     rcfg = config["paper"].get("report", {})
     channel = rcfg.get("delivery_channel", "alert_bridge")
@@ -698,24 +715,27 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     # --- Primary path: alert-bridge (default) or iLink (legacy) ---
     if channel == "alert_bridge":
         if _deliver_via_bridge(chunks, trade_date, conn, mode, report_text):
+            conn.execute(
+                "UPDATE reports SET delivery_status='sent', delivered_via='alert_bridge' "
+                "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+                (trade_date, mode),
+            )
+            conn.commit()
             return "sent"
     elif channel == "ilink":
         if _deliver_via_ilink_legacy(chunks, trade_date, conn, mode, report_text, rcfg):
+            conn.execute(
+                "UPDATE reports SET delivery_status='sent', delivered_via='ilink' "
+                "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+                (trade_date, mode),
+            )
+            conn.commit()
             return "sent"
     else:
         logger.warning("[deliver] unknown delivery_channel '%s', falling through", channel)
 
     # --- Fallback: serverchan / pushplus registry ---
     fb_name = rcfg.get("fallback_service", "serverchan")
-
-    # Dedup: skip if already sent for this (trade_date, mode)
-    already = conn.execute(
-        "SELECT COUNT(*) FROM reports WHERE trade_date=? AND mode=? AND delivery_status='sent'",
-        (trade_date, mode),
-    ).fetchone()[0]
-    if already > 0:
-        logger.info("[deliver] already sent for %s/%s, skipping fallback", trade_date, mode)
-        return "sent"
 
     logger.info("[deliver] trying fallback=%s", fb_name)
     fb_entry = _FALLBACK_PUSH.get(fb_name)
@@ -725,7 +745,11 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
         try:
             fb_token = _get_secret(pass_key)
             if send_fn(fb_token, f"A股日报 {trade_date}", report_text, rcfg.get("fallback_timeout", 15)):
-                insert_report(conn, trade_date, mode, report_text, fb_name, "sent")
+                conn.execute(
+                    "UPDATE reports SET delivery_status='sent', delivered_via=? "
+                    "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+                    (fb_name, trade_date, mode),
+                )
                 conn.commit()
                 logger.info("[deliver] fallback %s succeeded", fb_name)
                 return "sent"
@@ -734,7 +758,11 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     else:
         logger.warning("unknown fallback_service '%s', skipping fallback", fb_name)
 
-    insert_report(conn, trade_date, mode, report_text, None, "failed")
+    conn.execute(
+        "UPDATE reports SET delivery_status='failed' "
+        "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+        (trade_date, mode),
+    )
     conn.commit()
     return "failed"
 
@@ -751,12 +779,6 @@ def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, rep
             return False
         logger.info("[deliver] bridge chunk %d/%d sent", i + 1, len(chunks))
 
-    try:
-        insert_report(conn, trade_date, mode, report_text, "alert_bridge", "sent")
-        conn.commit()
-    except Exception as exc:
-        logger.warning("[deliver] bridge DB write failed: %s", exc)
-        return False
     logger.info("[deliver] all %d chunks sent via alert-bridge", len(chunks))
     return True
 
@@ -788,8 +810,6 @@ def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: st
                     pool.submit(asyncio.run, coro).result()
             except RuntimeError:
                 asyncio.run(coro)
-            insert_report(conn, trade_date, mode, report_text, "ilink", "sent")
-            conn.commit()
             logger.info("[deliver] all %d chunks sent via iLink (attempt %d)", len(chunks), attempt + 1)
             return True
         except Exception as e:
@@ -801,7 +821,7 @@ def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: st
     return False
 
 
-def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False) -> int:
+def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False, *, force: bool = False) -> int:
     nav_check = conn.execute("SELECT 1 FROM nav WHERE trade_date=?", (trade_date,)).fetchone()
     if not nav_check:
         logger.warning("No data for %s", trade_date)
@@ -838,5 +858,5 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
         print(report_text)
         return 0
 
-    status = deliver_report(conn, trade_date, mode, report_text, config)
-    return 0 if status == "sent" else 1
+    status = deliver_report(conn, trade_date, mode, report_text, config, force=force)
+    return 0 if status in ("sent", "skipped") else 1

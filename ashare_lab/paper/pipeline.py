@@ -2056,13 +2056,15 @@ def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
 
 def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float) -> None:
     """Write daily A/B/C comparison artifact to experiments/control_books/."""
-    from ashare_lab.paper.ledger import get_latest_positions, get_latest_cash  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash  # noqa: PLC0415
 
     # Book A NAV (from production)
     nav_a = ctx.total_nav
 
-    # Book B NAV
-    book_positions = get_latest_positions(book_conn)
+    # Book B NAV -- use get_positions_for_date (not get_latest_positions)
+    # because book_b never calls record_run, so "latest settled" resolves
+    # to yesterday.  We need today's post-settle positions.
+    book_positions = get_positions_for_date(book_conn, ctx.trade_date)
     book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
     nav_b = sum(pos["market_value"] for pos in book_positions.values()) + book_cash
 

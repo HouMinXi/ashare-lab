@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -1059,3 +1060,107 @@ class TestSettleIdentityGate:
         rc, row = self._run_with_drift(db_path, -1.00)
         assert rc == 2
         assert row["status"] == "ledger_error"
+
+
+# -------------------------------------------------------------------
+# F4: Book B artifact nav_b (SMFIX)
+# -------------------------------------------------------------------
+
+class TestWriteAbcArtifactNavB:
+    """Verify nav_b = total_nav (cash + market_value), not just cash."""
+
+    def test_nav_b_equals_total_nav(self, tmp_path: Path, base_config: dict, monkeypatch) -> None:
+        """nav_b must reflect post-settle positions, not just cash."""
+        from ashare_lab.paper.ledger import (
+            get_connection, init_schema, snapshot_positions,
+            record_nav, record_run,
+        )
+        from ashare_lab.paper.pipeline import _write_abc_artifact, DailyRunContext
+
+        monkeypatch.chdir(tmp_path)
+
+        # Book B DB: set up positions for today
+        book_b_path = tmp_path / "paper_b_none.db"
+        book_conn = get_connection(book_b_path)
+        init_schema(book_conn)
+
+        # Write today's positions with market_value
+        snapshot_positions(book_conn, "2025-01-06", {
+            "SZ000001": {"qty": 1000, "avg_cost": 10.0, "market_value": 12000.0},
+            "SZ000002": {"qty": 500, "avg_cost": 20.0, "market_value": 11000.0},
+        })
+        # Cash = 50000
+        book_conn.execute(
+            "INSERT INTO nav (trade_date, cash, market_value, total_nav) VALUES (?, ?, ?, ?)",
+            ("2025-01-06", 50000.0, 23000.0, 73000.0),
+        )
+        # Mark as settled so get_latest_positions works
+        record_run(book_conn, "2025-01-06", "settled")
+        book_conn.commit()
+
+        # Context: minimal
+        ctx = DailyRunContext(
+            trade_date="2025-01-06",
+            force=False,
+            steps=None,
+            pred_path=None,
+            start_time=0.0,
+            predictions_date_str="2025-01-06",
+        )
+        ctx.total_nav = 100000.0  # Book A NAV
+        ctx.paper_cfg = base_config["paper"]
+        ctx.benchmarks = {"csi1000": 5000.0}
+
+        # Write artifact
+        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        book_conn.close()
+
+        # Read artifact
+        artifact_path = tmp_path / "experiments" / "control_books" / "2025-01-06_none.json"
+        assert artifact_path.exists(), "artifact file not created"
+        artifact = json.loads(artifact_path.read_text())
+
+        # nav_b = cash (50000) + market_value (23000) = 73000
+        assert artifact["nav_b"] == 73000.0, (
+            f"nav_b should be total_nav (cash+market_value), got {artifact['nav_b']}"
+        )
+        assert artifact["nav_a"] == 100000.0
+
+    def test_nav_b_with_empty_positions(self, tmp_path: Path, base_config: dict, monkeypatch) -> None:
+        """Day 0 (no positions): nav_b = cash only (legitimate)."""
+        from ashare_lab.paper.ledger import (
+            get_connection, init_schema, record_run,
+        )
+        from ashare_lab.paper.pipeline import _write_abc_artifact, DailyRunContext
+
+        monkeypatch.chdir(tmp_path)
+
+        book_b_path = tmp_path / "paper_b_none.db"
+        book_conn = get_connection(book_b_path)
+        init_schema(book_conn)
+        book_conn.execute(
+            "INSERT INTO nav (trade_date, cash, market_value, total_nav) VALUES (?, ?, ?, ?)",
+            ("2025-01-06", 300000.0, 0.0, 300000.0),
+        )
+        record_run(book_conn, "2025-01-06", "settled")
+        book_conn.commit()
+
+        ctx = DailyRunContext(
+            trade_date="2025-01-06",
+            force=False,
+            steps=None,
+            pred_path=None,
+            start_time=0.0,
+            predictions_date_str="2025-01-06",
+        )
+        ctx.total_nav = 300000.0
+        ctx.paper_cfg = base_config["paper"]
+        ctx.benchmarks = {"csi1000": 5000.0}
+
+        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        book_conn.close()
+
+        artifact_path = tmp_path / "experiments" / "control_books" / "2025-01-06_none.json"
+        artifact = json.loads(artifact_path.read_text())
+        # No positions -> nav_b = cash = 300000
+        assert artifact["nav_b"] == 300000.0

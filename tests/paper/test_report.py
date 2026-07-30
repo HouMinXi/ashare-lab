@@ -491,3 +491,84 @@ def test_bridge_send_necessary(mock_bridge, db_conn):
         assert result == "sent"
         r2 = db_conn.execute("SELECT * FROM reports WHERE trade_date='2025-01-07' ORDER BY created_at DESC LIMIT 1").fetchone()
         assert r2["delivered_via"] == "serverchan"
+
+
+# -------------------------------------------------------------------
+# Dedup tests (SMFIX F1-F3)
+# -------------------------------------------------------------------
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_dedup_skips_and_closes_pending(mock_bridge, db_conn):
+    """Second invocation returns 'skipped', no dangling pending row (F1+F3)."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    # First call: succeeds
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    assert mock_bridge.call_count == 1
+    # Second call: dedup hit
+    result = deliver_report(db_conn, "2025-01-06", "simple", "text", cfg)
+    assert result == "skipped"
+    # No dangling pending rows
+    pending = db_conn.execute(
+        "SELECT COUNT(*) FROM reports WHERE trade_date='2025-01-06' AND delivery_status='pending'"
+    ).fetchone()[0]
+    assert pending == 0
+    # The dedup row is marked skipped_dedup
+    skipped = db_conn.execute(
+        "SELECT COUNT(*) FROM reports WHERE trade_date='2025-01-06' AND delivery_status='skipped_dedup'"
+    ).fetchone()[0]
+    assert skipped == 1
+    # Bridge was not called again
+    assert mock_bridge.call_count == 1
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_dedup_covers_primary_path(mock_bridge, db_conn):
+    """Dedup blocks primary path on re-invocation (F2)."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    # First call succeeds via primary
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    assert mock_bridge.call_count == 1
+    # Second call: dedup fires BEFORE primary path
+    result = deliver_report(db_conn, "2025-01-06", "simple", "text", cfg)
+    assert result == "skipped"
+    # Bridge was NOT called a second time
+    assert mock_bridge.call_count == 1
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_force_bypasses_dedup(mock_bridge, db_conn):
+    """force=True bypasses dedup, sends again (F2)."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
+    assert mock_bridge.call_count == 1
+    # force=True: bypasses dedup
+    result = deliver_report(db_conn, "2025-01-06", "simple", "text", cfg, force=True)
+    assert result == "sent"
+    assert mock_bridge.call_count == 2
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_deliver_report_skipped_returns_distinct_value(mock_bridge, db_conn):
+    """Dedup returns 'skipped', not 'sent' (F3)."""
+    cfg = {"paper": {"report": {"delivery_channel": "alert_bridge"}}}
+    deliver_report(db_conn, "2025-01-06", "simple", "text", cfg)
+    result = deliver_report(db_conn, "2025-01-06", "simple", "text", cfg)
+    assert result == "skipped"
+    assert result != "sent"
+
+
+@patch("ashare_lab.bridge.send_bridge_alert", return_value=True)
+def test_generate_and_send_report_skipped_returns_zero(mock_bridge, db_conn, paper_config):
+    """generate_and_send_report treats 'skipped' as success (rc=0)."""
+    from ashare_lab.paper.ledger import record_nav, snapshot_positions, record_run
+    record_nav(db_conn, "2025-01-06", 300_000.0, 0.0, 300_000.0, None, None, 3000.0, 5000.0)
+    snapshot_positions(db_conn, "2025-01-06", {})
+    record_run(db_conn, "2025-01-06", "settled")
+    db_conn.commit()
+    cfg = {"paper": {**paper_config, "report": {"delivery_channel": "alert_bridge"}}}
+    # First call: sends
+    rc1 = generate_and_send_report("2025-01-06", db_conn, cfg)
+    assert rc1 == 0
+    # Second call: dedup -> skipped -> rc=0
+    rc2 = generate_and_send_report("2025-01-06", db_conn, cfg)
+    assert rc2 == 0
