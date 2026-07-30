@@ -577,11 +577,20 @@ class TestBookBCapIntegration:
         book_conn.close()
 
         assert len(orders) == 5, f"Expected 5 buy orders, got {len(orders)}"
+        # Fixture reality: the bootstrapped Book B DB has no record_run,
+        # so get_latest_positions resolves empty and book NAV = cash only
+        # (90,000). Uncapped target_value = 90,000*0.95/15 = 5,700 ->
+        # round_lots at prices 11..15 gives (500,400,400,400,300).
+        # The cap binds at 0.20*90,000 = 18,000 < 5*5,700 = 28,500,
+        # factor = 18,000/28,500 = 0.6316, scaled value 3,600 ->
+        # exact capped quantities (300,300,200,200,200). Asserting the
+        # exact values proves the cap call fired: without it the orders
+        # are the uncapped (500,400,400,400,300).
+        expected = {"SH600001": 300, "SH600002": 300, "SH600003": 200,
+                    "SH600004": 200, "SH600005": 200}
         for row in orders:
             sym = row["symbol"]
-            qty = row["target_qty"]
-            price = prices[sym]["close"]
-            uncapped_qty = int(19000 / price // 100) * 100
-            assert qty < uncapped_qty, (
-                f"{sym}: Book B capped {qty} should be < uncapped {uncapped_qty}"
+            assert row["target_qty"] == expected[sym], (
+                f"{sym}: expected capped qty {expected[sym]}, "
+                f"got {row['target_qty']}"
             )
