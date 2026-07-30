@@ -6,8 +6,8 @@ T3: forced sells / IPO / carried excluded from numerator and scaling
 T4: ramp: day k caps follow 50,44,38,32,26,20 then normal cap
 T5: ramp persists across a simulated restart (reload from ledger)
 T6: Book B binds independently of Book A (different NAV)
-T7: integration through _step10 path (fixture ctx) with cap on/off
-T8: bug-injection at the call site
+T7: integration through _step10 path (direct ctx, cap on/off)
+T8: bug-injection at the call site (bypass cap -> all orders inserted)
 """
 
 from __future__ import annotations
@@ -281,8 +281,203 @@ def test_ramp_activation_empty_positions():
 
 
 # -------------------------------------------------------------------
-# T8: bug-injection (tested via integration in test_pipeline.py)
+# T7: Integration through _step10 path (direct ctx construction)
 # -------------------------------------------------------------------
-# The call-site injection test is in test_pipeline.py because it needs
-# the full pipeline context (DailyRunContext, etc.). See
-# TestTurnoverCapIntegration.test_inject_delete_cap_call.
+
+
+def _make_ctx(conn, signals, prices, config, *, positions=None, tmp_path=None):
+    """Build a minimal DailyRunContext for _step10 testing."""
+    from ashare_lab.paper.pipeline import DailyRunContext
+    from unittest.mock import MagicMock
+    from ashare_lab.paper.risk import RiskCheckResult
+    from pathlib import Path
+
+    # Create dummy prediction file if tmp_path provided
+    pred_path = None
+    if tmp_path:
+        pred_dir = tmp_path / "predictions"
+        pred_dir.mkdir(exist_ok=True)
+        pred_path = pred_dir / "2025-06-20.parquet"
+        pred_path.touch()
+
+    ctx = DailyRunContext(
+        trade_date="2025-06-20", force=False, steps=None,
+        pred_path=pred_path, start_time=0.0, predictions_date_str="2025-06-20",
+    )
+    ctx.conn = conn
+    ctx.config = config
+    ctx.paper_cfg = config["paper"]
+    ctx.prices = prices
+    ctx.current_positions = positions or {}
+    ctx.cash = 300_000.0
+    ctx.total_nav = 300_000.0
+    ctx.signals_raw = signals
+    ctx.risk_result = RiskCheckResult(
+        buying_halted=False, forced_sells={},
+        blocked_industries=set(), blocked_rebuys=set(),
+        topk_override=None, cooldown_entries={},
+        suspension_risk={}, shadow_log=None,
+    )
+    ctx.hedge_state = MagicMock(active=False)
+    ctx.hedge_symbols = set()
+    ctx.ipo_listing_syms = set()
+    ctx.st_names = set()
+
+    # Build market_data from prices for filter_candidates
+    ctx.market_data = {}
+    for sym, pdata in prices.items():
+        ctx.market_data[sym] = {
+            "close": pdata["close"],
+            "listing_days": 999,  # pass listing_min_days
+            "avg_turnover_20d": 1e9,  # pass liquidity filter
+        }
+
+    return ctx
+
+
+class TestTurnoverCapIntegration:
+    """T7: Integration through the real _step10 path."""
+
+    def test_cap_on_binding_day(self, turnover_conn, tmp_path):
+        """Cap ON: fewer buy orders than uncapped."""
+        from ashare_lab.paper.pipeline import _step10_signal_generation
+        from ashare_lab.paper.ledger import insert_order, init_schema
+        from unittest.mock import patch as P
+
+        init_schema(turnover_conn)
+        config = {
+            "paper": {
+                "topk": 15, "n_drop": 1, "initial_cash": 300_000,
+                "listing_min_days": 0, "liquidity_min_turnover": 0,
+                "turnover_cap": 0.20, "turnover_ramp_cap": 0.50,
+                "turnover_ramp_days": 5, "turnover_ramp_invested_ratio": 0.0,
+            },
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"exclude_close_above_cny": 300},
+        }
+        prices = {f"SH60000{i}": {"close": 10.0 + i, "change": 0.01,
+                                   "volume": 1e6, "factor": 1.0,
+                                   "threshold": 0.099}
+                  for i in range(1, 6)}
+        signals = {f"SH60000{i}": 0.95 - i * 0.05 for i in range(1, 6)}
+
+        ctx = _make_ctx(turnover_conn, signals, prices, config, tmp_path=tmp_path)
+        # Inject: mock insert_order to capture calls
+        insert_calls = []
+        def mock_insert(conn, td, sym, side, qty, *a, **kw):
+            insert_calls.append((sym, side, qty))
+        with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
+            _step10_signal_generation(ctx)
+
+        buy_calls = [c for c in insert_calls if c[1] == "buy"]
+        # Cap binds: quantities should be smaller than uncapped
+        for sym, side, qty in buy_calls:
+            price = prices[sym]["close"]
+            uncapped_qty = int(19000 / price // 100) * 100
+            assert qty < uncapped_qty, f"{sym}: capped {qty} should be < uncapped {uncapped_qty}"
+
+    def test_cap_off_full_orders(self, turnover_conn, tmp_path):
+        """Cap OFF: all buy orders inserted."""
+        from ashare_lab.paper.pipeline import _step10_signal_generation
+        from ashare_lab.paper.ledger import init_schema
+        from unittest.mock import patch as P
+
+        init_schema(turnover_conn)
+        config = {
+            "paper": {
+                "topk": 15, "n_drop": 1, "initial_cash": 300_000,
+                "listing_min_days": 0, "liquidity_min_turnover": 0,
+                # No turnover_cap key
+            },
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"exclude_close_above_cny": 300},
+        }
+        prices = {f"SH60000{i}": {"close": 10.0 + i, "change": 0.01,
+                                   "volume": 1e6, "factor": 1.0,
+                                   "threshold": 0.099}
+                  for i in range(1, 6)}
+        signals = {f"SH60000{i}": 0.95 - i * 0.05 for i in range(1, 6)}
+
+        ctx = _make_ctx(turnover_conn, signals, prices, config, tmp_path=tmp_path)
+        insert_calls = []
+        def mock_insert(conn, td, sym, side, qty, *a, **kw):
+            insert_calls.append((sym, side, qty))
+        with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
+            _step10_signal_generation(ctx)
+
+        buy_calls = [c for c in insert_calls if c[1] == "buy"]
+        assert len(buy_calls) == 5
+
+    def test_ramp_k_persists(self, turnover_conn):
+        """Ramp k advances and persists across simulated restarts."""
+        from ashare_lab.paper.turnover import (
+            load_turnover_ramp, save_turnover_ramp,
+        )
+        save_turnover_ramp(turnover_conn, "2025-06-20", 1)
+        turnover_conn.commit()
+
+        state = load_turnover_ramp(turnover_conn)
+        assert state["k"] == 1
+        assert state["entry_date"] == "2025-06-20"
+
+        save_turnover_ramp(turnover_conn, "2025-06-20", state["k"] + 1)
+        turnover_conn.commit()
+
+        state2 = load_turnover_ramp(turnover_conn)
+        assert state2["k"] == 2
+
+
+# -------------------------------------------------------------------
+# T8: bug-injection at call sites
+# -------------------------------------------------------------------
+
+
+class TestTurnoverBugInjection:
+    """T8: Delete cap call -> integration test RED; restore -> GREEN."""
+
+    def test_inject_step10_cap_bypass(self, turnover_conn, tmp_path):
+        """Cap call bypassed -> all buy orders inserted."""
+        from ashare_lab.paper.pipeline import _step10_signal_generation
+        from ashare_lab.paper import turnover as turnover_mod
+        from ashare_lab.paper.ledger import init_schema
+        from unittest.mock import patch as P
+
+        init_schema(turnover_conn)
+        config = {
+            "paper": {
+                "topk": 15, "n_drop": 1, "initial_cash": 300_000,
+                "listing_min_days": 0, "liquidity_min_turnover": 0,
+                "turnover_cap": 0.20, "turnover_ramp_cap": 0.50,
+                "turnover_ramp_days": 5, "turnover_ramp_invested_ratio": 0.0,
+            },
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"exclude_close_above_cny": 300},
+        }
+        prices = {f"SH60000{i}": {"close": 10.0 + i, "change": 0.01,
+                                   "volume": 1e6, "factor": 1.0,
+                                   "threshold": 0.099}
+                  for i in range(1, 6)}
+        signals = {f"SH60000{i}": 0.95 - i * 0.05 for i in range(1, 6)}
+
+        ctx = _make_ctx(turnover_conn, signals, prices, config, tmp_path=tmp_path)
+
+        # Inject: bypass cap_rotation_buys
+        def noop_cap(buy_syms, target_value, prices, equity_nav, cap, ramp_state):
+            return buy_syms, target_value, cap, ramp_state
+
+        insert_calls = []
+        def mock_insert(conn, td, sym, side, qty, *a, **kw):
+            insert_calls.append((sym, side, qty))
+
+        with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.pipeline.generate_signals", return_value=signals), \
+             P.object(turnover_mod, "cap_rotation_buys", side_effect=noop_cap):
+            _step10_signal_generation(ctx)
+
+        buy_calls = [c for c in insert_calls if c[1] == "buy"]
+        # With cap bypassed: all 5 orders inserted
+        assert len(buy_calls) == 5, (
+            f"Cap bypassed: expected 5 buys, got {len(buy_calls)}"
+        )

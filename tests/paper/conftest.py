@@ -18,6 +18,12 @@ from ashare_lab.paper.ledger import get_connection, init_schema
 # -- Database fixture (real temp file, not :memory:) -----------------------
 
 @pytest.fixture()
+def db_path(tmp_path: Path) -> Path:
+    """Return a temp DB path (no connection opened)."""
+    return tmp_path / "test.db"
+
+
+@pytest.fixture()
 def db_conn(tmp_path: Path) -> sqlite3.Connection:
     """Create a WAL-mode SQLite DB in a temp directory."""
     db_path = tmp_path / "test.db"
@@ -28,6 +34,43 @@ def db_conn(tmp_path: Path) -> sqlite3.Connection:
 
 
 # -- Config fixtures -------------------------------------------------------
+
+@pytest.fixture()
+def base_config(db_path: Path) -> dict:
+    """Full config dict matching baseline.yaml structure."""
+    return {
+        "paper": {
+            "db_path": str(db_path),
+            "carry_days": 3,
+            "volume_participation_pct": 0.05,
+            "topk": 15,
+            "n_drop": 1,
+            "initial_cash": 300_000,
+            "backup_retention_days": 7,
+            "slippage": 0.001,
+            "listing_min_days": 60,
+            "liquidity_min_turnover": 50_000_000,
+            "predictions_dir": "predictions",
+            "min_signal_coverage": 100,
+            "risk": {
+                "drawdown_hard": 0.15,
+                "daily_loss": 0.03,
+                "concentration": 0.15,
+                "market_regime_decline": 0.08,
+                "market_regime_days": 10,
+                "trailing_stop": 0.20,
+                "trailing_cooldown_days": 10,
+                "industry_cap": 0.30,
+                "soft_drawdown": 0.10,
+                "soft_drawdown_recovery": 0.95,
+                "default_topk": 15,
+                "reduced_topk": 7,
+            },
+        },
+        "cost_model": {"risk_degree": 0.95},
+        "universe": {"exclude_close_above_cny": 300},
+    }
+
 
 @pytest.fixture()
 def paper_config() -> dict:
