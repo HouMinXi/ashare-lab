@@ -171,14 +171,14 @@ paper:
     #   Azure OpenAI:  https://{resource}.openai.azure.com/openai/v1
     #   Bedrock:       https://bedrock-runtime.{region}.amazonaws.com/openai/v1
     llm_base_url: "http://localhost:20129/v1"
-    llm_model: "free-route"
+    llm_model: "onmi-gemini3.6"
     llm_api_key_pass: "api/omniroute"
     llm_timeout: 300
     llm_extra_body: {"stream": false}
   report:
     # LLM config -- see sentiment section above for supported providers.
     llm_base_url: "http://localhost:20129/v1"
-    llm_model: "default-route"
+    llm_model: "onmi-gemini3.6"
     llm_api_key_pass: "api/omniroute"
     llm_timeout: 300
     llm_extra_body: {"stream": false}
