@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT, load_config
+from ashare_lab.paper.signal_quality import signal_quality_ic_step, signal_quality_psi_step
 from ashare_lab.data.calendar import (
     latest_trading_day,
     next_trading_day,
@@ -2376,6 +2377,8 @@ def run_daily(
         _step13_report(ctx)
         _step14_record_pipeline_run(ctx)
         _step15_graduation(ctx)
+        signal_quality_psi_step(ctx)
+        signal_quality_ic_step(ctx)
 
         logger.info("Pipeline completed for %s", trade_date)
         return 0
