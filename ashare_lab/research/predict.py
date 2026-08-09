@@ -22,9 +22,8 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -421,7 +420,8 @@ def predict_for_date(
     from ashare_lab.research.model_meta import read_model_meta  # noqa: PLC0415
 
     model_meta, meta_reason = read_model_meta(model_path)
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    # fixed +08:00 offset, no tzdata dependency (works on hosts without IANA data)
+    today = datetime.now(timezone(timedelta(hours=8))).date()
     if model_meta is not None:
         model_age_days = (today - date.fromisoformat(model_meta["train_date"])).days
         age_source = "meta.json"
