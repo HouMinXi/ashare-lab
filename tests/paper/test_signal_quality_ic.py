@@ -5,6 +5,7 @@ Contract items 1-11 + 9b backfill guard.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -138,20 +139,30 @@ def test_ic_step_alert(tmp_path):
     t5_date = "2026-07-30"
     trade_date = "2026-08-06"
     instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
+    scores = list(range(100))
+    pd.DataFrame({"instrument": instruments, "score": scores}).to_parquet(tmp_path / f"{t5_date}.parquet")
     for i in range(20):
         date = f"2026-07-{i+1:02d}"
         (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
+    # Non-constant returns correlated with scores -> real IC
+    rng = np.random.default_rng(42)
+    returns = pd.Series(
+        [s / 100.0 + rng.normal(0, 0.1) for s in scores],
+        index=instruments,
+    )
     ctx = MagicMock()
     ctx.steps = None
     ctx.trade_date = trade_date
     ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
     with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=returns), \
          patch("ashare_lab.paper.signal_quality.send_bridge_alert", return_value=True) as mock_alert:
         signal_quality_ic_step(ctx)
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_t5" in sidecar
+    assert sidecar["lagged_ic_t5"] is not None  # Real IC computed
+    assert sidecar["lagged_ic_t5_n"] == 100
     mock_alert.assert_called_once()
 
 
@@ -291,6 +302,8 @@ def test_ic_step_alert_send_failure(tmp_path):
     mock_alert.assert_called_once()
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_t5" in sidecar  # IC still recorded despite alert failure
+    assert sidecar["lagged_ic_t5"] is None  # constant returns -> no rank IC
+    assert sidecar["lagged_ic_t5_n"] == 100
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +420,8 @@ def test_ic_step_insufficient_rolling_window(tmp_path):
     mock_alert.assert_not_called()
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_t5" in sidecar  # IC recorded even with insufficient window
-
-
+    assert sidecar["lagged_ic_t5"] is None  # constant returns -> no rank IC
+    assert sidecar["lagged_ic_t5_n"] == 100
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +489,148 @@ def test_ic_step_missing_instrument_column(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 23. No prediction file -> skip IC monitor
+# 24. R23 test 2b: low instrument coverage logs WARNING via real path
+# ---------------------------------------------------------------------------
+def test_ic_step_low_coverage_warning(caplog, tmp_path):
+    """Coverage < 95% must emit 'low instrument coverage' WARNING.
+
+    PM injection: delete the coverage check in signal_quality_ic_step -
+    this test must FAIL because the WARNING is no longer logged.
+    """
+    t5_date = "2026-07-30"
+    trade_date = "2026-08-06"
+    instruments = [f"SH{i:06d}" for i in range(100)]
+    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(
+        tmp_path / f"{t5_date}.parquet"
+    )
+    for i in range(20):
+        date = f"2026-07-{i+1:02d}"
+        (tmp_path / f"{date}.meta.json").write_text(
+            json.dumps({"lagged_ic_t5": -0.05})
+        )
+    # Only 50 of 100 t-5 instruments have forward returns -> 50% coverage.
+    covered = instruments[:50]
+    forward_returns = pd.Series(list(range(50)), index=covered)
+    ctx = MagicMock()
+    ctx.steps = None
+    ctx.trade_date = trade_date
+    ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
+    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=forward_returns), \
+         patch("ashare_lab.paper.signal_quality.send_bridge_alert"), \
+         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False), \
+         caplog.at_level(logging.WARNING, logger="ashare_lab.paper.signal_quality"):
+        signal_quality_ic_step(ctx)
+    assert any("low instrument coverage" in r.message for r in caplog.records)
+    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
+    assert sidecar["lagged_ic_t5_n"] == 50
+
+
+def test_ic_step_high_coverage_no_warning(caplog, tmp_path):
+    """Coverage >= 95% must NOT emit 'low instrument coverage' WARNING."""
+    t5_date = "2026-07-30"
+    trade_date = "2026-08-06"
+    instruments = [f"SH{i:06d}" for i in range(100)]
+    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(
+        tmp_path / f"{t5_date}.parquet"
+    )
+    for i in range(20):
+        date = f"2026-07-{i+1:02d}"
+        (tmp_path / f"{date}.meta.json").write_text(
+            json.dumps({"lagged_ic_t5": -0.05})
+        )
+    # 96 of 100 t-5 instruments have forward returns -> 96% coverage.
+    covered = instruments[:96]
+    forward_returns = pd.Series(list(range(96)), index=covered)
+    ctx = MagicMock()
+    ctx.steps = None
+    ctx.trade_date = trade_date
+    ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
+    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=forward_returns), \
+         patch("ashare_lab.paper.signal_quality.send_bridge_alert"), \
+         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False), \
+         caplog.at_level(logging.WARNING, logger="ashare_lab.paper.signal_quality"):
+        signal_quality_ic_step(ctx)
+    assert not any("low instrument coverage" in r.message for r in caplog.records)
+    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
+    assert sidecar["lagged_ic_t5_n"] == 96
+
+
+def test_ic_step_exact_coverage_boundary(caplog, tmp_path):
+    """Coverage exactly 95% must NOT emit 'low instrument coverage' WARNING."""
+    t5_date = "2026-07-30"
+    trade_date = "2026-08-06"
+    instruments = [f"SH{i:06d}" for i in range(100)]
+    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(
+        tmp_path / f"{t5_date}.parquet"
+    )
+    for i in range(20):
+        date = f"2026-07-{i+1:02d}"
+        (tmp_path / f"{date}.meta.json").write_text(
+            json.dumps({"lagged_ic_t5": -0.05})
+        )
+    # Exactly 95 of 100 t-5 instruments have forward returns -> 95.0% coverage.
+    covered = instruments[:95]
+    forward_returns = pd.Series(list(range(95)), index=covered)
+    ctx = MagicMock()
+    ctx.steps = None
+    ctx.trade_date = trade_date
+    ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
+    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=forward_returns), \
+         patch("ashare_lab.paper.signal_quality.send_bridge_alert"), \
+         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False), \
+         caplog.at_level(logging.WARNING, logger="ashare_lab.paper.signal_quality"):
+        signal_quality_ic_step(ctx)
+    assert not any("low instrument coverage" in r.message for r in caplog.records)
+    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
+    assert sidecar["lagged_ic_t5_n"] == 95
+
+
+# ---------------------------------------------------------------------------
+# 26. Non-constant forward returns exercise real Spearman path through step
+# ---------------------------------------------------------------------------
+def test_ic_step_non_constant_forward_returns(tmp_path):
+    """Mock compute_forward_returns with non-constant returns and verify
+    the IC step records a finite Spearman correlation in [-1, 1]."""
+    t5_date = "2026-07-30"
+    trade_date = "2026-08-06"
+    rng = np.random.default_rng(42)
+    n = 100
+    instruments = [f"SH{i:06d}" for i in range(n)]
+    scores = np.arange(n, dtype=float)
+    returns = scores * 0.6 + rng.normal(0, 5.0, n)
+    pd.DataFrame({"instrument": instruments, "score": scores}).to_parquet(
+        tmp_path / f"{t5_date}.parquet"
+    )
+    for i in range(20):
+        date = f"2026-07-{i+1:02d}"
+        (tmp_path / f"{date}.meta.json").write_text(
+            json.dumps({"lagged_ic_t5": 0.05})
+        )
+    forward_returns = pd.Series(returns, index=instruments)
+    ctx = MagicMock()
+    ctx.steps = None
+    ctx.trade_date = trade_date
+    ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
+    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=forward_returns), \
+         patch("ashare_lab.paper.signal_quality.send_bridge_alert"):
+        signal_quality_ic_step(ctx)
+    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
+    ic = sidecar["lagged_ic_t5"]
+    assert ic is not None
+    assert -1.0 <= ic <= 1.0
+    assert sidecar["lagged_ic_t5_n"] == n
+
+
+# ---------------------------------------------------------------------------
+# 27. No prediction file -> skip IC monitor
 # ---------------------------------------------------------------------------
 def test_ic_step_no_prediction(tmp_path):
     """Verify IC monitor skips when ctx.pred_path is None."""
@@ -489,3 +643,40 @@ def test_ic_step_no_prediction(tmp_path):
         signal_quality_ic_step(ctx)
     # No sidecar should be written
     assert not (tmp_path / "2026-08-06.meta.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 27. Non-constant returns -> real IC computation (not mocked lagged_ic_for_date)
+# ---------------------------------------------------------------------------
+def test_ic_step_real_ic_computation(tmp_path):
+    """Exercise actual IC computation path with non-constant returns."""
+    t5_date = "2026-07-30"
+    trade_date = "2026-08-06"
+    instruments = [f"SH{i:06d}" for i in range(100)]
+    # Scores with variance
+    scores = list(range(100))
+    pd.DataFrame({"instrument": instruments, "score": scores}).to_parquet(tmp_path / f"{t5_date}.parquet")
+    for i in range(20):
+        date = f"2026-07-{i+1:02d}"
+        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
+    # Non-constant forward returns correlated with scores
+    rng = np.random.default_rng(42)
+    returns = pd.Series(
+        [s / 100.0 + rng.normal(0, 0.1) for s in scores],
+        index=instruments,
+    )
+    ctx = MagicMock()
+    ctx.steps = None
+    ctx.trade_date = trade_date
+    ctx.predictions_date_str = trade_date
+    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
+    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
+         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=returns), \
+         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False):
+        signal_quality_ic_step(ctx)
+    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
+    assert "lagged_ic_t5" in sidecar
+    assert sidecar["lagged_ic_t5"] is not None
+    assert isinstance(sidecar["lagged_ic_t5"], float)
+    assert -1.0 <= sidecar["lagged_ic_t5"] <= 1.0  # Valid correlation range
+    assert sidecar["lagged_ic_t5_n"] == 100

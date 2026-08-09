@@ -390,60 +390,7 @@ def test_compute_psi_sparse_current():
 
 
 # ---------------------------------------------------------------------------
-# 21. R23 test 2b: low instrument coverage WARNING (IC step)
-# ---------------------------------------------------------------------------
-def test_ic_step_low_coverage_warning(caplog, tmp_path):
-    """Verify WARNING when instrument coverage < 95%."""
-    import logging
-    from ashare_lab.paper.signal_quality import signal_quality_ic_step
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    # Mock lagged_ic_for_date to return only 50 aligned instruments (50% < 95%)
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.lagged_ic_for_date", return_value=(-0.05, 50)), \
-         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False), \
-         caplog.at_level(logging.WARNING, logger="ashare_lab.paper.signal_quality"):
-        signal_quality_ic_step(ctx)
-    assert any("low instrument coverage" in r.message for r in caplog.records)
-
-
-def test_ic_step_high_coverage_no_warning(caplog, tmp_path):
-    """No WARNING when instrument coverage >= 95%."""
-    import logging
-    from ashare_lab.paper.signal_quality import signal_quality_ic_step
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    # Mock lagged_ic_for_date to return 96 aligned instruments (96% >= 95%)
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.lagged_ic_for_date", return_value=(-0.05, 96)), \
-         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False), \
-         caplog.at_level(logging.WARNING, logger="ashare_lab.paper.signal_quality"):
-        signal_quality_ic_step(ctx)
-    assert not any("low instrument coverage" in r.message for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# 22. compute_psi with NaN/Inf -> filters and returns finite PSI
+# 21. compute_psi with NaN/Inf -> filters and returns finite PSI
 # ---------------------------------------------------------------------------
 def test_compute_psi_nan_inf():
     """NaN and Inf values are filtered before PSI computation."""
@@ -455,7 +402,7 @@ def test_compute_psi_nan_inf():
 
 
 # ---------------------------------------------------------------------------
-# 23. compute_psi: current outside reference range (clipping)
+# 22. compute_psi: current outside reference range (clipping)
 # ---------------------------------------------------------------------------
 def test_compute_psi_out_of_range():
     """Current scores outside reference range are clipped."""
