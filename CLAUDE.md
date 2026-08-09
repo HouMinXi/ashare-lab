@@ -170,3 +170,21 @@ Use direct impact descriptions instead:
   GOOD: "fix NAV gate suppressing crash alerts on real market crashes"
   BAD:  "add Layer 2/3 tests for hedge volume"
   GOOD: "add isfinite guard and prefetch ordering tests for hedge volume"
+
+
+## Vendor Docs Before Vendor APIs (2026-08-09 QMT probe saga)
+
+Incident: an undocumented 8-arg passorder call shape (signal mode, next-bar
+conversion) produced total order silence and was misdiagnosed as a
+regulatory permission wall; days of probing before the official manual
+(quickTrade semantics) overturned it.
+
+- **When unsure about any vendor API (QMT/XTQuant, broker endpoints,
+  PTrade), read the authoritative docs FIRST; never trust community
+  snippets or model memory for call signatures.** Sources in order:
+  the vendor knowledge base (dict.thinktrader.net/innerApi), the
+  client-bundled API sources (<install>/bin.x64/Lib/site-packages/xtquant),
+  and broker documents under docs/.
+- Broker/compliance documents from the account manager are filed in
+  docs/ (e.g. the 2025-06-03 programmatic-trading commitment letter
+  template).
