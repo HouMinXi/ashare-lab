@@ -540,3 +540,78 @@ def test_meta_write_failure_is_fail_open():
 
     # Meta-write failure must not re-save the model (regression guard).
     assert mock_de_instance.to_pickle.call_count == 1
+
+
+def test_meta_write_callsite_injection():
+    """Injection: deleting write_model_meta call in train_window must fail this.
+
+    Verifies train_window actually invokes write_model_meta (integration level).
+    """
+    import ashare_lab.research.train as train_mod
+
+    mock_qlib = mock.MagicMock()
+    mock_qlib.config.C = mock.MagicMock(registered=True)
+
+    mock_de_cls = mock.MagicMock()
+    mock_de_mod = mock.MagicMock()
+    mock_de_mod.DEnsembleModel = mock_de_cls
+    mock_de_instance = mock.MagicMock()
+    mock_de_cls.return_value = mock_de_instance
+    mock_de_instance.predict.return_value = pd.Series(
+        [0.5], index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    mock_dataset_cls = mock.MagicMock()
+    mock_dataset_mod = mock.MagicMock()
+    mock_dataset_mod.DatasetH = mock_dataset_cls
+    mock_dataset_mod.TSDatasetH = mock.MagicMock()
+    mock_dataset_instance = mock.MagicMock()
+    mock_dataset_cls.return_value = mock_dataset_instance
+    mock_dataset_instance.prepare.return_value = pd.DataFrame(
+        {"label": [0.01]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    mock_write = mock.MagicMock()
+
+    with mock.patch.dict("sys.modules", {
+        "qlib": mock_qlib,
+        "qlib.config": mock_qlib.config,
+        "qlib.contrib.data.handler": mock.MagicMock(),
+        "qlib.contrib.model.gbdt": mock.MagicMock(),
+        "qlib.contrib.model.double_ensemble": mock_de_mod,
+        "qlib.data.dataset": mock_dataset_mod,
+        "qlib.contrib.data.dataset": mock.MagicMock(),
+        "ashare_lab.data.update": mock.MagicMock(),
+    }), mock.patch(
+        "ashare_lab.research.train.load_config",
+        return_value={"model": {
+            "type": "densemble", "handler": "alpha158",
+            "num_models": 6, "epochs": 28, "decay": 0.5,
+        }},
+    ), mock.patch(
+        "ashare_lab.research.train.apply_price_filter",
+        side_effect=lambda pred, *a, **kw: pred,
+    ), mock.patch(
+        "ashare_lab.research.model_meta.write_model_meta",
+        mock_write,
+    ):
+        window = {
+            "window_id": 1,
+            "train_start": "2018-01-01", "train_end": "2020-12-31",
+            "valid_start": "2021-01-01", "valid_end": "2021-06-30",
+            "test_start": "2021-07-01", "test_end": "2021-12-31",
+        }
+        train_mod.train_window(window, Path("/tmp/test_exp"), "csi1000")
+
+    # Integration proof: train_window called write_model_meta
+    assert mock_write.call_count == 1, (
+        "train_window must call write_model_meta once; "
+        f"got {mock_write.call_count}"
+    )
