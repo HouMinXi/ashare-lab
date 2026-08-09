@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 class TestAmpFlagDefaultOff:
     """use_amp absent or false -> model.fit is NOT monkey-patched."""
@@ -21,7 +23,7 @@ class TestAmpFlagEnablesAutocast:
     """use_amp=true -> autocast context is entered during fit."""
 
     def test_amp_flag_enables_autocast(self):
-        import torch
+        torch = pytest.importorskip("torch", reason="torch not installed on this host")
 
         cfg_model = {"use_amp": True}
         model = MagicMock()
@@ -50,7 +52,7 @@ class TestAmpBfloat16NotFloat16:
     """Verify the wrapper uses bfloat16, NOT float16."""
 
     def test_amp_bfloat16_not_float16(self):
-        import torch
+        torch = pytest.importorskip("torch", reason="torch not installed on this host")
 
         captured_kwargs = {}
 
@@ -82,7 +84,7 @@ class TestAssignDataFp32Cast:
     """bf16 tensor passed to assign_data is cast to fp32 before original."""
 
     def test_assign_data_fp32_cast(self):
-        import torch
+        torch = pytest.importorskip("torch", reason="torch not installed on this host")
 
         original_assign = MagicMock()
         dataset = MagicMock()

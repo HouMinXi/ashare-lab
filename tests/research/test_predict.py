@@ -247,7 +247,7 @@ class TestPredictForDate:
 
         df = pd.read_parquet(out)
         assert list(df.columns) == ["instrument", "score"]
-        assert df["instrument"].dtype == object  # str
+        assert pd.api.types.is_string_dtype(df["instrument"])  # object on pandas<3, StringDtype on pandas 3
         assert df["score"].dtype == float
 
     def test_row_count_matches_trade_date_instruments(

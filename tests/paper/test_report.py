@@ -332,7 +332,7 @@ def test_deliver_report_fallback(mock_sleep, mock_sc, mock_ilink, mock_sec, db_c
     mock_sec.return_value = "token"
     mock_ilink.side_effect = Exception("iLink down")
     mock_sc.return_value = True
-    cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
+    cfg = {"paper": {"report": {"delivery_channel": "ilink", "fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "serverchan"
@@ -345,14 +345,14 @@ def test_deliver_report_all_fail(mock_sleep, mock_sc, mock_ilink, mock_sec, db_c
     mock_sec.return_value = "token"
     mock_ilink.side_effect = Exception("iLink down")
     mock_sc.return_value = False
-    cfg = {"paper": {"report": {"fallback_service": "serverchan"}}}
+    cfg = {"paper": {"report": {"delivery_channel": "ilink", "fallback_service": "serverchan"}}}
     assert deliver_report(db_conn, "2025-01-06", "simple", "text", cfg) == "failed"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivery_status"] == "failed"
 
 def test_deliver_report_saves_always(db_conn):
     with patch("ashare_lab.paper.report._get_secret", side_effect=Exception("err")):
-        deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper":{}})
+        deliver_report(db_conn, "2025-01-06", "simple", "text", {"paper": {"report": {"delivery_channel": "ilink"}}})
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r is not None
     assert r["delivery_status"] == "failed"

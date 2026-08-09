@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
+import importlib.util
+
 import pytest
 
 from ashare_lab.research.batch_experiment import (
@@ -687,6 +689,7 @@ def test_ensure_gpu_already_online(monkeypatch: pytest.MonkeyPatch) -> None:
     real_fn()  # should return immediately
 
 
+@pytest.mark.skipif(importlib.util.find_spec("wakeonlan") is None, reason="wakeonlan not installed on this host")
 def test_ensure_gpu_wol_then_online(monkeypatch: pytest.MonkeyPatch) -> None:
     import ashare_lab.research.batch_experiment as mod
     real_fn = _real_ensure_gpu_online()
@@ -697,6 +700,7 @@ def test_ensure_gpu_wol_then_online(monkeypatch: pytest.MonkeyPatch) -> None:
     real_fn(timeout=30, poll=0)
 
 
+@pytest.mark.skipif(importlib.util.find_spec("wakeonlan") is None, reason="wakeonlan not installed on this host")
 def test_ensure_gpu_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     import ashare_lab.research.batch_experiment as mod
     real_fn = _real_ensure_gpu_online()
