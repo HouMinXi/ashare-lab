@@ -567,6 +567,17 @@ def train_window(
         model.to_pickle(path=str(model_path))
     log.info("W%d: model saved -> %s", window_id, model_path)
 
+    # Write model metadata for staleness gate (10-03)
+    try:
+        from ashare_lab.research.model_meta import write_model_meta  # noqa: PLC0415
+
+        write_model_meta(model_path, window["train_end"], f"w{window_id}")
+    except Exception as exc:
+        log.error("W%d: write_model_meta failed: %s", window_id, exc)
+        model_path = models_dir / f"w{window_id}.pkl"
+        model.to_pickle(path=str(model_path))
+    log.info("W%d: model saved -> %s", window_id, model_path)
+
     # -----------------------------------------------------------------------
     # Predict on test set and extract labels.
     # TRAModel.predict() returns a DataFrame with columns:
@@ -621,3 +632,89 @@ def train_window(
     )
 
     return model_path, pred, label
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    # Deferred import to avoid circular dependency (smoke_test imports train)
+    from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(
+        description="Walk-forward window training driver"
+    )
+    parser.add_argument(
+        "--exp-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent.parent,
+        help="Experiment output directory (default: repo root)",
+    )
+    parser.add_argument(
+        "--windows",
+        type=str,
+        default=None,
+        help="Comma-separated window IDs (default: all from get_all_windows)",
+    )
+    parser.add_argument(
+        "--universe",
+        type=str,
+        default="csi1000",
+        help="Qlib universe (default: csi1000)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-train windows whose model file already exists",
+    )
+    args = parser.parse_args()
+
+    # Resolve windows
+    all_windows = get_all_windows()
+    if not all_windows:
+        log.error("no training windows available")
+        sys.exit(2)
+
+    if args.windows:
+        selected = []
+        for wid in args.windows.split(","):
+            wid = wid.strip()
+            if wid.startswith("w"):
+                wid = wid[1:]
+            try:
+                wid_int = int(wid)
+            except ValueError:
+                log.error("invalid window ID: %s", wid)
+                sys.exit(2)
+            for w in all_windows:
+                if w["window_id"] == wid_int:
+                    selected.append(w)
+                    break
+            else:
+                log.error("window %d not found in config", wid_int)
+                sys.exit(2)
+    else:
+        selected = all_windows
+
+    if not selected:
+        log.error("empty window selection -- nothing to train")
+        sys.exit(2)
+
+    # Train each window
+    models_dir = args.exp_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    trained = 0
+    for window in selected:
+        wid = window["window_id"]
+        model_path = models_dir / f"w{wid}.pt"
+        if model_path.exists() and not args.force:
+            log.info("W%d: model exists, skipping (use --force to re-train)", wid)
+            continue
+        try:
+            train_window(window, exp_dir=args.exp_dir, universe=args.universe)
+            trained += 1
+        except Exception as exc:
+            log.error("W%d: training failed: %s", wid, exc, exc_info=True)
+            sys.exit(1)
+
+    log.info("trained %d/%d windows", trained, len(selected))

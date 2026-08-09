@@ -92,31 +92,68 @@ log "GPU online"
 ssh "$GPU_HOST" "H:/nssm/nssm.exe stop llama-server" 2>/dev/null || true
 sleep 5
 
-# --- Step 3: Run training (10 windows) ---
+# --- Step 3: Flock guard + Run training ---
+exec 9>"$PROJECT_DIR/data/retrain.lock"
+if ! flock -n 9; then
+    log "retrain lock held by another run, skipping"
+    exit 0
+fi
+
+# Delete gpu-side stale meta
+ssh -o ConnectTimeout=5 "$GPU_HOST" "del H:\\ashare-lab\\models\\meta.json 2>NUL" || true
+
 log "Starting training..."
-ssh "$GPU_HOST" "cd $GPU_REPO && py -m ashare_lab.research.train" >> "$LOG_FILE" 2>&1
-TRAIN_RC=$?
+PT_OK=0
+TRAIN_RC=0
+if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd $GPU_REPO && py -m ashare_lab.research.train --force" >> "$LOG_FILE" 2>&1; then
+    :
+else
+    TRAIN_RC=$?
+fi
 log "Training exit code: $TRAIN_RC"
 
 # --- Step 4: Copy models back ---
 log "Copying models..."
 mkdir -p "$PROJECT_DIR/models"
-scp "$GPU_HOST:$GPU_REPO/models/"*.pt "$PROJECT_DIR/models/" 2>/dev/null || true
+rm -f "$PROJECT_DIR/models/meta.json"
+if scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/w*[0-9].pt" "$PROJECT_DIR/models/"; then
+    PT_OK=1
+    scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/meta.json" "$PROJECT_DIR/models/" || true
+fi
 
 # --- Step 5: Update latest.pt symlink ---
-LATEST=$(ls -t "$PROJECT_DIR/models"/w*.pt 2>/dev/null | head -1)
-if [ -n "$LATEST" ]; then
-    ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
-    log "latest.pt -> $(basename "$LATEST")"
+# Helper: find latest model file with version sorting
+_find_latest_model() {
+    find "$PROJECT_DIR/models" -maxdepth 1 -name 'w*[0-9].pt' ! -name '*_backup*' -print0 2>/dev/null | sort -zV | tail -z -n1 | tr -d '\0' || true
+}
+
+if [ -f "$PROJECT_DIR/models/meta.json" ]; then
+    META_MODEL=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/models/meta.json'))['model_file'])" 2>/dev/null || true)
+    if [ -n "$META_MODEL" ] && [ -f "$PROJECT_DIR/models/$META_MODEL" ]; then
+        ln -sf "$META_MODEL" "$PROJECT_DIR/models/latest.pt"
+        log "latest.pt -> $META_MODEL (from meta.json)"
+    else
+        LATEST=$(_find_latest_model)
+        if [ -n "$LATEST" ]; then
+            ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
+            log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback)"
+        fi
+    fi
+else
+    LATEST=$(_find_latest_model)
+    if [ -n "$LATEST" ]; then
+        ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
+        log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback, no meta.json)"
+    fi
 fi
 
 # --- Step 6: Restart llama-server ---
-ssh "$GPU_HOST" "H:/nssm/nssm.exe start llama-server" 2>/dev/null || true
+ssh -o ConnectTimeout=5 "$GPU_HOST" "H:/nssm/nssm.exe start llama-server" 2>/dev/null || true
 
-# --- Step 7: Record retrain date (only on success) ---
-if [ "$TRAIN_RC" -eq 0 ]; then
+# --- Step 7: Record retrain date (only on real success) ---
+if [ "$TRAIN_RC" -eq 0 ] && [ "$PT_OK" -eq 1 ]; then
     echo "$TODAY" > "$SENTINEL"
     log "Retrain complete, sentinel written: $TODAY"
 else
-    log "Retrain failed (exit $TRAIN_RC), sentinel NOT written (will retry)"
+    log "Retrain incomplete (train_rc=$TRAIN_RC, pt_ok=$PT_OK), sentinel NOT written"
 fi

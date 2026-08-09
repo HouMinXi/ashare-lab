@@ -22,8 +22,9 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -416,17 +417,26 @@ def predict_for_date(
     )
     window_id: int = window["window_id"]
 
-    # -- Model freshness check --
-    model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
+    # -- Model freshness check (meta.json preferred, mtime fallback) --
+    from ashare_lab.research.model_meta import read_model_meta  # noqa: PLC0415
+
+    model_meta, meta_reason = read_model_meta(model_path)
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    if model_meta is not None:
+        model_age_days = (today - date.fromisoformat(model_meta["train_date"])).days
+        age_source = "meta.json"
+    else:
+        model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
+        age_source = f"mtime-fallback({meta_reason})"
     if model_age_days > _MODEL_STALE_DAYS:
         log.warning(
-            "MODEL STALE: %s is %.0f days old (threshold: %d days). "
+            "MODEL STALE: %s is %.0f days old (threshold: %d days, source: %s). "
             "Consider retraining.",
-            model_path.name, model_age_days, _MODEL_STALE_DAYS,
+            model_path.name, model_age_days, _MODEL_STALE_DAYS, age_source,
         )
         _send_alert(
             f"[predict] model stale: {model_path.name} is {model_age_days:.1f} days old "
-            f"(threshold: {_MODEL_STALE_DAYS}) on {trade_date}. "
+            f"(threshold: {_MODEL_STALE_DAYS}, source: {age_source}) on {trade_date}. "
             f"Action: retrain"
         )
 
@@ -610,18 +620,21 @@ def predict_for_date(
     out = PREDICTIONS_DIR / f"{trade_date}.parquet"
     df.to_parquet(out, index=False)
 
-    meta = {
+    sidecar = {
         "model": model_path.name,
         "universe": universe,
         "window_id": window_id,
         "produced_at": datetime.now(timezone.utc).isoformat(),
         "n_instruments": len(df),
         "model_age_days": round(model_age_days, 1),
+        "model_age_source": age_source,
         "ic": ic_value,
         "diversity": diversity.tier2_metrics,
     }
+    if model_meta is not None and "train_date" in model_meta:
+        sidecar["model_train_date"] = model_meta["train_date"]
     meta_path = PREDICTIONS_DIR / f"{trade_date}.meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(sidecar, indent=2))
 
     log.info(
         "predict %s: wrote %d instruments -> %s",
