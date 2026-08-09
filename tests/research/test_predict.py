@@ -754,3 +754,28 @@ class TestDiversityIntegration:
         meta = json.loads(meta_path.read_text())
         assert "diversity" in meta
         assert "score_std" in meta["diversity"]
+
+
+def test_gate_callsite_uses_meta_json(monkeypatch, tmp_path):
+    """Call-site proof: predict_for_date sources model age from meta.json.
+
+    Deleting the read_model_meta call in predict_for_date must fail this
+    (age_source becomes the mtime fallback).
+    """
+    from datetime import date, timedelta
+
+    from ashare_lab.research.model_meta import write_model_meta
+
+    _apply_patches(monkeypatch, tmp_path)
+    fresh = (date.today() - timedelta(days=1)).isoformat()
+    write_model_meta(tmp_path / "models" / "w1.pt", fresh, "w1")
+
+    from ashare_lab.research.predict import predict_for_date
+
+    predict_for_date("2021-12-01")
+
+    sidecar = json.loads(
+        (tmp_path / "predictions" / "2021-12-01.meta.json").read_text()
+    )
+    assert sidecar["model_age_source"] == "meta.json"
+    assert sidecar["model_train_date"] == fresh
