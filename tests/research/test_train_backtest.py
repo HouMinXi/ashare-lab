@@ -465,3 +465,78 @@ class TestRunFullWalkForward:
         assert pred_path.name == "pred_w1.parquet", (
             f"PredictionFile schema requires 'pred_w{{N}}.parquet'; got {pred_path.name!r}"
         )
+
+
+def test_meta_write_failure_is_fail_open():
+    """write_model_meta raising must not crash training nor re-save the model.
+
+    Regression: the except handler once re-invoked model.to_pickle (a stray
+    splice of the else-branch), which would crash torch models (no to_pickle)
+    and double-save others. Pin: on meta-write failure, model save happens
+    exactly once and train_window completes.
+    """
+    import ashare_lab.research.train as train_mod
+
+    mock_qlib = mock.MagicMock()
+    mock_qlib.config.C = mock.MagicMock(registered=True)
+
+    mock_de_cls = mock.MagicMock()
+    mock_de_mod = mock.MagicMock()
+    mock_de_mod.DEnsembleModel = mock_de_cls
+    mock_de_instance = mock.MagicMock()
+    mock_de_cls.return_value = mock_de_instance
+    mock_de_instance.predict.return_value = pd.Series(
+        [0.5], index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    mock_dataset_cls = mock.MagicMock()
+    mock_dataset_mod = mock.MagicMock()
+    mock_dataset_mod.DatasetH = mock_dataset_cls
+    mock_dataset_mod.TSDatasetH = mock.MagicMock()
+    mock_dataset_instance = mock.MagicMock()
+    mock_dataset_cls.return_value = mock_dataset_instance
+    mock_dataset_instance.prepare.return_value = pd.DataFrame(
+        {"label": [0.01]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2021-07-01"), "TEST")],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    with mock.patch.dict("sys.modules", {
+        "qlib": mock_qlib,
+        "qlib.config": mock_qlib.config,
+        "qlib.contrib.data.handler": mock.MagicMock(),
+        "qlib.contrib.model.gbdt": mock.MagicMock(),
+        "qlib.contrib.model.double_ensemble": mock_de_mod,
+        "qlib.data.dataset": mock_dataset_mod,
+        "qlib.contrib.data.dataset": mock.MagicMock(),
+        "ashare_lab.data.update": mock.MagicMock(),
+    }), mock.patch(
+        "ashare_lab.research.train.load_config",
+        return_value={"model": {
+            "type": "densemble", "handler": "alpha158",
+            "num_models": 6, "epochs": 28, "decay": 0.5,
+        }},
+    ), mock.patch(
+        "ashare_lab.research.train.apply_price_filter",
+        side_effect=lambda pred, *a, **kw: pred,
+    ), mock.patch(
+        "ashare_lab.research.model_meta.write_model_meta",
+        side_effect=RuntimeError("disk full"),
+    ):
+        window = {
+            "window_id": 1,
+            "train_start": "2018-01-01", "train_end": "2020-12-31",
+            "valid_start": "2021-01-01", "valid_end": "2021-06-30",
+            "test_start": "2021-07-01", "test_end": "2021-12-31",
+        }
+        model_path, pred, label = train_mod.train_window(
+            window, Path("/tmp/test_exp"), "csi1000",
+        )
+
+    # Meta-write failure must not re-save the model (regression guard).
+    assert mock_de_instance.to_pickle.call_count == 1

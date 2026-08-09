@@ -574,9 +574,6 @@ def train_window(
         write_model_meta(model_path, window["train_end"], f"w{window_id}")
     except Exception as exc:
         log.error("W%d: write_model_meta failed: %s", window_id, exc)
-        model_path = models_dir / f"w{window_id}.pkl"
-        model.to_pickle(path=str(model_path))
-    log.info("W%d: model saved -> %s", window_id, model_path)
 
     # -----------------------------------------------------------------------
     # Predict on test set and extract labels.
