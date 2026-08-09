@@ -52,6 +52,10 @@ class TestStockNameCachePreference:
             w = csv.writer(f)
             w.writerow(["code", "code_name"])
             w.writerow(["sz.000001", "OldPingAn"])
+            w.writerow(["sz.000002", "PaddingNameAlpha"])
+            w.writerow(["sz.000003", "PaddingNameBeta"])
+            w.writerow(["sz.000004", "PaddingNameGamma"])
+            w.writerow(["sz.000005", "PaddingNameDelta"])
 
         symbols = {"SZ000001", "SH600000"}
 
@@ -73,6 +77,10 @@ class TestStockNameCachePreference:
             w = csv.writer(f)
             w.writerow(["code", "code_name"])
             w.writerow(["sz.000001", "OldPingAn"])
+            w.writerow(["sz.000002", "PaddingNameAlpha"])
+            w.writerow(["sz.000003", "PaddingNameBeta"])
+            w.writerow(["sz.000004", "PaddingNameGamma"])
+            w.writerow(["sz.000005", "PaddingNameDelta"])
 
         symbols = {"SZ000001"}
 
@@ -113,6 +121,10 @@ class TestStockNameCachePreference:
             w = csv.writer(f)
             w.writerow(["code", "code_name"])
             w.writerow(["sz.000001", "FallbackName"])
+            w.writerow(["sz.000002", "PaddingNameAlpha"])
+            w.writerow(["sz.000003", "PaddingNameBeta"])
+            w.writerow(["sz.000004", "PaddingNameGamma"])
+            w.writerow(["sz.000005", "PaddingNameDelta"])
 
         symbols = {"sz000001"}
 
