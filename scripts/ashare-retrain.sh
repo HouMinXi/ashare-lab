@@ -140,10 +140,12 @@ if [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then
     if [ -n "$NEW_N" ] && [ -n "$EXPECTED_N" ] && [ "$NEW_N" -gt "$EXPECTED_N" ]; then
         DEPLOY_SKIP=1
         log "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}); not deploying"
-        # Alert (failure must not affect script)
-        if command -v send_bridge_alert >/dev/null 2>&1; then
-            send_bridge_alert "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}), artifact left on gpu-win" 2>/dev/null || true
-        fi
+        # Alert via the bridge module (failure must not affect script)
+        PYTHONPATH="$PROJECT_DIR" python3 -c "
+from ashare_lab.bridge import send_bridge_alert
+send_bridge_alert('ashare retrain: model shelved',
+                  'w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}), artifact left on gpu-win')
+" >>"$LOG_FILE" 2>&1 || true
     fi
 elif [ -z "$NEW_MODEL" ]; then
     log "WARNING: could not read gpu-side meta.json, deploying as fallback"
@@ -193,7 +195,9 @@ fi
 ssh -o ConnectTimeout=5 "$GPU_HOST" "H:/nssm/nssm.exe start llama-server" 2>/dev/null || true
 
 # --- Step 7: Record retrain date (only on real success) ---
-if [ "$TRAIN_RC" -eq 0 ]; then
+# Shelved run: training success (TRAIN_RC==0) alone suffices.
+# Normal deploy: the scp back must also have succeeded (PT_OK==1).
+if [ "$TRAIN_RC" -eq 0 ] && { [ "$DEPLOY_SKIP" -eq 1 ] || [ "$PT_OK" -eq 1 ]; }; then
     echo "$TODAY" > "$SENTINEL"
     log "Retrain complete, sentinel written: $TODAY"
 else

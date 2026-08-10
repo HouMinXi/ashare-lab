@@ -5,6 +5,7 @@
 # T3 rollback: NEW=w10, EXPECTED=w11 -> normal deploy (deploy gate allows)
 # T4 EXPECTED missing -> normal deploy + warning
 # T5 meta.json read failure -> normal deploy + warning
+# T6 normal deploy but scp fails -> sentinel NOT written (forge-fix guard)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,6 +21,7 @@ _run_test() {
     local expect_scp="$4"      # "yes" or "no"
     local expect_sentinel="$5" # "yes" or "no"
     local expect_skip_log="$6" # "yes" or "no"
+    local scp_fails="${7:-no}" # "yes" = scp shim exits 1
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -97,11 +99,11 @@ fi
 SH
     chmod +x "$shim_bin/ssh"
 
-    # scp: succeed if called
-    cat > "$shim_bin/scp" <<'SH'
+    # scp: succeed or fail per scenario
+    cat > "$shim_bin/scp" <<SH
 #!/bin/bash
-echo "scp $@" >> "$SHIM_LOG"
-exit 0
+echo "scp \$@" >> "\$SHIM_LOG"
+exit $([ "$scp_fails" = "yes" ] && echo 1 || echo 0)
 SH
     chmod +x "$shim_bin/scp"
 
@@ -193,6 +195,9 @@ _run_test "T4" "w11.pt" "" "yes" "yes" "no"
 
 echo "T5: meta.json read failure"
 _run_test "T5" "" "w10" "yes" "yes" "no"
+
+echo "T6: normal deploy + scp failure (sentinel must NOT be written)"
+_run_test "T6" "w11.pt" "w11" "yes" "no" "no" "yes"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
