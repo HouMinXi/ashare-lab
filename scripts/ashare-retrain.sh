@@ -112,46 +112,88 @@ else
 fi
 log "Training exit code: $TRAIN_RC"
 
-# --- Step 4: Copy models back ---
-log "Copying models..."
-mkdir -p "$PROJECT_DIR/models"
-rm -f "$PROJECT_DIR/models/meta.json"
-if scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/w*[0-9].pt" "$PROJECT_DIR/models/"; then
-    PT_OK=1
-    scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/meta.json" "$PROJECT_DIR/models/" || true
+# --- Step 3b: Deploy gate (expected_live_model check) ---
+DEPLOY_SKIP=0
+NEW_MODEL=""
+EXPECTED_MODEL=""
+
+# Read new model name from gpu-side meta.json (parse remotely, don't depend on scp)
+NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
+    "cd $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['model_file'])\"" 2>/dev/null || true)
+
+# Read expected_live_model from baseline config
+if [ -f "$PROJECT_DIR/configs/baseline.yaml" ]; then
+    EXPECTED_MODEL=$(python3 -c "
+import re, sys
+with open('$PROJECT_DIR/configs/baseline.yaml') as f:
+    text = f.read()
+# Find expected_live_model under research: section
+m = re.search(r'expected_live_model:\s*[\"'\'']*([wW]\d+)', text)
+print(m.group(1).lower() if m else '')
+" 2>/dev/null || true)
 fi
 
-# --- Step 5: Update latest.pt symlink ---
-# Helper: find latest model file with version sorting
-_find_latest_model() {
-    find "$PROJECT_DIR/models" -maxdepth 1 -name 'w*[0-9].pt' ! -name '*_backup*' -print0 2>/dev/null | sort -zV | tail -z -n1 | tr -d '\0' || true
-}
+# Numeric comparison: extract digits after 'w'
+if [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then
+    NEW_N=$(echo "$NEW_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
+    EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
+    if [ -n "$NEW_N" ] && [ -n "$EXPECTED_N" ] && [ "$NEW_N" -gt "$EXPECTED_N" ]; then
+        DEPLOY_SKIP=1
+        log "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}); not deploying"
+        # Alert (failure must not affect script)
+        if command -v send_bridge_alert >/dev/null 2>&1; then
+            send_bridge_alert "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}), artifact left on gpu-win" 2>/dev/null || true
+        fi
+    fi
+elif [ -z "$NEW_MODEL" ]; then
+    log "WARNING: could not read gpu-side meta.json, deploying as fallback"
+fi
 
-if [ -f "$PROJECT_DIR/models/meta.json" ]; then
-    META_MODEL=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/models/meta.json'))['model_file'])" 2>/dev/null || true)
-    if [ -n "$META_MODEL" ] && [ -f "$PROJECT_DIR/models/$META_MODEL" ]; then
-        ln -sf "$META_MODEL" "$PROJECT_DIR/models/latest.pt"
-        log "latest.pt -> $META_MODEL (from meta.json)"
+if [ "$DEPLOY_SKIP" -eq 1 ]; then
+    # Shelved: skip scp + relink, but still restart llama-server + write sentinel
+    log "Shelved model: skipping Step 4 (scp) and Step 5 (relink)"
+else
+    # --- Step 4: Copy models back ---
+    log "Copying models..."
+    mkdir -p "$PROJECT_DIR/models"
+    rm -f "$PROJECT_DIR/models/meta.json"
+    if scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/w*[0-9].pt" "$PROJECT_DIR/models/"; then
+        PT_OK=1
+        scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/meta.json" "$PROJECT_DIR/models/" || true
+    fi
+
+    # --- Step 5: Update latest.pt symlink ---
+    # Helper: find latest model file with version sorting
+    _find_latest_model() {
+        find "$PROJECT_DIR/models" -maxdepth 1 -name 'w*[0-9].pt' ! -name '*_backup*' -print0 2>/dev/null | sort -zV | tail -z -n1 | tr -d '\0' || true
+    }
+
+    if [ -f "$PROJECT_DIR/models/meta.json" ]; then
+        META_MODEL=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/models/meta.json'))['model_file'])" 2>/dev/null || true)
+        if [ -n "$META_MODEL" ] && [ -f "$PROJECT_DIR/models/$META_MODEL" ]; then
+            ln -sf "$META_MODEL" "$PROJECT_DIR/models/latest.pt"
+            log "latest.pt -> $META_MODEL (from meta.json)"
+        else
+            LATEST=$(_find_latest_model)
+            if [ -n "$LATEST" ]; then
+                ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
+                log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback)"
+            fi
+        fi
     else
         LATEST=$(_find_latest_model)
         if [ -n "$LATEST" ]; then
             ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
-            log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback)"
+            log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback, no meta.json)"
         fi
-    fi
-else
-    LATEST=$(_find_latest_model)
-    if [ -n "$LATEST" ]; then
-        ln -sf "$(basename "$LATEST")" "$PROJECT_DIR/models/latest.pt"
-        log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback, no meta.json)"
     fi
 fi
 
-# --- Step 6: Restart llama-server ---
+# --- Step 6: Restart llama-server (always, even if shelved) ---
 ssh -o ConnectTimeout=5 "$GPU_HOST" "H:/nssm/nssm.exe start llama-server" 2>/dev/null || true
 
 # --- Step 7: Record retrain date (only on real success) ---
-if [ "$TRAIN_RC" -eq 0 ] && [ "$PT_OK" -eq 1 ]; then
+if [ "$TRAIN_RC" -eq 0 ]; then
     echo "$TODAY" > "$SENTINEL"
     log "Retrain complete, sentinel written: $TODAY"
 else
