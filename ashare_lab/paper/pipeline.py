@@ -2164,8 +2164,8 @@ def _step13_report(ctx: DailyRunContext) -> None:
     logger.info("[report] entered for %s (steps=%s)", ctx.trade_date, ctx.steps)
     try:
         stale_flag = os.environ.get("ASHARE_USE_STALE", "")
-        if stale_flag and stale_flag != "1":
-            logger.warning("[report] ASHARE_USE_STALE='%s' (expected '1' or empty), treating as stale", stale_flag)
+        if stale_flag not in ("", "0", "1"):
+            logger.warning("[report] ASHARE_USE_STALE='%s' unrecognized, treating as not-stale", stale_flag)
         if stale_flag == "1":
             logger.info("[report] skipping: stale predictions (GPU inference failed)")
             return

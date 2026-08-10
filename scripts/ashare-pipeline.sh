@@ -66,6 +66,25 @@ if [ "$IS_TRADING" != "True" ]; then
     exit 0
 fi
 
+# ---- Idempotency guard: a terminal row for today means duplicate run ----
+# A second invocation (any launcher) must not reach the gpu/scp phases:
+# the blind sidecar scp would clobber monitor keys the first run wrote.
+ALREADY=$(python3 -c "
+import sqlite3
+db = sqlite3.connect('$REPO/paper.db')
+n = db.execute(
+    \"SELECT COUNT(*) FROM pipeline_runs WHERE trade_date = ? AND status IN ('success','stale')\",
+    ('$TRADE_DATE',),
+).fetchone()[0]
+print(n)
+" 2>>"$STDERR_LOG") || ALREADY=""
+if [ -z "$ALREADY" ]; then
+    echo "WARNING: idempotency check failed (paper.db unreadable), proceeding"
+elif [ "$ALREADY" -gt 0 ]; then
+    echo "Already settled today ($TRADE_DATE, terminal row present), exiting"
+    exit 0
+fi
+
 # ---- Step 2: Check data stamp freshness (D-D12) ----
 
 if [ -f "$DATA_STAMP" ]; then
