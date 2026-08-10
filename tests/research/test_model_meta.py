@@ -98,9 +98,13 @@ def test_read_meta_train_date_unparseable(tmp_path):
 
 def test_read_meta_train_date_future(tmp_path):
     """train_date in future -> (None, "train_date future")."""
+    from datetime import timezone as _tz, timedelta as _td
+
     model_path = tmp_path / "w11.pt"
     model_path.touch()
-    future = (date.today() + timedelta(days=1)).isoformat()
+    # Must use Asia/Shanghai today, not local tz (R4: gate uses CST)
+    _cst_now = datetime.now(_tz(_td(hours=8))).date()
+    future = (_cst_now + timedelta(days=1)).isoformat()
     meta = {"model_file": "w11.pt", "train_date": future}
     (tmp_path / "meta.json").write_text(json.dumps(meta))
     result, reason = read_model_meta(model_path)

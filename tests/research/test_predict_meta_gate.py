@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -95,7 +95,9 @@ def test_gate_train_date_future(tmp_path):
     """4. train_date tomorrow -> (None, "train_date future")."""
     model_path = tmp_path / "w11.pt"
     model_path.touch()
-    future = (date.today() + timedelta(days=1)).isoformat()
+    # Must use Asia/Shanghai today, not local tz (R4: gate uses CST)
+    cst_now = datetime.now(timezone(timedelta(hours=8))).date()
+    future = (cst_now + timedelta(days=1)).isoformat()
     meta = {"model_file": "w11.pt", "train_date": future}
     (tmp_path / "meta.json").write_text(json.dumps(meta))
     result, reason = read_model_meta(model_path)
