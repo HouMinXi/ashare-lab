@@ -17,6 +17,8 @@ _run_test() {
     local name="$1"          # test label
     local db_mode="$2"       # "today-success" | "old-only" | "missing"
     local expect_ssh="$3"    # "yes" = gpu phase reached, "no" = early exit
+    local extra_args="${4:-}"  # e.g. "--force"
+    local expect_force="${5:-no}"  # "yes" = run-all must receive --force
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -73,6 +75,7 @@ SH
     # delegates to the real interpreter against the fixture db.
     cat > "$shim_bin/python3" <<'SH'
 #!/bin/bash
+echo "python3 $@" >> "$SHIM_LOG"
 case " $* " in
     *latest_trading_day*) echo "2026-08-10"; exit 0;;
     *is_trading_day*)     echo "True";       exit 0;;
@@ -82,7 +85,7 @@ esac
 SH
     chmod +x "$shim_bin/python3"
 
-    PATH="$shim_bin:$PATH" __PIPELINE_LOGGING=1 bash "$script_copy/pipeline.sh" \
+    PATH="$shim_bin:$PATH" __PIPELINE_LOGGING=1 bash "$script_copy/pipeline.sh" ${extra_args:-} \
         > "$tmpdir/stdout.log" 2>&1 || true
 
     local actual_ssh="no"
@@ -96,6 +99,10 @@ SH
     if [ "$expect_ssh" = "no" ]; then
         grep -q "Already settled today" "$tmpdir/stdout.log" || {
             echo "  FAIL: missing 'Already settled today' log"; test_passed="no"; }
+    fi
+    if [ "$expect_force" = "yes" ]; then
+        grep -q "run-all.*--force" "$SHIM_LOG" || {
+            echo "  FAIL: run-all did not receive --force"; test_passed="no"; }
     fi
     if [ "$db_mode" = "missing" ]; then
         grep -q "idempotency check failed" "$tmpdir/stdout.log" || {
@@ -128,6 +135,9 @@ _run_test "T3" "missing" "yes"
 
 echo "T4: today stale (not settled) -> stale->fresh retry proceeds"
 _run_test "T4" "today-stale" "yes"
+
+echo "T5: settled + --force -> guard bypassed, run-all gets --force"
+_run_test "T5" "today-settled" "yes" "--force" "yes"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -38,6 +38,10 @@ PREDICTIONS_DIR="$REPO/predictions"
 SECONDS_START=$SECONDS
 USE_STALE=0
 PRED_ARG=""
+FORCE_ARG=""
+for _a in "$@"; do
+    [ "$_a" = "--force" ] && FORCE_ARG="--force"
+done
 
 echo "=== ashare-pipeline run started at $(date -Iseconds) ==="
 
@@ -71,6 +75,7 @@ fi
 # the blind sidecar scp would clobber monitor keys the first run wrote.
 # Matches run_daily's is_day_settled semantics (runs.status='settled'):
 # a STALE day must NOT block the designed stale->fresh auto-retry.
+# An explicit --force is the authorized rerun path and bypasses the guard.
 ALREADY=$(python3 -c "
 import sqlite3
 db = sqlite3.connect('$REPO/paper.db')
@@ -80,7 +85,9 @@ n = db.execute(
 ).fetchone()[0]
 print(n)
 " 2>>"$STDERR_LOG") || ALREADY=""
-if [ -z "$ALREADY" ]; then
+if [ -n "$FORCE_ARG" ]; then
+    echo "Force rerun requested, idempotency guard bypassed"
+elif [ -z "$ALREADY" ]; then
     echo "WARNING: idempotency check failed (paper.db unreadable), proceeding"
 elif [ "$ALREADY" -gt 0 ]; then
     echo "Already settled today ($TRADE_DATE, terminal row present), exiting"
@@ -265,7 +272,7 @@ fi
 # ---- Step 4: Run pipeline (R3B1: ASHARE_USE_STALE env for pipeline.py) ----
 
 # shellcheck disable=SC2086
-ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>>"$STDERR_LOG"
+ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG $FORCE_ARG 2>>"$STDERR_LOG"
 PIPELINE_RC=$?
 
 # Pipeline retry: 2 attempts total (1 initial + 1 retry, D-D14)
@@ -273,7 +280,7 @@ if [ $PIPELINE_RC -ne 0 ]; then
     echo "Pipeline attempt 1 failed (rc=$PIPELINE_RC), retrying in 30min"
     sleep 1800
     # shellcheck disable=SC2086
-    ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG 2>>"$STDERR_LOG"
+    ASHARE_USE_STALE=$USE_STALE python3 -m ashare_lab.cli paper run-all $PRED_ARG $FORCE_ARG 2>>"$STDERR_LOG"
     PIPELINE_RC=$?
 fi
 
