@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PATH-shim tests for the idempotency guard in ashare-pipeline.sh.
-# T1 today's terminal row exists -> exit before any ssh/scp work
+# T1 today's settled row exists -> exit before any ssh/scp work
 # T2 only old rows -> proceeds into gpu phase (ssh called)
 # T3 paper.db missing -> warning + proceeds (fail-open)
+# T4 today stale (pipeline_runs only, not settled) -> retry proceeds
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,11 +28,15 @@ _run_test() {
 import sqlite3, sys
 path, mode = sys.argv[1], sys.argv[2]
 db = sqlite3.connect(path)
+db.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, trade_date TEXT, status TEXT)")
 db.execute("CREATE TABLE pipeline_runs (id INTEGER PRIMARY KEY, trade_date TEXT, status TEXT)")
-if mode == "today-success":
-    db.execute("INSERT INTO pipeline_runs (trade_date, status) VALUES ('2026-08-10', 'success')")
+if mode == "today-settled":
+    db.execute("INSERT INTO runs (trade_date, status) VALUES ('2026-08-10', 'settled')")
 elif mode == "old-only":
-    db.execute("INSERT INTO pipeline_runs (trade_date, status) VALUES ('2026-08-07', 'success')")
+    db.execute("INSERT INTO runs (trade_date, status) VALUES ('2026-08-07', 'settled')")
+elif mode == "today-stale":
+    # stale night: pipeline_runs marks the day but runs.settled is absent
+    db.execute("INSERT INTO pipeline_runs (trade_date, status) VALUES ('2026-08-10', 'stale')")
 db.commit()
 PY
     fi
@@ -71,7 +76,7 @@ SH
 case " $* " in
     *latest_trading_day*) echo "2026-08-10"; exit 0;;
     *is_trading_day*)     echo "True";       exit 0;;
-    *pipeline_runs*)      exec /usr/bin/python3 "$@";;
+    *"FROM runs"*)       exec /usr/bin/python3 "$@";;
     *)                    exit 0;;
 esac
 SH
@@ -112,14 +117,17 @@ SH
 echo "=== Pipeline idempotency guard tests ==="
 echo ""
 
-echo "T1: today's terminal row exists -> early exit, no gpu work"
-_run_test "T1" "today-success" "no"
+echo "T1: today's settled row exists -> early exit, no gpu work"
+_run_test "T1" "today-settled" "no"
 
 echo "T2: only old rows -> proceeds"
 _run_test "T2" "old-only" "yes"
 
 echo "T3: paper.db missing -> warning + proceeds"
 _run_test "T3" "missing" "yes"
+
+echo "T4: today stale (not settled) -> stale->fresh retry proceeds"
+_run_test "T4" "today-stale" "yes"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

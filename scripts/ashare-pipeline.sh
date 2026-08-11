@@ -66,14 +66,16 @@ if [ "$IS_TRADING" != "True" ]; then
     exit 0
 fi
 
-# ---- Idempotency guard: a terminal row for today means duplicate run ----
+# ---- Idempotency guard: a settled day means duplicate run ----
 # A second invocation (any launcher) must not reach the gpu/scp phases:
 # the blind sidecar scp would clobber monitor keys the first run wrote.
+# Matches run_daily's is_day_settled semantics (runs.status='settled'):
+# a STALE day must NOT block the designed stale->fresh auto-retry.
 ALREADY=$(python3 -c "
 import sqlite3
 db = sqlite3.connect('$REPO/paper.db')
 n = db.execute(
-    \"SELECT COUNT(*) FROM pipeline_runs WHERE trade_date = ? AND status IN ('success','stale')\",
+    \"SELECT COUNT(*) FROM runs WHERE trade_date = ? AND status = 'settled'\",
     ('$TRADE_DATE',),
 ).fetchone()[0]
 print(n)
