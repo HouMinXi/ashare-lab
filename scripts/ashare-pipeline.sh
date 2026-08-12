@@ -8,13 +8,17 @@
 # exec > >(tee ...) is unreliable -- pipefail doesn't cover process substitution,
 # so tee failures are invisible.  Self-invocation wraps the whole script in a
 # pipeline where pipefail DOES apply.
+# NOTE: plain child run + exit, NOT exec -- `exec "$0" | tee` leaves the parent
+# alive in bash, which falls through and silently re-runs the entire body
+# (root cause of the nightly duplicate-run + sidecar clobber, found 2026-08-11).
 REPO="$HOME/code/ashare-lab"
 RUN_LOG_DIR="$REPO/logs/pipeline"
 mkdir -p "$RUN_LOG_DIR"
 RUN_LOG="$RUN_LOG_DIR/$(date +%Y%m%d-%H%M%S).log"
 if [[ "${__PIPELINE_LOGGING:-}" != "1" ]]; then
     export __PIPELINE_LOGGING=1
-    exec "$0" "$@" 2>&1 | tee -a "$RUN_LOG"
+    "$0" "$@" 2>&1 | tee -a "$RUN_LOG"
+    exit "${PIPESTATUS[0]}"
 fi
 
 set -uo pipefail
