@@ -1510,8 +1510,18 @@ def _fetch_csi1000_closes_for_timing(trade_date: str):
     Returns Series indexed by trading date with enough history for all
     nulls (N2/N3 need 252 days).  Uses qlib subprocess, same source
     as regime data fetch.
+
+    The result is memoized per trade_date for the process lifetime so
+    that multiple Book B ledgers share a single fetch.
     """
     import pandas as pd  # noqa: PLC0415
+
+    cache = getattr(_fetch_csi1000_closes_for_timing, "_cache", None)
+    if cache is None:
+        cache = {}
+        _fetch_csi1000_closes_for_timing._cache = cache
+    if trade_date in cache:
+        return cache[trade_date]
 
     # Need 300 trading days (~420 calendar days) for N2/N3 warmup
     start_date = (dt.date.fromisoformat(trade_date) - dt.timedelta(days=500)).isoformat()
@@ -1546,12 +1556,14 @@ else:
                 closes.index = pd.to_datetime(closes.index)
                 closes = closes.sort_index()
                 logger.info("[timing] fetched %d CSI1000 closes for %s", len(closes), trade_date)
+                cache[trade_date] = closes
                 return closes
     except subprocess.TimeoutExpired:
         logger.warning("[timing] CSI1000 fetch timed out")
     except Exception as exc:
         logger.warning("[timing] CSI1000 fetch error: %s", exc)
 
+    cache[trade_date] = None
     return None
 
 
@@ -1941,15 +1953,18 @@ def _step12_book_b(ctx: DailyRunContext) -> None:
     The timing multiplier m scales target weights at order generation.
     With m=1.0, Book B must reproduce Book A to the cent (R3).
     """
-    try:
-        _run_book_b(ctx)
-    except Exception:
-        logger.warning("[book_b] Book B failed for %s, continuing", ctx.trade_date, exc_info=True)
+    for book_id in ("none", "n1", "n2", "n3"):
+        try:
+            _run_book_b(ctx, book_id)
+        except Exception:
+            logger.warning(
+                "[book_b] Book B failed for %s (book_id=%s), continuing",
+                ctx.trade_date, book_id, exc_info=True,
+            )
 
 
-def _run_book_b(ctx: DailyRunContext) -> None:
+def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
     """Book B implementation.  Isolated for testability."""
-    book_id = "none"  # future: "n1", "n2", "n3"
     m = timing_multiplier(ctx.trade_date, model=book_id)
 
     # Open Book B database
