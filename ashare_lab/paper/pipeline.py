@@ -558,6 +558,7 @@ def _step2_idempotency(ctx: DailyRunContext) -> int:
             )
             return 2
         force_reset_day(ctx.conn, ctx.trade_date)
+        _force_reset_book_b(ctx, ctx.trade_date)
     return -1  # sentinel: continue
 
 
@@ -1943,6 +1944,50 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
     ctx.conn.commit()
 
 
+# Single source of truth for the Book B shadow ledger ids: the m=1.0
+# "none" canary plus the three pre-registered timing nulls.  Every loop
+# that must cover all four books iterates this, including the force-reset
+# helper below -- keeping the list in one place is what keeps a
+# --force rerun from silently leaving one book behind.
+_BOOK_B_IDS = ("none", "n1", "n2", "n3")
+
+
+def _force_reset_book_b(ctx_or_db_dir: "DailyRunContext | Path", trade_date: str) -> None:
+    """Undo *trade_date* in every existing Book B shadow ledger.
+
+    Production force_reset_day only resets the prod DB; a --force rerun
+    of day T would otherwise roll prod back while paper_b_<id>.db keeps
+    its old state, and the replay would settle T's orders into it a
+    second time -- double-booking T+1 and silently rewriting that day's
+    artifact.  Fail-open by design, matching _step12_book_b: a missing
+    book DB is skipped (not an error) and a failing one logs a warning
+    so the remaining books still reset.  Production reset semantics are
+    untouched.
+    """
+    if hasattr(ctx_or_db_dir, "db_path"):
+        db_path = ctx_or_db_dir.db_path
+        db_dir = db_path.parent if db_path else Path("data")
+    else:
+        db_dir = Path(ctx_or_db_dir)
+    for book_id in _BOOK_B_IDS:
+        book_b_path = db_dir / f"paper_b_{book_id}.db"
+        if not book_b_path.exists():
+            continue
+        book_conn = None
+        try:
+            book_conn = get_connection(book_b_path)
+            force_reset_day(book_conn, trade_date)
+            book_conn.commit()
+        except Exception:
+            logger.warning(
+                "[book_b] force-reset failed for %s (book_id=%s), continuing",
+                trade_date, book_id, exc_info=True,
+            )
+        finally:
+            if book_conn is not None:
+                book_conn.close()
+
+
 def _step12_book_b(ctx: DailyRunContext) -> None:
     """Run Book B shadow ledger (fail-open, never affects production).
 
@@ -1953,7 +1998,7 @@ def _step12_book_b(ctx: DailyRunContext) -> None:
     The timing multiplier m scales target weights at order generation.
     With m=1.0, Book B must reproduce Book A to the cent (R3).
     """
-    for book_id in ("none", "n1", "n2", "n3"):
+    for book_id in _BOOK_B_IDS:
         try:
             _run_book_b(ctx, book_id)
         except Exception:
@@ -2458,6 +2503,7 @@ def run_backfill(
         init_schema(conn)
         for d in reversed(days):
             force_reset_day(conn, d)
+            _force_reset_book_b(db_path.parent, d)
         conn.commit()
 
     had_skip = False
