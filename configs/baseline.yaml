@@ -90,9 +90,13 @@ slippage_fragility:
 research:
   # Expected live model name (without .pt). When predict's computed window
   # model differs but latest.pt resolves to this value, the mismatch is
-  # deliberate (e.g. w11 shelved, KEEP w10) -- log.info only, no alert.
+  # deliberate -- log.info only, no alert.
   # Update this value when swapping the live model; no code edits needed.
-  expected_live_model: "w10"
+  # 2026-08-15: swapped to w115 (serve-now retrain, user-approved swap).
+  # NOTE: the retrain deploy gate compares window numbers numerically, so
+  # a future w12 (12 < 115) would NOT be shelved against this value --
+  # review the gate before the next cadence retrain (~2027-02).
+  expected_live_model: "w115"
 paper:
   db_path: "paper.db"
   carry_days: 3
