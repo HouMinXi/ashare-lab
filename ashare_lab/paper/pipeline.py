@@ -2129,9 +2129,29 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
 
 
 def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
-    """Day 0 bootstrap: copy production DB to Book B DB."""
+    """Day 0 bootstrap: copy production DB to Book B DB, settled state only.
+
+    Book B starts from Book A's settled snapshot (positions/nav/cash) and
+    must not inherit unsettled orders: it places its own T+1 orders for its
+    own m-scaled targets.  Inheriting prod's pending/carry rows would make
+    Book B settle the same orders a second time (double settlement), so
+    they are scrubbed right after the copy.  Scrub by status, not date --
+    carry rows keep their original trade_date, which is already <= today,
+    so a date filter would miss them.
+    """
     import shutil  # noqa: PLC0415
     shutil.copy2(prod_db_path, book_b_path)
+
+    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    conn = get_connection(book_b_path)
+    try:
+        conn.execute(
+            "DELETE FROM orders WHERE status IN ('pending', 'carry')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     logger.info("[book_b] bootstrapped %s -> %s", prod_db_path, book_b_path)
 
 
@@ -2170,7 +2190,11 @@ def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float)
         "m": m,
     }
     artifact_path = artifact_dir / f"{ctx.trade_date}_{book_id}.json"
-    artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Atomic write via same-directory temp + rename: a crashed writer must
+    # not leave a truncated artifact behind for consumers to read.
+    tmp_path = artifact_path.with_name(artifact_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, artifact_path)
     logger.info("[book_b] A/B/C artifact written: %s", artifact_path)
 
 

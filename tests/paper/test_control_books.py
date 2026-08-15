@@ -17,6 +17,7 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from ashare_lab.paper.ledger import init_schema
 from ashare_lab.paper.pipeline import (
     timing_multiplier,
     _bootstrap_book_b,
@@ -48,8 +49,12 @@ class TestBootstrap:
         book_b_db = tmp_path / "paper_b_none.db"
 
         conn = sqlite3.connect(str(prod_db))
-        conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
-        conn.execute("INSERT INTO nav VALUES ('2026-07-25', 300000.0)")
+        init_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO nav "
+            "(trade_date, cash, market_value, total_nav) "
+            "VALUES ('2026-07-25', 300000.0, 0.0, 300000.0)"
+        )
         conn.commit()
         conn.close()
 
@@ -66,14 +71,22 @@ class TestBootstrap:
         book_b_db = tmp_path / "paper_b_none.db"
 
         conn = sqlite3.connect(str(prod_db))
-        conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
-        conn.execute("INSERT INTO nav VALUES ('2026-07-25', 300000.0)")
+        init_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO nav "
+            "(trade_date, cash, market_value, total_nav) "
+            "VALUES ('2026-07-25', 300000.0, 0.0, 300000.0)"
+        )
         conn.commit()
         conn.close()
 
         conn = sqlite3.connect(str(book_b_db))
-        conn.execute("CREATE TABLE nav (trade_date TEXT, total_nav REAL)")
-        conn.execute("INSERT INTO nav VALUES ('2026-07-25', 999999.0)")
+        init_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO nav "
+            "(trade_date, cash, market_value, total_nav) "
+            "VALUES ('2026-07-25', 999999.0, 0.0, 999999.0)"
+        )
         conn.commit()
         conn.close()
 

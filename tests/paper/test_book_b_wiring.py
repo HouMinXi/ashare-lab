@@ -22,6 +22,7 @@ from ashare_lab.paper.ledger import (
     get_connection,
     get_positions_for_date,
     init_schema,
+    insert_order,
 )
 from ashare_lab.paper.pipeline import (
     _fetch_csi1000_closes_for_timing,
@@ -468,3 +469,83 @@ class TestInjectionMapping:
 
     def test_injection_c_three_fetches_covered_by_memo(self):
         """(c) fetch called 3x -> TestMemoization::test_three_books_one_fetch FAILS."""
+
+
+# -- Contract 7: Day-0 bootstrap scrub --------------------------------------
+
+class TestBootstrapScrub:
+    """Day-0 bootstrap copies prod's settled state, not unsettled orders."""
+
+    def test_book_b_bootstrap_scrubs_unsettled_orders(self, tmp_path):
+        """Unsettled prod orders must not leak into a bootstrapped Book B.
+
+        Without the scrub, prod's pending/carry rows ride the full-DB copy
+        into Book B, where they settle a second time (double settlement)
+        alongside Book B's own orders.  PM injection: delete the scrub
+        DELETE in _bootstrap_book_b -- this test must then fail on (b) and
+        (c) below.
+        """
+        trade_date = "2026-07-22"
+        next_td = dt.date(2026, 7, 23)
+        prod_db = tmp_path / "paper.db"
+        book_b_db = tmp_path / "paper_b_none.db"
+        assert not book_b_db.exists()  # bootstrap must be the creator
+
+        # Production DB: settled nav state plus two unsettled orders.
+        conn = sqlite3.connect(str(prod_db))
+        conn.row_factory = sqlite3.Row
+        init_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO nav (trade_date, cash, market_value, total_nav) "
+            "VALUES (?, ?, ?, ?)",
+            ("2026-07-01", 1_000_000.0, 0.0, 1_000_000.0),
+        )
+        # Same symbol+date Book B will target itself: without the scrub the
+        # own-order count in (c) becomes 2 instead of 1.
+        insert_order(conn, "2026-07-23", "SH600519", "buy", 777, None,
+                     "pending", 0, trade_date)
+        # Old carry order: trade_date <= today, so a date-based scrub would
+        # miss it; the status-based scrub must remove it.
+        insert_order(conn, "2026-07-21", "SZ000002", "buy", 555, None,
+                     "carry", 1, "2026-07-20")
+        conn.commit()
+        conn.close()
+
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+             patch("ashare_lab.paper.pipeline.next_trading_day", return_value=next_td), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            _run_book_b(ctx, "none")
+
+        # (a) bootstrap ran: the Book B DB was created by copying prod,
+        #     evidenced by the inherited nav row.
+        assert book_b_db.exists()
+        book_conn = get_connection(book_b_db)
+        try:
+            seeded_nav = book_conn.execute(
+                "SELECT cash FROM nav WHERE trade_date = '2026-07-01'"
+            ).fetchone()
+            assert seeded_nav is not None and seeded_nav["cash"] == 1_000_000.0
+
+            # (b) the unsettled prod rows are gone (any status).
+            for symbol, qty in (("SH600519", 777), ("SZ000002", 555)):
+                remaining = book_conn.execute(
+                    "SELECT COUNT(*) AS n FROM orders "
+                    "WHERE symbol = ? AND target_qty = ?",
+                    (symbol, qty),
+                ).fetchone()["n"]
+                assert remaining == 0, (
+                    f"inherited order {symbol}x{qty} survived scrub"
+                )
+
+            # (c) Book B's own T+1 order exists exactly once.
+            own = book_conn.execute(
+                "SELECT COUNT(*) AS n FROM orders "
+                "WHERE symbol = 'SH600519' AND trade_date = ?",
+                ("2026-07-23",),
+            ).fetchone()["n"]
+            assert own == 1, f"expected 1 own T+1 order, found {own}"
+        finally:
+            book_conn.close()
