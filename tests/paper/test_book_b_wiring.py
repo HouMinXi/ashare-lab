@@ -9,20 +9,39 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from ashare_lab.paper.ledger import get_connection, init_schema
-from ashare_lab.paper.pipeline import _run_book_b, _step12_book_b
+from ashare_lab.paper.engine import apply_slippage, round_lots
+from ashare_lab.paper.fees import calculate_fees
+from ashare_lab.paper.ledger import (
+    get_connection,
+    get_positions_for_date,
+    init_schema,
+)
+from ashare_lab.paper.pipeline import (
+    _fetch_csi1000_closes_for_timing,
+    _run_book_b,
+    _step12_book_b,
+)
 
 
 @pytest.fixture(autouse=True)
 def _cd_tmp_path(tmp_path, monkeypatch):
     """Run each test in its own tmp_path so artifact I/O is isolated."""
     monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _clear_timing_cache():
+    """Clear the CSI1000 fetch cache so memoization tests are order-independent."""
+    if hasattr(_fetch_csi1000_closes_for_timing, "_cache"):
+        delattr(_fetch_csi1000_closes_for_timing, "_cache")
+    yield
 
 
 def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
@@ -58,7 +77,10 @@ def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
         topk_override=None,
         cooldown_entries={},
     )
-    ctx.prices = {"SH600519": {"close": 180.0}}
+    # volume must be present and positive, otherwise settle_buy_orders
+    # reads volume=0.0, flags the symbol suspended, and carries every
+    # buy order instead of filling it.
+    ctx.prices = {"SH600519": {"close": 180.0, "volume": 10_000_000.0}}
     ctx.pred_path = pred_path
     ctx.universe_symbols = ["SH600519"]
     ctx.ipo_listing_syms = set()
@@ -80,15 +102,20 @@ def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
     return ctx
 
 
-def _init_prod_and_book_b_db(tmp_path, book_id="none", cash=300000.0):
-    """Create production DB and bootstrapped Book B DB with cash state."""
+def _init_prod_and_book_b_db(tmp_path, book_id="none", cash=1_000_000.0):
+    """Create production DB and bootstrapped Book B DB with real nav state.
+
+    get_latest_cash reads the nav table, not paper_state, so the seed cash
+    must land in nav for the fixture state to be effective.
+    """
     prod_db = tmp_path / "paper.db"
     conn = sqlite3.connect(str(prod_db))
     conn.row_factory = sqlite3.Row
     init_schema(conn)
     conn.execute(
-        "INSERT OR IGNORE INTO paper_state (key, value) VALUES (?, ?)",
-        ("cash", str(cash)),
+        "INSERT OR REPLACE INTO nav (trade_date, cash, market_value, total_nav) "
+        "VALUES (?, ?, ?, ?)",
+        ("2026-07-01", cash, 0.0, cash),
     )
     conn.commit()
     conn.close()
@@ -97,12 +124,35 @@ def _init_prod_and_book_b_db(tmp_path, book_id="none", cash=300000.0):
     conn_b = get_connection(book_b_db)
     init_schema(conn_b)
     conn_b.execute(
-        "INSERT OR IGNORE INTO paper_state (key, value) VALUES (?, ?)",
-        ("cash", str(cash)),
+        "INSERT OR REPLACE INTO nav (trade_date, cash, market_value, total_nav) "
+        "VALUES (?, ?, ?, ?)",
+        ("2026-07-01", cash, 0.0, cash),
     )
     conn_b.commit()
     conn_b.close()
     return prod_db, book_b_db
+
+
+def _record_book_state(conn, trade_date, cash, positions):
+    """Record a settled Book state into nav + positions tables.
+
+    positions: list of (symbol, qty, avg_cost, market_value)
+    """
+    market_value = sum(p[3] for p in positions)
+    total_nav = cash + market_value
+    conn.execute(
+        "INSERT OR REPLACE INTO nav (trade_date, cash, market_value, total_nav) "
+        "VALUES (?, ?, ?, ?)",
+        (trade_date, cash, market_value, total_nav),
+    )
+    conn.execute("DELETE FROM positions WHERE trade_date = ?", (trade_date,))
+    for symbol, qty, avg_cost, mv in positions:
+        conn.execute(
+            "INSERT INTO positions (trade_date, symbol, qty, avg_cost, market_value, buy_date) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (trade_date, symbol, qty, avg_cost, mv, trade_date),
+        )
+    conn.commit()
 
 
 def _make_pred_path(tmp_path, trade_date):
@@ -179,22 +229,74 @@ class TestR3Canary:
     """book_id='none' with m=1.0 reproduces Book A NAV to the cent."""
 
     def test_none_book_b_nav_matches_book_a_with_m_one(self, tmp_path):
-        trade_date = "2026-07-22"
-        next_td = dt.date.fromisoformat(trade_date) + dt.timedelta(days=1)
-        _init_prod_and_book_b_db(tmp_path, "none")
-        pred_path = _make_pred_path(tmp_path, trade_date)
-        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+        """Two-day settle path: Book B must mirror Book A's actual position state.
 
-        with patch("ashare_lab.paper.pipeline.next_trading_day", return_value=next_td), \
+        Day 1 generates a buy order; Day 2 settles it. Book A's day-2 state
+        is recorded with the same slippage/fee math the settle path applies,
+        so its post-trade NAV sits below the initial cash. A Book B that
+        stops trading keeps its NAV at initial cash and holds no position --
+        both the NAV equality and the position assertion below must then
+        fail (PM injection: delete the Book B buy-order insert).
+        """
+        d1 = "2026-07-21"
+        d2 = "2026-07-22"
+        d3 = "2026-07-23"
+        cash_d1 = 1_000_000.0
+        price = 180.0
+        slippage = 0.001
+        risk_degree = 0.95
+        topk = 15
+
+        # Expected Book B fill, derived with the same production helpers the
+        # settle path uses (buy rounding, directional slippage, fee schedule).
+        # This keeps Book A's recorded state consistent "to the cent" with
+        # what settle_day will produce, without duplicating their math.
+        target_value = cash_d1 * risk_degree / topk  # m=1.0
+        qty = round_lots(target_value / price, "buy")
+        fill_price = apply_slippage(price, "buy", slippage)
+        fees = calculate_fees(fill_price * qty, "buy").total
+        market_value = qty * price
+        cash_d2 = cash_d1 - fill_price * qty - fees
+        nav_d2 = cash_d2 + market_value  # < cash_d1: fees+slippage are real
+
+        _init_prod_and_book_b_db(tmp_path, "none", cash=cash_d1)
+        prod_conn = sqlite3.connect(str(tmp_path / "paper.db"))
+        prod_conn.row_factory = sqlite3.Row
+        # Record Book A's settled day-2 state in production DB.
+        _record_book_state(
+            prod_conn, d2, cash_d2, [("SH600519", qty, fill_price, market_value)],
+        )
+        prod_conn.close()
+
+        pred_path = _make_pred_path(tmp_path, d1)
+        ctx_d1 = _make_ctx(tmp_path, d1, pred_path, book_a_nav=cash_d1)
+
+        with patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d2)), \
              patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
-            _run_book_b(ctx, "none")
+            _run_book_b(ctx_d1, "none")  # generates buy order for d2
 
-        artifact_path = Path("experiments/control_books") / f"{trade_date}_none.json"
+        pred_path_d2 = _make_pred_path(tmp_path, d2)
+        ctx_d2 = _make_ctx(tmp_path, d2, pred_path_d2, book_a_nav=nav_d2)
+
+        with patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            _run_book_b(ctx_d2, "none")  # settles d1 order
+
+        artifact_path = Path("experiments/control_books") / f"{d2}_none.json"
         assert artifact_path.exists()
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         assert artifact["book_id"] == "none"
         assert artifact["m"] == 1.0
         assert artifact["nav_a"] == artifact["nav_b"]
+
+        # Book B must have reached that NAV by trading: its settled d2
+        # snapshot has to hold the same position Book A recorded. If the
+        # buy-order insertion is broken, nothing ever fills and this fails.
+        book_conn = get_connection(tmp_path / "paper_b_none.db")
+        b_positions = get_positions_for_date(book_conn, d2)
+        assert set(b_positions) == {"SH600519"}
+        assert b_positions["SH600519"]["qty"] == qty
+        book_conn.close()
 
     def test_m_scaling_changes_target_value(self, tmp_path):
         """m=0.5 produces roughly half the buy qty of m=1.0.
@@ -207,10 +309,11 @@ class TestR3Canary:
         trade_date = "2026-07-22"
         next_td = dt.date.fromisoformat(trade_date) + dt.timedelta(days=1)
 
-        def run_with_m(m):
-            _init_prod_and_book_b_db(tmp_path, f"n1_m{int(m * 10)}")
-            pred_path = _make_pred_path(tmp_path, trade_date)
-            ctx = _make_ctx(tmp_path, trade_date, pred_path)
+        def run_with_m(m, sub_tmp):
+            sub_tmp.mkdir(parents=True, exist_ok=True)
+            _init_prod_and_book_b_db(sub_tmp, "n1")
+            pred_path = _make_pred_path(sub_tmp, trade_date)
+            ctx = _make_ctx(sub_tmp, trade_date, pred_path)
             captured = []
 
             def capture_insert_order(conn, trade_date, symbol, side, target_qty, *args, **kwargs):
@@ -224,8 +327,8 @@ class TestR3Canary:
                 _run_book_b(ctx, "n1")
             return captured
 
-        full = run_with_m(1.0)
-        half = run_with_m(0.5)
+        full = run_with_m(1.0, tmp_path / "full")
+        half = run_with_m(0.5, tmp_path / "half")
         assert full and half
         # Round lots (100-share) make the ratio approximate; the important
         # property is that m=0.5 yields strictly less buy exposure than m=1.0.
@@ -256,6 +359,61 @@ class TestMemoization:
             _step12_book_b(ctx)
 
         assert mock_run.call_count == 1
+
+    def test_fetch_failure_cached_as_none(self, tmp_path):
+        """A failing CSI1000 fetch is cached as None and not retried per book.
+
+        All books must fall back to m=1.0 (timing_multiplier fail-open).
+        """
+        trade_date = "2026-07-25"
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        for book_id in ("none", "n1", "n2", "n3"):
+            _init_prod_and_book_b_db(tmp_path, book_id)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        with patch("ashare_lab.paper.pipeline.subprocess.run") as mock_run, \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            mock_run.return_value.returncode = 1
+            mock_run.return_value.stdout = ""
+            _step12_book_b(ctx)
+
+        assert mock_run.call_count == 1
+
+        for book_id in ("none", "n1", "n2", "n3"):
+            artifact_path = Path("experiments/control_books") / f"{trade_date}_{book_id}.json"
+            assert artifact_path.exists(), f"missing artifact for {book_id}"
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            assert artifact["book_id"] == book_id
+            assert artifact["m"] == 1.0
+
+    def test_fetch_exception_cached_as_none(self, tmp_path):
+        """A raising CSI1000 fetch is cached as None and not retried per book.
+
+        subprocess.run raising (timeout/spawn failure) must take the same
+        memoized-None path as a non-zero returncode: one fetch attempt
+        across all four books, all failing open at m=1.0.
+        """
+        trade_date = "2026-07-25"
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        for book_id in ("none", "n1", "n2", "n3"):
+            _init_prod_and_book_b_db(tmp_path, book_id)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        with patch(
+            "ashare_lab.paper.pipeline.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="qlib-fetch", timeout=120),
+        ) as mock_run, \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+            _step12_book_b(ctx)
+
+        assert mock_run.call_count == 1
+
+        for book_id in ("none", "n1", "n2", "n3"):
+            artifact_path = Path("experiments/control_books") / f"{trade_date}_{book_id}.json"
+            assert artifact_path.exists(), f"missing artifact for {book_id}"
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            assert artifact["book_id"] == book_id
+            assert artifact["m"] == 1.0
 
 
 # -- Contract 5: artifact shape -----------------------------------------------
