@@ -24,7 +24,7 @@ from ashare_lab.paper.ledger import (
     init_schema,
     insert_order,
 )
-from ashare_lab.paper.pipeline import _run_book_b
+from ashare_lab.paper.pipeline import _bootstrap_book_b, _run_book_b
 
 
 # ---------------------------------------------------------------------------
@@ -289,39 +289,35 @@ class TestBookBRunRecord:
         )
 
     def test_book_b_settle_visible_same_day(self, tmp_path):
-        """Settled positions must be visible to order generation on T+1.
+        """Settled positions visible to order generation on the SAME day.
 
-        Day T: pending buy for X settles via the real settle_day path.
-        Day T+1: order generation runs with REAL signals.  X must appear
-        in held_set (it was bought on T), so no duplicate buy for T+1.
+        Production runs _run_book_b exactly ONCE per day.  At the post-settle
+        reload (pipeline.py:2060), record_run has NOT yet been called for
+        today (it runs at line 2177), so get_latest_positions still anchors
+        on yesterday.  Using get_positions_for_date(T) instead is critical:
+        injection C (swap to get_latest_positions) causes a duplicate buy
+        because held_set misses the just-settled position.
 
-        NOTE on injection C (swap post-settle reload to
-        get_latest_positions): this injection does NOT fail test 4
-        because settle_day always writes a T+1 snapshot using
-        current_positions from the initial load (get_latest_positions),
-        so both get_positions_for_date(T+1) and get_latest_positions
-        return the same data.  The divergence only manifests on no-order
-        days where settle_day is skipped entirely (injection B), which
-        test 2 already covers.
+        This test mirrors the production single-run shape:
+        1. Bootstrap the Book B DB directly (no _run_book_b, so no
+           record_run(T) -- this is what the old test masked by calling
+           _run_book_b for bootstrap, which advanced the anchor to T).
+        2. Seed position + pending buy for SH600519 on day T.
+        3. Run _run_book_b ONCE on day T with real signals containing X.
+        4. Assert: NO pending buy for SH600519 with trade_date > T
+           (the duplicate-buy check).
+        5. Assert: the day-T buy settled (filled) so the scenario is honest.
         """
-        from datetime import date as dt_date
-
-        from ashare_lab.data.calendar import next_trading_day
-
         day_t = "2026-08-15"
-        day_t1 = next_trading_day(dt_date.fromisoformat(day_t)).isoformat()
         _init_prod_db(tmp_path)
         pred_t = _make_pred_path(tmp_path, day_t)
-        pred_t1 = _make_pred_path(tmp_path, day_t1)
         ctx_t = _make_ctx(tmp_path, day_t, pred_t)
-        ctx_t1 = _make_ctx(tmp_path, day_t1, pred_t1)
 
         book_db = tmp_path / "paper_b_none.db"
 
-        # Bootstrap the Book B DB.
-        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
-             patch("ashare_lab.paper.signal.generate_signals", return_value={}):
-            _run_book_b(ctx_t, "none")
+        # Bootstrap the Book B DB directly -- no _run_book_b call, so no
+        # record_run(T).  This matches production before the first daily run.
+        _bootstrap_book_b(ctx_t.db_path, book_db)
 
         # Seed position + pending buy for SH600519 on day T.
         conn_b = get_connection(book_db)
@@ -332,39 +328,39 @@ class TestBookBRunRecord:
         # generate_signals returns both symbols with real scores.
         real_signals = {"SH600519": 0.9, "SH601318": 0.7}
 
-        # Day T: settle the buy via the real settle_day path.
+        # Single day-T run: settle the buy + generate next-day orders.
+        # Under injection C (get_latest_positions at 2060), held_set misses
+        # SH600519 because the anchor still points at yesterday (no
+        # record_run yet), so order generation emits a duplicate buy for T+1.
         with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
              patch("ashare_lab.paper.signal.generate_signals", return_value=real_signals):
             _run_book_b(ctx_t, "none")
 
-        # Day T+1: order generation runs with real signals.  No pending
-        # orders remain (the buy was settled on T), so this is a pure
-        # order-generation day.
-        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
-             patch("ashare_lab.paper.signal.generate_signals", return_value=real_signals):
-            _run_book_b(ctx_t1, "none")
-
         conn_b = get_connection(book_db)
 
-        # Exactly ONE buy order for SH600519 total (the settled one from T).
-        buy_orders_519 = conn_b.execute(
-            "SELECT id, trade_date, status FROM orders "
-            "WHERE symbol = 'SH600519' AND side = 'buy'",
-        ).fetchall()
-        assert len(buy_orders_519) == 1, (
-            f"expected 1 buy order for SH600519, got {len(buy_orders_519)}: "
-            f"{[dict(r) for r in buy_orders_519]}"
+        # The day-T buy must have settled (filled).
+        settled_buy = conn_b.execute(
+            "SELECT trade_date, status, target_qty FROM orders "
+            "WHERE symbol = 'SH600519' AND side = 'buy' AND trade_date = ?",
+            (day_t,),
+        ).fetchone()
+        assert settled_buy is not None, (
+            f"no buy order for SH600519 on {day_t} -- settle_day did not fill"
+        )
+        assert settled_buy["status"] == "filled", (
+            f"day-T buy status={settled_buy['status']}, expected 'filled'"
         )
 
-        # No NEW pending buy for SH600519 with trade_date = day_t1.
+        # Duplicate-buy check: NO pending buy for SH600519 with trade_date > T.
         dup = conn_b.execute(
-            "SELECT id FROM orders "
+            "SELECT id, trade_date, status FROM orders "
             "WHERE symbol = 'SH600519' AND side = 'buy' "
-            "AND trade_date = ? AND status = 'pending'",
-            (day_t1,),
+            "AND trade_date > ? AND status = 'pending'",
+            (day_t,),
         ).fetchall()
         assert len(dup) == 0, (
-            f"duplicate pending buy for SH600519 on {day_t1}: {dup}"
+            f"duplicate pending buy for SH600519 after single day-T run: "
+            f"{[dict(r) for r in dup]}"
         )
 
         conn_b.close()
