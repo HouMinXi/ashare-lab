@@ -268,3 +268,72 @@ class TestBookBRunRecord:
         assert "SH600519" not in positions, (
             f"SH600519 resurrected after sell; positions={positions}"
         )
+
+    def test_book_b_settle_visible_same_day(self, tmp_path):
+        """Settled positions must be visible to same-day order generation.
+
+        If a buy for symbol X settles on day T, X must appear in held_set
+        when T's orders are generated, preventing a duplicate buy for T+1.
+        Conversely, a symbol sold on T must NOT appear in held_set, so no
+        stale sell order is generated for T+1.
+
+        This catches the divergence where post-settle reload used
+        get_latest_positions (anchor = yesterday) instead of
+        get_positions_for_date (exact today).
+        """
+        trade_date = "2026-08-15"
+        _init_prod_db(tmp_path)
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        book_db = tmp_path / "paper_b_none.db"
+
+        # Bootstrap + seed a position (simulate "already held from yesterday")
+        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={}):
+            _run_book_b(ctx, "none")
+
+        conn_b = get_connection(book_db)
+        _seed_position(conn_b, trade_date, "SH600519", qty=100, avg_cost=180.0)
+        # Pending sell for SH600519 -- should settle today
+        _seed_sell_order(conn_b, trade_date, "SH600519", qty=100)
+        # Also seed a buy for SH601318 -- should settle today
+        _seed_buy_order(conn_b, trade_date, "SH601318", qty=200)
+        conn_b.execute(
+            "INSERT OR REPLACE INTO runs (trade_date, status, started_at) "
+            "VALUES (?, 'settled', datetime('now'))",
+            (trade_date,),
+        )
+        conn_b.commit()
+        conn_b.close()
+
+        # Now run _run_book_b again on the SAME trade_date.
+        # settle_day fills the sell of SH600519 and buy of SH601318.
+        # With get_positions_for_date, order generation sees:
+        #   - SH600519 is GONE (sold) -> no sell order for T+1
+        #   - SH601318 is HELD (bought) -> present in held_set, no dup buy
+        # With get_latest_positions (the bug), it would see yesterday's
+        # snapshot: SH600519 still held, SH601318 absent.
+        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={}):
+            _run_book_b(ctx, "none")
+
+        conn_b = get_connection(book_db)
+        # Check orders generated for the NEXT trading day
+        next_td = "2026-08-18"  # next trading day after 08-15
+        orders = conn_b.execute(
+            "SELECT symbol, side FROM orders WHERE trade_date = ?",
+            (next_td,),
+        ).fetchall()
+        conn_b.close()
+
+        order_map = {r["symbol"]: r["side"] for r in orders}
+
+        # SH600519 was sold today -- must NOT get a new sell order
+        assert order_map.get("SH600519") != "sell", (
+            f"SH600519 got a stale sell order after being sold: {order_map}"
+        )
+        # SH601318 was bought today -- must NOT get a duplicate buy order
+        assert order_map.get("SH601318") != "buy", (
+            f"SH601318 got a duplicate buy order: {order_map}"
+        )

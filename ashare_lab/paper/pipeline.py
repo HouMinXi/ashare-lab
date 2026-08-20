@@ -2025,7 +2025,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # Load Book B state
         from ashare_lab.paper.ledger import (  # noqa: PLC0415
             get_latest_positions, get_latest_cash, get_cooldowns,
-            delete_expired_cooldowns, record_run,
+            delete_expired_cooldowns, get_positions_for_date, record_run,
         )
         from ashare_lab.paper.risk import manage_trailing_cooldown  # noqa: PLC0415
         book_positions = get_latest_positions(book_conn)
@@ -2054,7 +2054,10 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         )
         # Reload post-settle state (needed even when pending_orders is
         # empty: settle_day still reprices and snapshots positions).
-        book_positions = get_latest_positions(book_conn)
+        # Exact-date read, not get_latest_positions: record_run hasn't
+        # marked today settled yet, so the "latest settled" anchor would
+        # still resolve to yesterday (mirrors Book A at _step8_settle).
+        book_positions = get_positions_for_date(book_conn, ctx.trade_date)
         book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
 
         # Compute Book B NAV from post-settle state
