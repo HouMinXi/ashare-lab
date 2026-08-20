@@ -167,6 +167,11 @@ def settle_day(
 
     Processes sell orders before buy orders (D-26).  All DB mutations
     happen inside a single transaction (``with conn:``).
+
+    Contract: update_positions_post_trade must write the day-T
+    positions+nav snapshot even when pending_orders is empty, because
+    Book B's settled progress and its get_latest_positions anchor
+    depend on it.
     """
     from ashare_lab.paper.engine_settle import (
         settle_sell_orders,

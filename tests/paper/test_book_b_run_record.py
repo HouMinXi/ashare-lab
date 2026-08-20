@@ -13,8 +13,11 @@ to catch regressions in the actual wiring.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sqlite3
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import pandas as pd
 
@@ -286,6 +289,57 @@ class TestBookBRunRecord:
         conn_b.close()
         assert "SH600519" not in positions, (
             f"SH600519 resurrected after sell; positions={positions}"
+        )
+
+    def test_book_b_failed_record_run_leaves_anchor(self, tmp_path):
+        """When record_run raises, artifact is already committed but no runs
+        row exists for T -- anchor stays at T-1 and next run re-anchors cleanly.
+
+        Injection proof: patching ashare_lab.paper.ledger.record_run (the
+        lazy-imported target at pipeline.py:2028) to raise RuntimeError
+        triggers the failure window.  If the patch target is wrong (a no-op
+        location), this test would PASS instead of FAIL.
+        """
+        trade_date = "2026-08-15"
+        _init_prod_db(tmp_path)
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        book_db = tmp_path / "paper_b_none.db"
+        _bootstrap_book_b(ctx.db_path, book_db)
+
+        # Clean pre-existing artifact so the assertion tests *this* run's write
+        artifact = Path("experiments/control_books") / f"{trade_date}_none.json"
+        artifact.unlink(missing_ok=True)
+
+        conn_b = get_connection(book_db)
+        _seed_buy_order(conn_b, trade_date, "SH600519", qty=100)
+        conn_b.close()
+
+        # Patch the lazy-imported record_run to raise -- this is the real
+        # call site: pipeline.py:2028 imports it, pipeline.py:2177 calls it.
+        with patch("ashare_lab.paper.ledger.record_run", side_effect=RuntimeError("DB write failure")), \
+             patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+             patch("ashare_lab.paper.signal.generate_signals", return_value={}):
+            with pytest.raises(RuntimeError, match="DB write failure"):
+                _run_book_b(ctx, "none")
+
+        # (b) A/B/C artifact already committed before the failure
+        artifact = Path("experiments/control_books") / f"{trade_date}_none.json"
+        assert artifact.exists(), (
+            f"artifact {artifact} should exist -- it was committed before "
+            f"record_run raised"
+        )
+
+        # (c) runs table has NO row for trade_date T
+        conn_b = get_connection(book_db)
+        row = conn_b.execute(
+            "SELECT status FROM runs WHERE trade_date = ?", (trade_date,)
+        ).fetchone()
+        conn_b.close()
+        assert row is None, (
+            f"runs table should have no row for {trade_date} after "
+            f"record_run failure, but found: {row}"
         )
 
     def test_book_b_settle_visible_same_day(self, tmp_path):
