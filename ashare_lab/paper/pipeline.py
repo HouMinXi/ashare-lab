@@ -2025,7 +2025,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # Load Book B state
         from ashare_lab.paper.ledger import (  # noqa: PLC0415
             get_latest_positions, get_latest_cash, get_cooldowns,
-            delete_expired_cooldowns,
+            delete_expired_cooldowns, record_run,
         )
         from ashare_lab.paper.risk import manage_trailing_cooldown  # noqa: PLC0415
         book_positions = get_latest_positions(book_conn)
@@ -2048,14 +2048,14 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
             ).fetchall()
         ]
 
-        if pending_orders:
-            settle_day(
-                book_conn, ctx.trade_date, pending_orders, ctx.prices,
-                book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
-            )
-            # Reload post-settle state
-            book_positions = get_latest_positions(book_conn)
-            book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
+        settle_day(
+            book_conn, ctx.trade_date, pending_orders, ctx.prices,
+            book_positions, book_cash, set(), ctx.benchmarks, ctx.config,
+        )
+        # Reload post-settle state (needed even when pending_orders is
+        # empty: settle_day still reprices and snapshots positions).
+        book_positions = get_latest_positions(book_conn)
+        book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
 
         # Compute Book B NAV from post-settle state
         book_total_nav = sum(
@@ -2168,6 +2168,12 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         _write_abc_artifact(ctx, book_conn, book_id, m)
 
         book_conn.commit()
+
+        # Mark the run settled *after* the artifact write and commit so
+        # that an exception mid-run leaves the anchor un-advanced.
+        record_run(book_conn, ctx.trade_date, "settled")
+        book_conn.commit()
+
         logger.info("[book_b] completed for %s (m=%.1f, book_id=%s)", ctx.trade_date, m, book_id)
     finally:
         book_conn.close()
@@ -2208,8 +2214,8 @@ def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float)
     nav_a = ctx.total_nav
 
     # Book B NAV -- use get_positions_for_date (not get_latest_positions)
-    # because book_b never calls record_run, so "latest settled" resolves
-    # to yesterday.  We need today's post-settle positions.
+    # because record_run hasn't marked today settled yet at this point
+    # in the pipeline, so "latest settled" resolves to yesterday.
     book_positions = get_positions_for_date(book_conn, ctx.trade_date)
     book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
     nav_b = sum(pos["market_value"] for pos in book_positions.values()) + book_cash
