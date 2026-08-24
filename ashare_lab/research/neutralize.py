@@ -1,15 +1,17 @@
 """Factor/style neutralization for prediction scores.
 
 Implements Barra-style cross-sectional neutralization: regress prediction
-scores against Size, Volatility, and Momentum factors, then use residuals
-as the neutralized alpha signal for Top-K portfolio construction.
+scores against Size, Volatility, and Momentum factors using a Huber
+M-estimator for robustness, then use residuals as the neutralized alpha
+signal for Top-K portfolio construction.
 
 All qlib imports are deferred inside function bodies so this module is
 importable without a qlib runtime (required for unit test isolation).
 
 Exports:
+    huber_m_estimator: Iteratively reweighted least squares robust regression.
     compute_style_factors: Fetch and z-score normalize style factors.
-    neutralize_predictions: Cross-sectional OLS neutralization per date.
+    neutralize_predictions: Cross-sectional robust neutralization per date.
 """
 
 from __future__ import annotations
@@ -20,6 +22,70 @@ import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
+
+
+def huber_m_estimator(
+    X: np.ndarray,
+    y: np.ndarray,
+    c: float = 1.345,
+    max_iter: int = 30,
+    tol: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Huber M-estimator: iteratively reweighted least squares.
+
+    Robust regression that downweights outliers using Huber's loss
+    function. Converges when the maximum coefficient change falls
+    below ``tol`` or ``max_iter`` is reached.
+
+    Args:
+        X: Design matrix (n, p). Intercept column should be included.
+        y: Response vector (n,).
+        c: Tuning constant for Huber loss (default 1.345 gives 95%
+            efficiency at the normal).
+        max_iter: Maximum number of IRLS iterations.
+        tol: Convergence tolerance on max abs coefficient change.
+
+    Returns:
+        Tuple of (beta, residuals, weights) where beta is the
+        coefficient vector, residuals = y - X @ beta, and weights
+        are the IRLS weights (ones for OLS-equivalent case).
+    """
+    try:
+        beta_ols, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        beta = beta_ols
+
+        for _ in range(max_iter):
+            e = y - X @ beta
+            mad = np.median(np.abs(e - np.median(e)))
+            sigma_hat = mad / 0.6745
+
+            if sigma_hat < 1e-8:
+                return beta, e, np.ones_like(y, dtype=np.float64)
+
+            r = e / sigma_hat
+            weights = np.where(np.abs(r) <= c, 1.0, c / np.abs(r))
+
+            X_w = X * np.sqrt(weights[:, np.newaxis])
+            y_w = y * np.sqrt(weights)
+            beta_new, _, _, _ = np.linalg.lstsq(X_w, y_w, rcond=None)
+
+            if np.max(np.abs(beta_new - beta)) < tol:
+                beta = beta_new
+                e = y - X @ beta
+                return beta, e, weights
+
+            beta = beta_new
+
+        # max_iter reached without convergence -- fall back to OLS
+        log.warning("huber_m_estimator: did not converge after %d iterations", max_iter)
+        e_ols = y - X @ beta_ols
+        return beta_ols, e_ols, np.ones_like(y, dtype=np.float64)
+
+    except Exception:
+        log.warning("huber_m_estimator: exception during estimation; falling back to OLS", exc_info=True)
+        beta_ols, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        return beta_ols, y - X @ beta_ols, np.ones_like(y, dtype=np.float64)
+
 
 # Minimum instruments per date to run cross-sectional regression.
 # With 3 regressors + intercept, fewer than 30 observations produces
@@ -113,9 +179,9 @@ def neutralize_predictions(
     pred: pd.Series,
     factors: pd.DataFrame,
 ) -> pd.Series:
-    """Cross-sectional OLS neutralization of predictions against style factors.
+    """Cross-sectional Huber-robust neutralization of predictions against style factors.
 
-    For each date, runs OLS regression:
+    For each date, runs a Huber M-estimator regression:
         pred_i = alpha + beta_size * Size_i + beta_vol * Vol_i
                  + beta_mom * Mom_i + residual_i
 
@@ -178,7 +244,7 @@ def neutralize_predictions(
             results.append(pd.Series(pred_cs.values, index=idx, dtype=float))
             continue
 
-        # OLS via numpy.linalg.lstsq: y = X @ beta, residuals = y - X @ beta.
+        # Huber robust regression: y = X @ beta, residuals = y - X @ beta.
         y = pred_valid.values.astype(np.float64)
         x_mat = np.column_stack([
             np.ones(len(pred_valid)),  # intercept
@@ -187,9 +253,15 @@ def neutralize_predictions(
             factors_valid["momentum"].values,
         ]).astype(np.float64)
 
-        beta, _, _, _ = np.linalg.lstsq(x_mat, y, rcond=None)
-        fitted = x_mat @ beta
-        residuals = y - fitted
+        beta, residuals, weights = huber_m_estimator(x_mat, y)
+
+        downweight_ratio = np.mean(weights < 0.95)
+        if downweight_ratio > 0.10:
+            log.info(
+                "Neutralization on %s: %.1f%% instruments downweighted by Huber robust estimator",
+                date,
+                downweight_ratio * 100,
+            )
 
         # Build result for valid instruments only.
         idx = pd.MultiIndex.from_tuples(
