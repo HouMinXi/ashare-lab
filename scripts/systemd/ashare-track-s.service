@@ -1,0 +1,13 @@
+[Unit]
+Description=ashare-lab Track S dynamic-slippage replay (R6)
+After=ashare-pipeline.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/houminxi/code/ashare-lab
+ExecStart=/home/houminxi/code/ashare-lab/scripts/ashare-track-s.sh
+Environment=PATH=/home/houminxi/code/ashare-lab/.venv/bin:/home/houminxi/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=/home/houminxi/code/ashare-lab/.venv
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,9 @@
+[Unit]
+Description=ashare-lab Track S replay (19:30 CST)
+
+[Timer]
+OnCalendar=*-*-* 19:30:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target
