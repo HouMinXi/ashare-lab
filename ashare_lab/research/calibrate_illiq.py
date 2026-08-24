@@ -217,10 +217,25 @@ def calibrate(
     provider_uri: str | None = None,
 ) -> dict[str, Any]:
     """Run full ILLIQ calibration pipeline and write artifact."""
-    from ashare_lab.data.calendar import get_qlib_calendar
+    import qlib
+    from qlib.data import D
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
-    cal = get_qlib_calendar()
-    cal_dates = sorted(cal)
+    uri = provider_uri or str(DEFAULT_PROVIDER_URI)
+    try:
+        qlib.init(provider_uri=uri)
+    except Exception:
+        pass
+
+    try:
+        cal = D.calendar(start_time="2020-01-01", end_time=end_date)
+        cal_dates = sorted([str(d)[:10] for d in cal])
+    except Exception as e:
+        logger.error("Failed to fetch qlib calendar: %s", e)
+        cal_dates = []
+
+    if not cal_dates:
+        raise RuntimeError("No trading dates found in qlib calendar")
     try:
         end_idx = cal_dates.index(end_date)
     except ValueError:
