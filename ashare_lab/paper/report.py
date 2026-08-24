@@ -737,26 +737,29 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
     # --- Fallback: serverchan / pushplus registry ---
     fb_name = rcfg.get("fallback_service", "serverchan")
 
-    logger.info("[deliver] trying fallback=%s", fb_name)
-    fb_entry = _FALLBACK_PUSH.get(fb_name)
-    if fb_entry:
-        pass_key, fn_name = fb_entry
-        send_fn = globals()[fn_name]
-        try:
-            fb_token = _get_secret(pass_key)
-            if send_fn(fb_token, f"A股日报 {trade_date}", report_text, rcfg.get("fallback_timeout", 15)):
-                conn.execute(
-                    "UPDATE reports SET delivery_status='sent', delivered_via=? "
-                    "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
-                    (fb_name, trade_date, mode),
-                )
-                conn.commit()
-                logger.info("[deliver] fallback %s succeeded", fb_name)
-                return "sent"
-        except Exception as e:
-            logger.warning("[deliver] fallback %s failed: %s", fb_name, e)
+    if not fb_name:
+        logger.info("[deliver] no fallback_service configured, skipping fallback")
     else:
-        logger.warning("unknown fallback_service '%s', skipping fallback", fb_name)
+        logger.info("[deliver] trying fallback=%s", fb_name)
+        fb_entry = _FALLBACK_PUSH.get(fb_name)
+        if fb_entry:
+            pass_key, fn_name = fb_entry
+            send_fn = globals()[fn_name]
+            try:
+                fb_token = _get_secret(pass_key)
+                if send_fn(fb_token, f"A股日报 {trade_date}", report_text, rcfg.get("fallback_timeout", 15)):
+                    conn.execute(
+                        "UPDATE reports SET delivery_status='sent', delivered_via=? "
+                        "WHERE trade_date=? AND mode=? AND delivery_status='pending'",
+                        (fb_name, trade_date, mode),
+                    )
+                    conn.commit()
+                    logger.info("[deliver] fallback %s succeeded", fb_name)
+                    return "sent"
+            except Exception as e:
+                logger.warning("[deliver] fallback %s failed: %s", fb_name, e)
+        else:
+            logger.warning("unknown fallback_service '%s', skipping fallback", fb_name)
 
     conn.execute(
         "UPDATE reports SET delivery_status='failed' "

@@ -13,7 +13,9 @@ GPU_USER="admin"
 QLIB_DIR="$HOME/.qlib/qlib_data"
 
 sync_gpu_data() {
-    local tarball="/tmp/cn_data_sync.tar.gz"
+    local sync_dir="${HOME}/.cache/ashare-sync"
+    mkdir -p "$sync_dir"
+    local tarball="${sync_dir}/cn_data_sync.tar.gz"
     trap 'rm -f "$tarball"' RETURN
 
     if ! tar czf "$tarball" -C "$QLIB_DIR" cn_data; then

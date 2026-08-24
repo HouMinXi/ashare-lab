@@ -56,10 +56,33 @@ class TestSyncHappyPath:
             ssh() {{ return 0; }}
             export -f scp ssh
             sync_gpu_data
-            [ ! -f /tmp/cn_data_sync.tar.gz ] && echo CLEANED
+            [ ! -f "$HOME/.cache/ashare-sync/cn_data_sync.tar.gz" ] && [ ! -f /tmp/cn_data_sync.tar.gz ] && echo CLEANED
         """))
         assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
         assert "CLEANED" in r.stdout
+
+
+class TestSyncScratchLocation:
+    def test_tar_uses_disk_cache_not_tmp(self, tmp_path):
+        """Verify tar command targets ~/.cache/ashare-sync and not /tmp."""
+        log = tmp_path / "tar_target.log"
+        r = _run(textwrap.dedent(f"""\
+            QLIB_DIR=$(mktemp -d)
+            mkdir -p "$QLIB_DIR/cn_data"
+            touch "$QLIB_DIR/cn_data/dummy.bin"
+            tar() {{
+                echo "$2" > {log}
+                command tar "$@"
+            }}
+            scp() {{ return 0; }}
+            ssh() {{ return 0; }}
+            export -f tar scp ssh
+            sync_gpu_data
+        """))
+        assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
+        target = log.read_text().strip()
+        assert target.endswith(".cache/ashare-sync/cn_data_sync.tar.gz")
+        assert not target.startswith("/tmp/cn_data_sync.tar.gz")
 
 
 class TestSyncTarFailure:
