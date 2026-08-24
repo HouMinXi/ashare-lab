@@ -42,8 +42,11 @@ def fetch_qlib_bars_df(
     provider_uri: str | None = None,
 ) -> Any:
     """Fetch daily OHLCV bars from qlib as pandas DataFrame."""
-    import qlib
-    from qlib.data import D
+    try:
+        import qlib
+        from qlib.data import D
+    except ImportError as e:
+        raise ImportError(f"Failed to import qlib for ILLIQ calibration: {e}") from e
 
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 

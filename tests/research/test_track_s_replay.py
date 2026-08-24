@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -21,6 +22,7 @@ import pytest
 from ashare_lab.research.calibrate_illiq import (
     compute_illiq_from_df,
     compute_quintile_bands,
+    fetch_qlib_bars_df,
     gate_4_health_check,
 )
 from ashare_lab.research.track_s_replay import (
@@ -31,6 +33,7 @@ from ashare_lab.research.track_s_replay import (
     S2Amihud,
     S3Banded,
     TrackTrade,
+    fetch_qlib_prices,
     gate_1_check,
     get_model,
     init_shadow_db,
@@ -165,7 +168,7 @@ class TestSlippageModels:
     def test_get_model_factory(self) -> None:
         m0 = get_model("S0")
         assert isinstance(m0, S0Fixed)
-        calib = {"per_stock": {}, "bands": {}}
+        calib = {"per_stock": {"SH600000": {"illiq": 1e-8}}, "bands": {}}
         m2 = get_model("S2", calib)
         assert isinstance(m2, S2Amihud)
         m3 = get_model("S3", calib)
@@ -422,3 +425,108 @@ class TestIlliqComputation:
         health = gate_4_health_check(per_stock, boundaries, spearman_corr=0.92)
         assert health["pass"] is True
         assert len(health["failures"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 5 P1 Review Findings Guards
+# ---------------------------------------------------------------------------
+
+
+class TestP1ReviewFindingsGuards:
+    def test_p1_1_empty_qlib_prices_raises(self) -> None:
+        """P1.1: Empty prices dict when trades exist must raise ValueError."""
+        model = S0Fixed(slippage=0.001)
+        t = TrackTrade(
+            order_id=1,
+            trade_date="2026-08-18",
+            symbol="SH600000",
+            side="buy",
+            fill_qty=1000,
+            orig_fill_price=10.01,
+            orig_commission=5.0,
+            orig_stamp=0.0,
+            orig_transfer_fee=0.1,
+        )
+        with pytest.raises(ValueError, match="Price data dictionary is empty"):
+            run_model([t], ["2026-08-18"], {}, model, initial_cash=300000.0)
+
+    def test_p1_2_oversell_raises_value_error(self) -> None:
+        """P1.2: Oversell beyond held position must raise ValueError."""
+        model = S0Fixed(slippage=0.001)
+        prices = {
+            "SH600000": {
+                "2026-08-18": {"close": 10.0, "volume": 100000.0, "change": 0.0, "factor": 1.0},
+            }
+        }
+        # Attempt to sell 1000 shares with 0 initial position
+        t_sell = TrackTrade(
+            order_id=1,
+            trade_date="2026-08-18",
+            symbol="SH600000",
+            side="sell",
+            fill_qty=1000,
+            orig_fill_price=9.99,
+            orig_commission=5.0,
+            orig_stamp=5.0,
+            orig_transfer_fee=0.1,
+        )
+        with pytest.raises(ValueError, match="Oversell detected"):
+            run_model([t_sell], ["2026-08-18"], prices, model, initial_cash=300000.0)
+
+    def test_p1_3_calibration_schema_validation(self) -> None:
+        """P1.3: S2/S3 without valid non-empty 'per_stock' schema must raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid calibration schema for model S2"):
+            get_model("S2", calibration={})
+
+        with pytest.raises(ValueError, match="Invalid calibration schema for model S3"):
+            get_model("S3", calibration={"per_stock": {}})
+
+        with pytest.raises(ValueError, match="Invalid calibration schema for model S2"):
+            S2Amihud(calibration={})
+
+        with pytest.raises(ValueError, match="Invalid calibration schema for model S3"):
+            S3Banded(calibration={"per_stock": {}})
+
+    def test_p1_4_partial_symbol_price_gap_in_nav(self) -> None:
+        """P1.4: Symbol not in prices on day 2 carries last known close price."""
+        model = S0Fixed(slippage=0.001)
+        # Day 1 has valid price for SH600000. Day 2 is missing from prices dict.
+        prices = {
+            "SH600000": {
+                "2026-08-18": {"close": 10.0, "volume": 100000.0, "change": 0.0, "factor": 1.0},
+            }
+        }
+        t_buy = TrackTrade(
+            order_id=1,
+            trade_date="2026-08-18",
+            symbol="SH600000",
+            side="buy",
+            fill_qty=1000,
+            orig_fill_price=10.01,
+            orig_commission=5.0,
+            orig_stamp=0.0,
+            orig_transfer_fee=0.1,
+        )
+        res = run_model([t_buy], ["2026-08-18", "2026-08-19"], prices, model, initial_cash=300000.0)
+        assert len(res.nav_series) == 2
+        # Day 2 should maintain position market value of 1000 * 10.0 = 10000.0 rather than 0.0
+        assert res.nav_series[1].market_value == pytest.approx(10000.0)
+
+    def test_p1_5_qlib_import_error_propagation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P1.5: qlib ImportError must propagate with clear diagnostic."""
+        import builtins
+        real_import = builtins.__import__
+
+        def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "qlib" or name.startswith("qlib."):
+                raise ImportError("No module named 'qlib'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", mock_import)
+
+        with pytest.raises(ImportError, match="Failed to import qlib for ILLIQ calibration"):
+            fetch_qlib_bars_df("2026-08-01", "2026-08-10")
+
+        with pytest.raises(ImportError, match="Failed to import qlib for Track S replay"):
+            fetch_qlib_prices(["SH600000"], "2026-08-01", "2026-08-10")
+

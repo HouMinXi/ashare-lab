@@ -152,6 +152,21 @@ class S0Fixed(SlippageModel):
         return f"Fixed slippage {self._slippage}"
 
 
+def _validate_calibration_schema(calibration: dict | None, model_name: str) -> None:
+    """Validate calibration schema for models requiring calibration data."""
+    if not isinstance(calibration, dict):
+        raise ValueError(
+            f"Invalid calibration schema for model {model_name}: "
+            f"expected dict, got {type(calibration).__name__}"
+        )
+    per_stock = calibration.get("per_stock")
+    if not isinstance(per_stock, dict) or not per_stock:
+        raise ValueError(
+            f"Invalid calibration schema for model {model_name}: "
+            "'per_stock' must be a non-empty dict"
+        )
+
+
 class S2Amihud(SlippageModel):
     """S2: Amihud-style linear impact.
 
@@ -162,6 +177,7 @@ class S2Amihud(SlippageModel):
     name = "S2"
 
     def __init__(self, calibration: dict) -> None:
+        _validate_calibration_schema(calibration, "S2")
         self._per_stock: dict[str, dict] = calibration.get("per_stock", {})
         illiq_vals = [
             v.get("illiq", 0.0) for v in self._per_stock.values() if v.get("illiq", 0.0) > 0
@@ -191,6 +207,7 @@ class S3Banded(SlippageModel):
     name = "S3"
 
     def __init__(self, calibration: dict) -> None:
+        _validate_calibration_schema(calibration, "S3")
         self._per_stock: dict[str, dict] = calibration.get("per_stock", {})
         self._rates: list[float] = calibration.get(
             "quintile_rates", [0.0005, 0.0008, 0.0010, 0.0015, 0.0025]
@@ -260,8 +277,7 @@ def get_model(name: str, calibration: dict | None = None) -> SlippageModel:
     if name == "S0":
         return cls()
     if name in ("S2", "S3"):
-        if calibration is None:
-            raise ValueError(f"{name} requires calibration data")
+        _validate_calibration_schema(calibration, name)
         return cls(calibration)
     if name == "S1":
         return cls()
@@ -368,8 +384,11 @@ def fetch_qlib_prices(
 
     Returns {symbol: {date: {"close": float, "volume": float, "change": float, "factor": float}}}.
     """
-    import qlib
-    from qlib.data import D
+    try:
+        import qlib
+        from qlib.data import D
+    except ImportError as e:
+        raise ImportError(f"Failed to import qlib for Track S replay: {e}") from e
 
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
@@ -411,7 +430,10 @@ def _load_calibration(calibration_path: str | Path) -> dict:
             f"Calibration artifact not found at {path}. "
             "Run calibrate_illiq.py first."
         )
-    return json.loads(path.read_text())
+    cal = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(cal, dict) or "per_stock" not in cal:
+        raise ValueError(f"Invalid calibration artifact at {path}: missing 'per_stock'")
+    return cal
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +452,9 @@ def run_model(
 
     Returns ReplayResult with recomputed trades and NAV series.
     """
+    if trades and not prices:
+        raise ValueError("Price data dictionary is empty while trades exist")
+
     result = ReplayResult(model_name=model.name)
 
     trades_by_date: dict[str, list[TrackTrade]] = {}
@@ -438,19 +463,40 @@ def run_model(
 
     cash = initial_cash
     positions: dict[str, int] = {}  # symbol -> qty
+    last_known_close: dict[str, float] = {}
 
     for dt in nav_dates:
+        # Update last known close for currently held positions if present today
+        for sym in positions:
+            p = prices.get(sym, {}).get(dt, {}).get("close", 0.0)
+            if p > 0.0:
+                last_known_close[sym] = p
+
         # Pre-trade market value
-        pre_market_value = sum(
-            qty * prices.get(sym, {}).get(dt, {}).get("close", 0.0)
-            for sym, qty in positions.items()
-        )
+        pre_market_value = 0.0
+        for sym, qty in positions.items():
+            p = prices.get(sym, {}).get(dt, {}).get("close", 0.0)
+            if p <= 0.0:
+                p = last_known_close.get(sym, 0.0)
+            if p <= 0.0 and qty > 0:
+                raise ValueError(
+                    f"Missing valid close price for held symbol {sym} on date {dt}"
+                )
+            pre_market_value += qty * p
         pre_trade_nav = cash + pre_market_value
 
         day_trades = trades_by_date.get(dt, [])
         for t in day_trades:
             pdata = prices.get(t.symbol, {}).get(dt, {})
-            t.close = pdata.get("close", 0.0)
+            close = pdata.get("close", 0.0)
+            if close <= 0.0:
+                close = last_known_close.get(t.symbol, 0.0)
+            if close <= 0.0:
+                raise ValueError(
+                    f"Missing valid close price for trade on {t.symbol} on date {dt}"
+                )
+            last_known_close[t.symbol] = close
+            t.close = close
             t.volume = pdata.get("volume", 0.0)
             t.change = pdata.get("change", 0.0)
             t.factor = pdata.get("factor", 1.0)
@@ -477,18 +523,30 @@ def run_model(
                 cash -= notional + fees.total
                 positions[t.symbol] = positions.get(t.symbol, 0) + t.fill_qty
             else:
+                current_qty = positions.get(t.symbol, 0)
+                if t.fill_qty > current_qty:
+                    raise ValueError(
+                        f"Oversell detected: symbol {t.symbol} held {current_qty}, "
+                        f"attempted to sell {t.fill_qty}"
+                    )
                 cash += notional - fees.total
-                positions[t.symbol] = positions.get(t.symbol, 0) - t.fill_qty
+                positions[t.symbol] = current_qty - t.fill_qty
                 if positions[t.symbol] <= 0:
                     positions.pop(t.symbol, None)
 
             result.trades.append(t)
 
         # Post-trade market value
-        post_market_value = sum(
-            qty * prices.get(sym, {}).get(dt, {}).get("close", 0.0)
-            for sym, qty in positions.items()
-        )
+        post_market_value = 0.0
+        for sym, qty in positions.items():
+            p = prices.get(sym, {}).get(dt, {}).get("close", 0.0)
+            if p <= 0.0:
+                p = last_known_close.get(sym, 0.0)
+            if p <= 0.0 and qty > 0:
+                raise ValueError(
+                    f"Missing valid close price for held symbol {sym} on date {dt}"
+                )
+            post_market_value += qty * p
         total_nav = cash + post_market_value
 
         result.nav_series.append(
@@ -779,6 +837,10 @@ def run_replay(
         len(symbols), start_date, end_date,
     )
     prices = fetch_qlib_prices(symbols, start_date, end_date, provider_uri=provider_uri)
+    if all_trades and not prices:
+        raise ValueError(
+            f"qlib returned no prices for {len(symbols)} symbols ({start_date} to {end_date})"
+        )
 
     initial_cash = read_initial_cash(paper)
 
