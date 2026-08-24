@@ -81,8 +81,12 @@ def huber_m_estimator(
         e_ols = y - X @ beta_ols
         return beta_ols, e_ols, np.ones_like(y, dtype=np.float64)
 
-    except Exception:
-        log.warning("huber_m_estimator: exception during estimation; falling back to OLS", exc_info=True)
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError) as e:
+        log.warning("huber_m_estimator: numerical error (%s); falling back to OLS", e)
+        beta_ols, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        return beta_ols, y - X @ beta_ols, np.ones_like(y, dtype=np.float64)
+    except Exception as e:
+        log.warning("huber_m_estimator: unexpected exception (%s); falling back to OLS", e, exc_info=True)
         beta_ols, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
         return beta_ols, y - X @ beta_ols, np.ones_like(y, dtype=np.float64)
 
