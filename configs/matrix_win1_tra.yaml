@@ -1,0 +1,52 @@
+---
+# Window sweep arm: production TRA + Alpha158 model, 1-year rolling
+# train window. Model section is a verbatim copy of configs/baseline.yaml
+# (plus tag); the only experimental difference is
+# walk_forward.train_window_years.
+model:
+  tag: win1_tra
+  type: tra                 # R10: TRA (Temporal Routing Adaptor, KDD 2021)
+  handler: alpha158         # Alpha360 triggers qlib 0.9.7 multiprocessing bug on Windows;
+                            # Alpha158 loads correctly (same as R9 LGB baseline)
+  step_len: 20              # Alpha158 natural lookback; shorter than Alpha360's 60
+
+  # TRA backbone: GRU with concat-attention
+  backbone:
+    input_size: 158         # must match Alpha158 feature count (was 360 for Alpha360)
+    hidden_size: 64         # paper default
+    num_layers: 2
+    rnn_arch: GRU
+    use_attn: true          # concat-attention as in Adv-ALSTM
+    dropout: 0.0
+
+  # TRA routing head: 3 market-regime patterns, LR+TPE routing signal
+  routing:
+    num_states: 3           # paper default; 3 regimes for CSI markets
+    hidden_size: 16         # router GRU hidden size
+    tau: 1.0                # gumbel-softmax temperature
+    src_info: LR_TPE        # Latent Repr + Transport Prediction Error (paper best)
+    rnn_arch: GRU
+    num_layers: 1
+    dropout: 0.0
+
+  # TRAModel training
+  transport_method: router  # full TRA with optimal transport routing
+  pretrain: true            # pretrain backbone first, then finetune TRA head
+  n_epochs: 200             # reduced from paper 500 for 6-window feasibility
+  early_stop: 30            # patience on valid IC
+  lr: 0.001
+
+  # LGB reference params (kept for documentation; not used when type=tra)
+  learning_rate: 0.0421
+  colsample_bytree: 0.8879
+  subsample: 0.8789
+  lambda_l1: 205.6999
+  lambda_l2: 580.9768
+  max_depth: 8
+  num_leaves: 210
+  num_boost_round: 500
+  device: gpu
+walk_forward:
+  train_window_years: 1
+matrix:
+  tag: win1_tra

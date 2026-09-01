@@ -10,6 +10,8 @@ importable without a qlib runtime (required for unit test isolation).
 from __future__ import annotations
 
 import logging
+import math
+import numbers
 
 import pandas as pd
 from scipy.stats import spearmanr
@@ -22,6 +24,19 @@ _MIN_INSTRUMENTS = 5
 # Formal JSONL record schema for matrix experiment results.
 # matrix_runner.py writes these keys; analyze_matrix.py reads them.
 CELL_SCHEMA_KEYS = ["model", "window", "ic", "excess", "maxdd", "completed_at"]
+
+
+def is_valid_turnover(value) -> bool:
+    """True for real numeric turnover values.
+
+    Accepts Python and numpy numeric scalars (numbers.Real covers both);
+    rejects bools (Python bool and numpy bool_), NaN, strings, and None.
+    Shared scalar contract used by both the producer (matrix_runner)
+    and the consumer (analyze_matrix) of the turnover metric.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    return not math.isnan(float(value))
 
 
 def daily_rank_ic(pred: pd.Series, label: pd.Series) -> pd.Series:

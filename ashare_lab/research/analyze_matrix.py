@@ -21,10 +21,14 @@ from scipy.stats import spearmanr
 log = logging.getLogger(__name__)
 
 # Shared JSONL record schema -- single source of truth in metrics.py.
-from ashare_lab.research.metrics import CELL_SCHEMA_KEYS
+from ashare_lab.research.metrics import CELL_SCHEMA_KEYS, is_valid_turnover
 
 # Minimum common instruments per date to compute meaningful Spearman rho.
 _MIN_COMMON_INSTRUMENTS = 30
+
+# Single-window Spearman rho below this flags a low-correlation survivor pair
+# (directional indicator only; see the correlation snapshot comment below).
+_LOW_CORR_THRESHOLD = 0.6
 
 
 def compute_correlation_matrix(
@@ -155,7 +159,9 @@ def generate_gate_decision(
 
     Applies the kill gate (IC < kill_ic OR maxdd worse than kill_maxdd)
     per candidate.  Kill gate runs FIRST, then only survivors go
-    to oracle computation.
+    to oracle computation.  The report includes a Mean Turnover column
+    averaged over each candidate's records that carry a valid numeric
+    turnover (see metrics.is_valid_turnover); ``n/a`` when none do.
 
     Args:
         results_jsonl: Path to results.jsonl with all candidate results.
@@ -202,6 +208,14 @@ def generate_gate_decision(
         mean_ic = sum(ics) / len(ics) if ics else 0.0
         total_excess = sum(excesses)
         worst_maxdd = min(maxdds) if maxdds else 0.0
+        # Optional per-record turnover (absent in pre-sweep jsonl rows).
+        # Non-numeric values are dropped rather than poisoning the mean.
+        turnovers = []
+        for rec in candidate_records:
+            t = rec.get("turnover")
+            if is_valid_turnover(t):
+                turnovers.append(t)
+        mean_turnover = sum(turnovers) / len(turnovers) if turnovers else None
 
         # Kill check: any single window below threshold kills the candidate.
         kill_reason = None
@@ -223,6 +237,7 @@ def generate_gate_decision(
             "mean_ic": mean_ic,
             "total_excess": total_excess,
             "worst_maxdd": worst_maxdd,
+            "mean_turnover": mean_turnover,
             "kill_reason": kill_reason or "--",
         })
 
@@ -249,7 +264,7 @@ def generate_gate_decision(
             for i in range(len(tags)):
                 for j in range(i + 1, len(tags)):
                     val = corr_df.loc[tags[i], tags[j]]
-                    if pd.notna(val) and val < 0.6:
+                    if pd.notna(val) and val < _LOW_CORR_THRESHOLD:
                         low_corr_pairs.append((tags[i], tags[j], float(val)))
 
     # Write GATE_DECISION.md
@@ -260,19 +275,20 @@ def generate_gate_decision(
 
     # Section 1: Candidate Verdicts
     lines.append("## Candidate Verdicts\n")
-    lines.append(
+    header = (
         "| Candidate | Status | Windows | Mean IC | Total Excess "
-        "| Worst MaxDD | Kill Reason |"
+        "| Worst MaxDD | Mean Turnover | Kill Reason |"
     )
-    lines.append(
-        "|-----------|--------|---------|---------|----------"
-        "---|-------------|-------------|"
-    )
+    lines.append(header)
+    lines.append("|" + "---|" * (header.count("|") - 1))
     for v in verdicts:
+        mt = v.get("mean_turnover")
+        # Producer guarantees mean_turnover is None or a finite float.
+        turnover_cell = "n/a" if mt is None else f"{mt:.4f}"
         lines.append(
             f"| {v['tag']} | {v['status']} | {v['n_windows']} "
             f"| {v['mean_ic']:.4f} | {v['total_excess']:.4f} "
-            f"| {v['worst_maxdd']:.4f} | {v['kill_reason']} |"
+            f"| {v['worst_maxdd']:.4f} | {turnover_cell} | {v['kill_reason']} |"
         )
     lines.append("")
 

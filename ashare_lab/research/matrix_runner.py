@@ -10,19 +10,56 @@ imports are deferred inside function bodies.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
 from ashare_lab import config as cfg
-from ashare_lab.research.metrics import CELL_SCHEMA_KEYS
+from ashare_lab.research.metrics import CELL_SCHEMA_KEYS, is_valid_turnover
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 log = logging.getLogger(__name__)
+
+
+def merge_candidate_config(base: dict, candidate: dict) -> dict:
+    """Overlay a candidate config onto the baseline config dict.
+
+    The model section is always replaced. An optional walk_forward map is
+    merged key-wise so candidates can sweep window lengths without copying
+    the whole section. base is not mutated; the merged copy is returned.
+    """
+    result = copy.deepcopy(base)
+    result["model"] = copy.deepcopy(candidate["model"])
+    wf_override = candidate.get("walk_forward")
+    if wf_override is not None:
+        merged_wf = {**(base.get("walk_forward") or {}), **wf_override}
+        result["walk_forward"] = copy.deepcopy(merged_wf)
+    return result
+
+
+def extract_mean_turnover(portfolio_df: "pd.DataFrame") -> float | None:
+    """Mean of the qlib portfolio-metrics ``turnover`` column.
+
+    Returns None when the frame is empty, the column is absent, or the
+    mean is NaN (mirrors the mean_rank_ic NaN guard in metrics.py).
+    """
+    if portfolio_df.empty or "turnover" not in portfolio_df.columns:
+        return None
+    values = [
+        float(t) for t in portfolio_df["turnover"] if is_valid_turnover(t)
+    ]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def run_cell(
@@ -42,8 +79,9 @@ def run_cell(
         n_epochs: Epoch count override.  None = use config value.
 
     Returns:
-        Dict with CELL_SCHEMA_KEYS: model, window, ic, excess, maxdd,
-        completed_at.
+        Dict with CELL_SCHEMA_KEYS (model, window, ic, excess, maxdd,
+        completed_at) plus an optional ``turnover`` key holding the mean
+        of the backtest turnover column (omitted when unavailable).
     """
     import numpy as np  # noqa: PLC0415
 
@@ -63,7 +101,7 @@ def run_cell(
         with original_config_path.open() as f:
             base = yaml.safe_load(f)
 
-        base["model"] = candidate["model"]
+        base = merge_candidate_config(base, candidate)
         tmp_cfg = tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", delete=False,
         )
@@ -144,6 +182,10 @@ def run_cell(
         )
         max_drawdown_value = compute_max_drawdown(portfolio_df)
 
+        # Extra record key, not part of CELL_SCHEMA_KEYS: old results.jsonl
+        # rows without it stay valid.
+        turnover = extract_mean_turnover(portfolio_df)
+
         record = {
             "model": tag,
             "window": window_id,
@@ -152,6 +194,10 @@ def run_cell(
             "maxdd": max_drawdown_value,
             "completed_at": datetime.now(tz=timezone.utc).isoformat(),
         }
+        # Optional key: omitted entirely when turnover data is unavailable,
+        # matching pre-sweep jsonl rows.
+        if turnover is not None:
+            record["turnover"] = turnover
 
         # Validate record.
         missing = [k for k in CELL_SCHEMA_KEYS if k not in record]
