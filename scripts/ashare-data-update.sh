@@ -9,14 +9,26 @@ STAMP="$HOME/.cache/ashare-data-update.stamp"
 STDERR_LOG="/tmp/ashare-data-update-stderr.log"
 SECONDS_START=$SECONDS
 GPU_HOST="192.168.100.11"
+GPU_MAC="04:7C:16:49:BE:32"
 GPU_USER="admin"
 QLIB_DIR="$HOME/.qlib/qlib_data"
+
+# shellcheck source=scripts/lib/gpu-wake.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/gpu-wake.sh"
 
 sync_gpu_data() {
     local sync_dir="${HOME}/.cache/ashare-sync"
     mkdir -p "$sync_dir"
     local tarball="${sync_dir}/cn_data_sync.tar.gz"
     trap 'rm -f "$tarball"' RETURN
+
+    # The GPU box sleeps between runs.  Without this wake the scp below
+    # fails with "No route to host", the sync is skipped, and the 18:00
+    # pipeline then finds stale qlib data and records a stale run.
+    if ! wake_gpu "$GPU_HOST" "$GPU_MAC" "$GPU_USER"; then
+        echo "sync_gpu_data: GPU wake failed"
+        return 1
+    fi
 
     if ! tar czf "$tarball" -C "$QLIB_DIR" cn_data; then
         echo "sync_gpu_data: tar failed"
@@ -54,7 +66,13 @@ for attempt in 1 2; do
 done
 
 if [ $rc -eq 0 ]; then
-    sync_gpu_data || echo "WARNING: GPU data sync failed, GPU keeps stale data"
+    if ! sync_gpu_data; then
+        echo "WARNING: GPU data sync failed, GPU keeps stale data"
+        # Without this the failure is invisible until the 18:00 pipeline
+        # records a stale run 15 minutes later, pointing at the wrong layer.
+        python3 "$REPO/scripts/alert.py" "1" "gpu_data_sync" \
+            "$((SECONDS - SECONDS_START))" "$STDERR_LOG" || true
+    fi
 fi
 
 if [ $rc -ne 0 ]; then

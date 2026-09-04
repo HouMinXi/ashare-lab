@@ -43,6 +43,10 @@ SECONDS_START=$SECONDS
 USE_STALE=0
 PRED_ARG=""
 FORCE_ARG=""
+
+# shellcheck source=scripts/lib/gpu-wake.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/gpu-wake.sh"
+
 for _a in "$@"; do
     [ "$_a" = "--force" ] && FORCE_ARG="--force"
 done
@@ -158,33 +162,9 @@ try_gpu_inference() {
         exec 9>&-
     fi
 
-    local GPU_START=$SECONDS
-
-    # WoL
-    wol "$GPU_MAC"
-
-    # Ping poll: 5s interval, 40 attempts = 200s max
-    local ping_ok=0
-    for _i in $(seq 1 40); do
-        if ping -c1 -W1 "$GPU_HOST" >/dev/null 2>&1; then
-            ping_ok=1
-            break
-        fi
-        sleep 5
-    done
-    if [ "$ping_ok" -eq 0 ]; then
-        echo "ERROR: GPU not reachable after 200s ping poll"
+    if ! wake_gpu "$GPU_HOST" "$GPU_MAC" "$GPU_USER" 300; then
         return 1
     fi
-
-    # SSH readiness poll (H6: ping up before SSH ready on Windows)
-    while ! ssh -o ConnectTimeout=3 -o BatchMode=yes "${GPU_USER}@${GPU_HOST}" "echo ok" >/dev/null 2>&1; do
-        if [ $(( SECONDS - GPU_START )) -ge 300 ]; then
-            echo "ERROR: SSH not ready within 300s"
-            return 1
-        fi
-        sleep 5
-    done
 
     # Sync code to GPU before inference
     sync_code_to_gpu || echo "WARNING: code sync failed, proceeding with existing GPU code"
