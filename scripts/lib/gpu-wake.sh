@@ -5,6 +5,15 @@
 # same wake sequence: send the magic packet, wait for ICMP, then wait for
 # sshd (Windows answers ping well before sshd binds).
 #
+# The host identity lives here too, so a hardware swap is a one-file edit
+# rather than two files that must stay in lockstep.
+# shellcheck disable=SC2034  # consumed by the scripts that source this file
+GPU_HOST="192.168.100.11"
+# shellcheck disable=SC2034
+GPU_MAC="04:7C:16:49:BE:32"
+# shellcheck disable=SC2034
+GPU_USER="admin"
+
 # wake_gpu HOST MAC USER [TOTAL_BUDGET_S]
 #   0 = host reachable over SSH
 #   1 = not reachable within budget (caller decides whether that is fatal)
@@ -15,6 +24,15 @@
 wake_gpu() {
     local host="$1" mac="$2" user="$3" budget="${4:-300}"
     local start=$SECONDS
+
+    # A non-numeric budget makes the deadline comparison error out and
+    # evaluate false, so the ping poll is skipped entirely and the wake
+    # reports "not reachable" without ever having waited.  An empty budget
+    # is not this case: ${4:-300} substitutes the default.
+    if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: wake_gpu budget must be a positive integer, got '$budget'"
+        return 1
+    fi
 
     # Without this the magic packet silently never goes out: bash prints
     # "wol: command not found" to stderr, the ping poll still runs, and a

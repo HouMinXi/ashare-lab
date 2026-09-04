@@ -9,11 +9,9 @@ STAMP="$HOME/.cache/ashare-data-update.stamp"
 STDERR_LOG="/tmp/ashare-data-update-stderr.log"
 SYNC_LOG="/tmp/ashare-gpu-sync.log"
 SECONDS_START=$SECONDS
-GPU_HOST="192.168.100.11"
-GPU_MAC="04:7C:16:49:BE:32"
-GPU_USER="admin"
 QLIB_DIR="$HOME/.qlib/qlib_data"
 
+# Defines GPU_HOST / GPU_MAC / GPU_USER alongside the wake sequence.
 # shellcheck source=scripts/lib/gpu-wake.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/gpu-wake.sh"
 
@@ -70,7 +68,11 @@ if [ $rc -eq 0 ]; then
     # Capture the sync's own diagnostics: alert.py reports the tail of a
     # log file, and STDERR_LOG only holds fetch-today's output.  Without a
     # dedicated log the alert says a sync failed but not which step.
-    if ! sync_gpu_data 2>&1 | tee "$SYNC_LOG"; then
+    # PIPESTATUS rather than the pipeline status: tee always exits 0, so
+    # reading $? would make the alert depend on pipefail staying set.
+    sync_gpu_data 2>&1 | tee "$SYNC_LOG"
+    sync_rc=${PIPESTATUS[0]}
+    if [ "$sync_rc" -ne 0 ]; then
         echo "WARNING: GPU data sync failed, GPU keeps stale data"
         # Without this the failure is invisible until the 18:00 pipeline
         # records a stale run 15 minutes later, pointing at the wrong layer.

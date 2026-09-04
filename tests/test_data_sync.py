@@ -275,6 +275,75 @@ class TestWakeLibBehavior:
         )
 
 
+    def test_non_numeric_budget_rejected(self):
+        """A non-numeric budget makes the deadline comparison error out and
+        evaluate false, so the ping poll never runs and the wake reports
+        unreachable without having waited at all.  (An EMPTY budget is not
+        this case: ${4:-300} substitutes the default, which is correct.)"""
+        r = self._run_lib(textwrap.dedent("""\
+            wol() { return 0; }
+            ping() { echo "BUG: polled with a bad budget"; return 0; }
+            ssh() { return 0; }
+            export -f wol ping ssh
+            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser "abc"
+            echo "RC=$?"
+        """))
+        assert "RC=1" in r.stdout, r.stdout
+        assert "budget must be a positive integer" in r.stdout
+        assert "BUG:" not in r.stdout
+
+    def test_empty_budget_uses_the_default(self):
+        """Documents the boundary the guard must NOT reject."""
+        r = self._run_lib(textwrap.dedent("""\
+            wol() { return 0; }
+            ping() { return 0; }
+            ssh() { return 0; }
+            export -f wol ping ssh
+            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser ""
+            echo "RC=$?"
+        """))
+        assert "RC=0" in r.stdout, r.stdout
+
+
+class TestGpuIdentityIsSharedOnce:
+    """GPU_HOST/MAC/USER live in the lib so a hardware swap is one edit."""
+
+    LIB = Path(SCRIPT).resolve().parent / "lib" / "gpu-wake.sh"
+    PIPELINE = Path(SCRIPT).resolve().parent / "ashare-pipeline.sh"
+
+    def test_lib_defines_the_identity(self):
+        src = self.LIB.read_text()
+        for var in ("GPU_HOST=", "GPU_MAC=", "GPU_USER="):
+            assert var in src, f"{var} must live in the shared lib"
+
+    def test_callers_do_not_redefine_it(self):
+        for script in (Path(SCRIPT), self.PIPELINE):
+            src = script.read_text()
+            for var in ("GPU_HOST=", "GPU_MAC=", "GPU_USER="):
+                assert var not in src, (
+                    f"{script.name} redefines {var}; the hardware address "
+                    "would then have to be changed in lockstep across files"
+                )
+
+    def test_identity_is_defined_before_first_use(self):
+        """The lib is sourced partway down the pipeline; if any GPU_* use
+        preceded the source line the variable would be empty under set -u."""
+        src = self.PIPELINE.read_text().splitlines()
+        source_line = next(
+            i for i, ln in enumerate(src) if "lib/gpu-wake.sh" in ln and "source" in ln
+        )
+        uses = [
+            i for i, ln in enumerate(src)
+            if ("$GPU_HOST" in ln or "${GPU_HOST}" in ln
+                or "$GPU_MAC" in ln or "${GPU_USER}" in ln)
+        ]
+        assert uses, "expected the pipeline to use the shared identity"
+        assert min(uses) > source_line, (
+            f"GPU_* used at line {min(uses) + 1} before the lib is sourced "
+            f"at line {source_line + 1}"
+        )
+
+
 class TestSyncFailureAlerts:
     """Sync failure used to exit 0 silently; the only visible symptom was a
     stale pipeline run 15 minutes later, pointing at the wrong layer."""
@@ -303,12 +372,32 @@ class TestSyncFailureAlerts:
             "STDERR_LOG holds fetch-today output, not sync diagnostics"
         )
 
-    def test_sync_failure_survives_the_tee_pipe(self):
-        """The sync output is piped through tee; without pipefail the
-        pipeline's status would be tee's (always 0) and the alert would
-        never fire."""
+    def test_sync_failure_detected_without_relying_on_pipefail(self):
+        """The sync output is piped through tee, and tee always exits 0.
+        Reading the pipeline status would make the alert depend on pipefail
+        staying set -- a future refactor into a subshell or `bash -c` would
+        silently disarm it.  PIPESTATUS[0] is explicit about which command's
+        status matters."""
         src = Path(SCRIPT).read_text()
-        assert "set -uo pipefail" in src, (
-            "piping sync output through tee requires pipefail, or the "
-            "failure branch becomes unreachable"
+        assert "PIPESTATUS[0]" in src, (
+            "sync failure must be read from PIPESTATUS, not the pipeline "
+            "status that tee overwrites"
         )
+        assert "if ! sync_gpu_data 2>&1 | tee" not in src, (
+            "pipeline-status form reintroduces the pipefail dependency"
+        )
+
+    def test_pipestatus_form_detects_failure(self):
+        """Behavioural check that the chosen form works even with pipefail
+        off -- the point of using PIPESTATUS in the first place."""
+        r = subprocess.run(
+            ["bash", "-c", textwrap.dedent("""\
+                set +o pipefail
+                f() { return 1; }
+                f 2>&1 | tee /dev/null
+                rc=${PIPESTATUS[0]}
+                [ "$rc" -ne 0 ] && echo DETECTED || echo MASKED
+            """)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert "DETECTED" in r.stdout, r.stdout

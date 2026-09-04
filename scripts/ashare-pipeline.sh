@@ -32,9 +32,6 @@ if ! flock -w 60 8; then
     exit 1
 fi
 
-GPU_HOST="192.168.100.11"
-GPU_MAC="04:7C:16:49:BE:32"
-GPU_USER="admin"
 GPU_PREDICT_TIMEOUT=1800
 DATA_STAMP="$HOME/.cache/ashare-data-update.stamp"
 STDERR_LOG="/tmp/ashare-pipeline-stderr.log"
