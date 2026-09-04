@@ -8,6 +8,9 @@
 # wake_gpu HOST MAC USER [TOTAL_BUDGET_S]
 #   0 = host reachable over SSH
 #   1 = not reachable within budget (caller decides whether that is fatal)
+#
+# BUDGET covers the whole call, ping poll included.  A caller that cannot
+# afford a five-minute stall on a dead host should pass a smaller one.
 
 wake_gpu() {
     local host="$1" mac="$2" user="$3" budget="${4:-300}"
@@ -21,10 +24,15 @@ wake_gpu() {
         return 1
     fi
 
-    wol "$mac"
+    # An unchecked wol turns "the packet never went out" (wrong interface,
+    # no permission) into the generic unreachable error 200s later.
+    if ! wol "$mac"; then
+        echo "ERROR: wol failed to send the magic packet to $mac"
+        return 1
+    fi
 
     local ping_ok=0
-    for _i in $(seq 1 40); do
+    while [ $(( SECONDS - start )) -lt "$budget" ]; do
         if ping -c1 -W1 "$host" >/dev/null 2>&1; then
             ping_ok=1
             break
@@ -32,7 +40,7 @@ wake_gpu() {
         sleep 5
     done
     if [ "$ping_ok" -eq 0 ]; then
-        echo "ERROR: GPU not reachable after 200s ping poll"
+        echo "ERROR: GPU not reachable within ${budget}s ping poll"
         return 1
     fi
 

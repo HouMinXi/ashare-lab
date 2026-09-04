@@ -238,6 +238,42 @@ class TestWakeLibBehavior:
         """))
         assert r.returncode == 0, f"stdout={r.stdout} stderr={r.stderr}"
 
+    def test_wol_send_failure_is_reported(self):
+        """An unchecked wol turns 'the packet never went out' into the
+        generic unreachable error 200 seconds later."""
+        r = self._run_lib(textwrap.dedent("""\
+            wol() { return 1; }
+            ping() { echo "BUG: ping ran after wol failed"; return 0; }
+            ssh() { return 0; }
+            export -f wol ping ssh
+            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser 5
+        """))
+        assert r.returncode != 0
+        assert "wol failed" in r.stdout, r.stdout
+        assert "BUG:" not in r.stdout, "must not poll after a failed send"
+
+    def test_ping_poll_respects_the_budget(self):
+        """The poll used to run a fixed 40 iterations (200s) whatever the
+        caller asked for, so a small budget could not bound the stall.
+        Measured before the fix: budget=5 still ran all 40 iterations."""
+        r = self._run_lib(textwrap.dedent("""\
+            wol() { return 0; }
+            ping() { return 1; }
+            ssh() { return 1; }
+            iters=0
+            sleep() { iters=$((iters+1)); command sleep 0.05; }
+            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser 1
+            echo "RC=$? ITERS=$iters"
+        """))
+        # The trailing echo sets the script's own status, so read wake_gpu's
+        # return code from the output rather than from returncode.
+        assert "RC=1" in r.stdout, r.stdout
+        iters = int(r.stdout.split("ITERS=")[1].split()[0])
+        assert iters < 40, (
+            f"ping poll ran {iters} iterations on a 1s budget; "
+            "the budget does not bound the poll"
+        )
+
 
 class TestSyncFailureAlerts:
     """Sync failure used to exit 0 silently; the only visible symptom was a
@@ -253,4 +289,26 @@ class TestSyncFailureAlerts:
         assert "gpu_data_sync" in tail, (
             "alert must name the failing stage so it is not confused "
             "with a data_update or pipeline failure"
+        )
+
+    def test_alert_gets_the_sync_log_not_the_fetch_log(self):
+        """alert.py reports the tail of the log it is handed.  Passing
+        STDERR_LOG (fetch-today's output) means the alert names a failed
+        sync without saying which step broke."""
+        src = Path(SCRIPT).read_text()
+        idx = src.index("gpu_data_sync")
+        call = src[idx:idx + 200]
+        assert "SYNC_LOG" in call, "alert must carry the sync's own log"
+        assert "STDERR_LOG" not in call, (
+            "STDERR_LOG holds fetch-today output, not sync diagnostics"
+        )
+
+    def test_sync_failure_survives_the_tee_pipe(self):
+        """The sync output is piped through tee; without pipefail the
+        pipeline's status would be tee's (always 0) and the alert would
+        never fire."""
+        src = Path(SCRIPT).read_text()
+        assert "set -uo pipefail" in src, (
+            "piping sync output through tee requires pipefail, or the "
+            "failure branch becomes unreachable"
         )

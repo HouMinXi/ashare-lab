@@ -7,6 +7,7 @@ set -uo pipefail
 REPO="$HOME/code/ashare-lab"
 STAMP="$HOME/.cache/ashare-data-update.stamp"
 STDERR_LOG="/tmp/ashare-data-update-stderr.log"
+SYNC_LOG="/tmp/ashare-gpu-sync.log"
 SECONDS_START=$SECONDS
 GPU_HOST="192.168.100.11"
 GPU_MAC="04:7C:16:49:BE:32"
@@ -66,12 +67,15 @@ for attempt in 1 2; do
 done
 
 if [ $rc -eq 0 ]; then
-    if ! sync_gpu_data; then
+    # Capture the sync's own diagnostics: alert.py reports the tail of a
+    # log file, and STDERR_LOG only holds fetch-today's output.  Without a
+    # dedicated log the alert says a sync failed but not which step.
+    if ! sync_gpu_data 2>&1 | tee "$SYNC_LOG"; then
         echo "WARNING: GPU data sync failed, GPU keeps stale data"
         # Without this the failure is invisible until the 18:00 pipeline
         # records a stale run 15 minutes later, pointing at the wrong layer.
         python3 "$REPO/scripts/alert.py" "1" "gpu_data_sync" \
-            "$((SECONDS - SECONDS_START))" "$STDERR_LOG" || true
+            "$((SECONDS - SECONDS_START))" "$SYNC_LOG" || true
     fi
 fi
 
