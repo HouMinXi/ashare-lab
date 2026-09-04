@@ -26,10 +26,11 @@ wake_gpu() {
     local start=$SECONDS
 
     # A non-numeric budget makes the deadline comparison error out and
-    # evaluate false, so the ping poll is skipped entirely and the wake
-    # reports "not reachable" without ever having waited.  An empty budget
+    # evaluate false; a zero budget makes it false on the first pass.
+    # Either way no poll runs and the caller is told the host is
+    # unreachable, hiding what is really a bad argument.  An empty budget
     # is not this case: ${4:-300} substitutes the default.
-    if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$budget" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: wake_gpu budget must be a positive integer, got '$budget'"
         return 1
     fi

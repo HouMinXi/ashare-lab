@@ -304,6 +304,25 @@ class TestWakeLibBehavior:
         assert "budget must be a positive integer" in r.stdout
         assert "BUG:" not in r.stdout
 
+    def test_zero_budget_rejected(self):
+        """Zero passes a bare ^[0-9]+$ but makes the deadline false on the
+        first pass, so no poll runs and the caller is told the host is
+        unreachable -- a misleading message for a bad argument."""
+        r = self._run_lib(textwrap.dedent("""\
+            wol() { return 0; }
+            ping() { echo "BUG: polled with a zero budget"; return 0; }
+            ssh() { return 0; }
+            export -f wol ping ssh
+            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser 0
+            echo "RC=$?"
+        """))
+        assert "RC=1" in r.stdout, r.stdout
+        assert "budget must be a positive integer" in r.stdout, r.stdout
+        assert "not reachable" not in r.stdout, (
+            "a bad budget must not be reported as an unreachable host"
+        )
+        assert "BUG:" not in r.stdout
+
     def test_empty_budget_uses_the_default(self):
         """Documents the boundary the guard must NOT reject."""
         r = self._run_lib(textwrap.dedent("""\
