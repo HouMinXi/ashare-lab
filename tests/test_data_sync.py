@@ -253,25 +253,37 @@ class TestWakeLibBehavior:
         assert "BUG:" not in r.stdout, "must not poll after a failed send"
 
     def test_ping_poll_respects_the_budget(self):
-        """The poll used to run a fixed 40 iterations (200s) whatever the
-        caller asked for, so a small budget could not bound the stall.
-        Measured before the fix: budget=5 still ran all 40 iterations."""
-        r = self._run_lib(textwrap.dedent("""\
-            wol() { return 0; }
-            ping() { return 1; }
-            ssh() { return 1; }
-            iters=0
-            sleep() { iters=$((iters+1)); command sleep 0.05; }
-            wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser 1
-            echo "RC=$? ITERS=$iters"
-        """))
-        # The trailing echo sets the script's own status, so read wake_gpu's
-        # return code from the output rather than from returncode.
-        assert "RC=1" in r.stdout, r.stdout
-        iters = int(r.stdout.split("ITERS=")[1].split()[0])
-        assert iters < 40, (
-            f"ping poll ran {iters} iterations on a 1s budget; "
-            "the budget does not bound the poll"
+        """The poll used to run a fixed 40 iterations whatever the caller
+        asked for, so the budget could not bound the stall.  Comparing two
+        budgets is what makes this a budget test: a fixed-count poll gives
+        the same iteration count for both, a bounded one does not.
+
+        Iterations are counted rather than seconds so the assertion does
+        not depend on wall-clock timing; sleep is stubbed to keep the test
+        fast, which means SECONDS advances by real time, not by the stub."""
+        def run_with_budget(budget: str) -> tuple[str, int]:
+            r = self._run_lib(textwrap.dedent(f"""\
+                wol() {{ return 0; }}
+                ping() {{ return 1; }}
+                ssh() {{ return 1; }}
+                iters=0
+                sleep() {{ iters=$((iters+1)); command sleep 0.05; }}
+                wake_gpu 10.0.0.1 aa:bb:cc:dd:ee:ff someuser {budget}
+                echo "RC=$? ITERS=$iters"
+            """))
+            # The trailing echo sets the script's own status, so read
+            # wake_gpu's return code from the output, not from returncode.
+            iters = int(r.stdout.split("ITERS=")[1].split()[0])
+            return r.stdout, iters
+
+        small_out, small_iters = run_with_budget("1")
+        large_out, large_iters = run_with_budget("3")
+
+        assert "RC=1" in small_out, small_out
+        assert "RC=1" in large_out, large_out
+        assert large_iters > small_iters, (
+            f"budget=1 ran {small_iters} iterations and budget=3 ran "
+            f"{large_iters}; the poll length does not follow the budget"
         )
 
 
