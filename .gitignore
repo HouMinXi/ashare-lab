@@ -38,3 +38,6 @@ results_*/
 *.html
 .mcp.json
 paper.db*
+
+# code-forge review tooling: local config and run state, never committed
+.code-forge/
