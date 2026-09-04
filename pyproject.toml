@@ -36,6 +36,7 @@ markers = [
 dev = [
     "pytest",
     "pytest-timeout>=2.1",
+    "pytest-asyncio",
     "ruff",
     "pylint",
 ]
