@@ -200,6 +200,31 @@ class TestSharedWakeLib:
         )
 
 
+class TestGpuCodeSyncShipsModelMeta:
+    """predict.py imports model_meta; GPU sync must ship the module.
+
+    gpu-win latest.pt is a regular-file copy. Without model_meta.py on
+    that host the staleness gate always falls back to mtime.
+    """
+
+    PIPELINE = Path(SCRIPT).resolve().parent / "ashare-pipeline.sh"
+    DEPLOY = Path(SCRIPT).resolve().parent / "deploy.sh"
+
+    def test_pipeline_sync_copies_model_meta(self):
+        src = self.PIPELINE.read_text()
+        fn = src[src.index("sync_code_to_gpu()"): src.index("try_gpu_inference()")]
+        assert "model_meta.py" in fn, (
+            "sync_code_to_gpu must copy model_meta.py with predict.py"
+        )
+        assert "predict.py" in fn
+
+    def test_deploy_sync_copies_model_meta(self):
+        src = self.DEPLOY.read_text()
+        staging = src[src.index("Staging files for GPU deploy"): src.index("Section 8")]
+        assert "model_meta.py" in staging
+        assert "predict.py" in staging
+
+
 class TestWakeLibBehavior:
     """Direct tests of the shared lib, independent of the sync path."""
 

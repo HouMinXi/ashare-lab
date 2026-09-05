@@ -117,6 +117,7 @@ sync_code_to_gpu() {
     rm -rf "$STAGING"
     mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
     cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/model_meta.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
     # matrix_runner and matrix configs may not exist on fresh deploys.
     cp "$REPO/ashare_lab/research/matrix_runner.py" "$STAGING/ashare_lab/research/" 2>/dev/null || true
