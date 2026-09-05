@@ -1646,11 +1646,6 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             ctx.pred_path,
         )
 
-    # Track IC history for event-driven retraining (outside the
-    # meta.json try-block so failures log their own message, not
-    # the misleading "Failed to read meta.json").
-    append_ic_history(ctx.pred_path, ctx.trade_date)
-
     candidate_syms = [s for s in ctx.signals_raw if s in ctx.market_data]
     filtered_syms = filter_candidates(
         candidate_syms, ctx.market_data,
@@ -2472,6 +2467,8 @@ def run_daily(
         _step15_graduation(ctx)
         signal_quality_psi_step(ctx)
         signal_quality_ic_step(ctx)
+        if ctx.pred_path is not None:
+            append_ic_history(ctx.pred_path, ctx.trade_date)
 
         logger.info("Pipeline completed for %s", trade_date)
         return 0
@@ -2540,34 +2537,51 @@ def run_backfill(
 
 
 def append_ic_history(pred_path: Path, trade_date: str) -> None:
-    """Append today's IC value to data/ic_history.tsv.
+    """Append T-5 lagged RankIC to data/ic_history.tsv.
 
-    Reads meta.json next to the prediction file, extracts the ``ic``
-    field (may be ``None``), and appends ``{date}\\t{ic}`` to the
-    TSV file.  Deduplicates by date and keeps only the last 30 rows.
+    Live TRA ``ic`` is NaN out of sample and must not drive the retrain
+    gate. The IC monitor writes ``lagged_ic_t5`` onto the T-5 sidecar;
+    this function reads that field after the monitor has run.
+
+    Deduplicates by T-5 date and keeps only the last 30 rows.
+    Missing or non-finite lagged IC is skipped (not recorded as empty).
     """
-    meta_path = pred_path.with_suffix(".meta.json")
-    if not meta_path.exists():
-        logger.debug("IC history: no meta.json at %s, skipping", meta_path)
+    try:
+        cursor = dt.date.fromisoformat(trade_date)
+        for _ in range(5):
+            cursor = previous_trading_day(cursor)
+        t5_date = cursor.isoformat()
+    except Exception as exc:
+        logger.debug("IC history: t5 derivation failed: %s", exc)
+        return
+
+    t5_meta = pred_path.parent / f"{t5_date}.meta.json"
+    if not t5_meta.exists():
+        logger.debug("IC history: no T-5 sidecar at %s, skipping", t5_meta)
         return
 
     try:
-        with meta_path.open() as f:
+        with t5_meta.open() as f:
             meta = json.load(f)
     except Exception:
-        logger.debug("IC history: failed to read %s", meta_path)
+        logger.debug("IC history: failed to read %s", t5_meta)
         return
 
-    ic_val = meta.get("ic")
-    # Normalize NaN to empty string for the TSV
+    ic_val = meta.get("lagged_ic_t5")
     import math as _math  # noqa: PLC0415
-    if ic_val is not None and isinstance(ic_val, float) and _math.isnan(ic_val):
-        ic_val = None
+    if ic_val is None:
+        logger.debug("IC history: lagged_ic_t5 missing for %s", t5_date)
+        return
+    if isinstance(ic_val, bool) or not isinstance(ic_val, (int, float)):
+        logger.debug("IC history: lagged_ic_t5 not numeric for %s", t5_date)
+        return
+    if isinstance(ic_val, float) and not _math.isfinite(ic_val):
+        logger.debug("IC history: lagged_ic_t5 non-finite for %s", t5_date)
+        return
 
     history_path = PROJECT_ROOT / "data" / "ic_history.tsv"
     history_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Read existing entries
     entries: list[tuple[str, str]] = []
     if history_path.exists():
         with history_path.open() as f:
@@ -2579,29 +2593,23 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
                 if len(parts) == 2:
                     entries.append((parts[0], parts[1]))
 
-    # Skip if today already recorded
     for d, _ in entries:
-        if d == trade_date:
-            logger.debug("IC history: %s already recorded, skipping", trade_date)
+        if d == t5_date:
+            logger.debug("IC history: %s already recorded, skipping", t5_date)
             return
 
-    ic_str = str(ic_val) if ic_val is not None else ""
-    entries.append((trade_date, ic_str))
-
-    # Sort by date to handle backfills correctly
+    ic_str = str(float(ic_val))
+    entries.append((t5_date, ic_str))
     entries.sort(key=lambda e: e[0])
-
-    # Keep only last 30 entries (by date, not file order)
     entries = entries[-30:]
 
-    # Atomic write: write to temp file then rename
     tmp_path = history_path.with_suffix(".tsv.tmp")
     with tmp_path.open("w") as f:
         for d, v in entries:
             f.write(f"{d}\t{v}\n")
     tmp_path.rename(history_path)
 
-    logger.info("IC history: recorded %s -> %s", trade_date, ic_str or "null")
+    logger.info("IC history: recorded %s -> %s", t5_date, ic_str)
 
 
 # ------------------------------------------------------------------

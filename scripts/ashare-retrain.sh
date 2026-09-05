@@ -72,6 +72,27 @@ fi
 
 log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 
+
+# Serve-now live models (w115) sit outside walk-forward (w1..w11).
+# --force all windows would write w11.pt on gpu-win; predict loads
+# w11.pt when it exists and displaces live w115.
+EXPECTED_MODEL=""
+if [ -f "$PROJECT_DIR/configs/baseline.yaml" ]; then
+    EXPECTED_MODEL=$(python3 -c "
+import re, sys
+with open('$PROJECT_DIR/configs/baseline.yaml') as f:
+    text = f.read()
+# Find expected_live_model under research: section
+m = re.search(r'expected_live_model:\s*[\"'\'']*([wW]\d+)', text)
+print(m.group(1).lower() if m else '')
+" 2>/dev/null || true)
+fi
+EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
+if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
+    log "serve-now live model ${EXPECTED_MODEL} is outside walk-forward; skipping --force all-windows"
+    exit 0
+fi
+
 # --- Step 1: Wake GPU ---
 log "Waking GPU..."
 wol "$WOL_MAC"

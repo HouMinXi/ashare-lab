@@ -225,6 +225,21 @@ class TestGpuCodeSyncShipsModelMeta:
         assert "predict.py" in staging
 
 
+class TestRetrainSkipsServeNowLive:
+    """Walk-forward --force must not clobber a serve-now live model (w115)."""
+
+    RETRAIN = Path(SCRIPT).resolve().parent / "ashare-retrain.sh"
+
+    def test_serve_now_guard_before_train(self):
+        src = self.RETRAIN.read_text()
+        assert "serve-now" in src
+        train_at = src.index("py -m ashare_lab.research.train --force")
+        guard_at = src.index("serve-now")
+        assert guard_at < train_at
+        assert "-ge 100" in src
+        assert "skipping --force all-windows" in src
+
+
 class TestWakeLibBehavior:
     """Direct tests of the shared lib, independent of the sync path."""
 

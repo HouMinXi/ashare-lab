@@ -124,6 +124,8 @@ def test_monitor_wiring_after_graduation(prediction_file, tmp_path):
         graduation.side_effect = record_call("graduation")
         psi.side_effect = record_call("psi")
         ic.side_effect = record_call("ic")
+        hist = stack.enter_context(patch(f"{_MOD}.append_ic_history"))
+        hist.side_effect = record_call("ic_history")
 
         rc = run_daily("2025-06-20", pred_path=prediction_file)
 
@@ -131,4 +133,5 @@ def test_monitor_wiring_after_graduation(prediction_file, tmp_path):
     graduation.assert_called_once()
     psi.assert_called_once()
     ic.assert_called_once()
-    assert call_order == ["graduation", "psi", "ic"]
+    hist.assert_called_once()
+    assert call_order == ["graduation", "psi", "ic", "ic_history"]

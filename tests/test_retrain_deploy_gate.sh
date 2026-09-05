@@ -22,6 +22,8 @@ _run_test() {
     local expect_sentinel="$5" # "yes" or "no"
     local expect_skip_log="$6" # "yes" or "no"
     local scp_fails="${7:-no}" # "yes" = scp shim exits 1
+    local expect_llama="${8:-yes}"
+    local expect_serve_now="${9:-no}"
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -115,6 +117,13 @@ exit 0
 SH
     chmod +x "$shim_bin/flock"
 
+    # sleep: no-op (the script sleeps 5s after stopping llama-server)
+    cat > "$shim_bin/sleep" <<'SH'
+#!/bin/bash
+exit 0
+SH
+    chmod +x "$shim_bin/sleep"
+
     # python3 shim: handle baseline.yaml parse, delegate rest to real python3
     cat > "$shim_bin/python3" <<SH
 #!/bin/bash
@@ -160,9 +169,19 @@ SH
         echo "  FAIL: skip_log=$actual_skip_log, expected=yes"
         test_passed="no"
     fi
-    if [ "$actual_llama" != "yes" ]; then
-        echo "  FAIL: llama-server restart not called"
+    if [ "$actual_llama" != "$expect_llama" ]; then
+        echo "  FAIL: llama called=$actual_llama, expected=$expect_llama"
         test_passed="no"
+    fi
+    if [ "$expect_serve_now" = "yes" ]; then
+        if ! grep -q "serve-now" "$tmpdir"/logs/retrain-*.log 2>/dev/null; then
+            echo "  FAIL: serve-now skip log missing"
+            test_passed="no"
+        fi
+        if grep -q "^wol" "$SHIM_LOG" 2>/dev/null; then
+            echo "  FAIL: wol ran after serve-now skip"
+            test_passed="no"
+        fi
     fi
 
     if [ "$test_passed" = "yes" ]; then
@@ -198,6 +217,9 @@ _run_test "T5" "" "w10" "yes" "yes" "no"
 
 echo "T6: normal deploy + scp failure (sentinel must NOT be written)"
 _run_test "T6" "w11.pt" "w11" "yes" "no" "no" "yes"
+
+echo "T7: serve-now live (EXPECTED=w115) skips --force all-windows"
+_run_test "T7" "w11.pt" "w115" "no" "no" "no" "no" "no" "yes"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
