@@ -124,17 +124,12 @@ exit 0
 SH
     chmod +x "$shim_bin/sleep"
 
-    # python3 shim: handle baseline.yaml parse, delegate rest to real python3
-    cat > "$shim_bin/python3" <<SH
+    # python3: pass through. The expected_live_model parser must run
+    # for real; stubbing it hid a syntax-broken regex on 2026-09-05.
+    cat > "$shim_bin/python3" <<'SH'
 #!/bin/bash
-echo "python3 \$@" >> "\$SHIM_LOG"
-if echo "\$*" | grep -q "baseline.yaml"; then
-    if [ -n "$expected_model" ]; then
-        echo "$expected_model"
-    fi
-else
-    /usr/bin/python3 "\$@"
-fi
+echo "python3 $@" >> "$SHIM_LOG"
+exec /usr/bin/python3 "$@"
 SH
     chmod +x "$shim_bin/python3"
 

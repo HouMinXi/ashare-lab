@@ -17,6 +17,19 @@ CONSECUTIVE_DAYS=3
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
+
+# Parse expected_live_model from baseline.yaml. No python: a quoted
+# regex in python3 -c is a syntax error that 2>/dev/null swallows.
+read_expected_live_model() {
+    local f="$PROJECT_DIR/configs/baseline.yaml"
+    [ -f "$f" ] || return 0
+    awk '/^[[:space:]]*expected_live_model:/ {
+        gsub(/["\047]/, "", $2)
+        print tolower($2)
+        exit
+    }' "$f"
+}
+
 mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/data"
 
 # --- Sentinel check: prevent double training ---
@@ -76,17 +89,7 @@ log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 # Serve-now live models (w115) sit outside walk-forward (w1..w11).
 # --force all windows would write w11.pt on gpu-win; predict loads
 # w11.pt when it exists and displaces live w115.
-EXPECTED_MODEL=""
-if [ -f "$PROJECT_DIR/configs/baseline.yaml" ]; then
-    EXPECTED_MODEL=$(python3 -c "
-import re, sys
-with open('$PROJECT_DIR/configs/baseline.yaml') as f:
-    text = f.read()
-# Find expected_live_model under research: section
-m = re.search(r'expected_live_model:\s*[\"'\'']*([wW]\d+)', text)
-print(m.group(1).lower() if m else '')
-" 2>/dev/null || true)
-fi
+EXPECTED_MODEL=$(read_expected_live_model)
 EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
 if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
     log "serve-now live model ${EXPECTED_MODEL} is outside walk-forward; skipping --force all-windows"
@@ -143,16 +146,7 @@ NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
     "cd $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['model_file'])\"" 2>/dev/null || true)
 
 # Read expected_live_model from baseline config
-if [ -f "$PROJECT_DIR/configs/baseline.yaml" ]; then
-    EXPECTED_MODEL=$(python3 -c "
-import re, sys
-with open('$PROJECT_DIR/configs/baseline.yaml') as f:
-    text = f.read()
-# Find expected_live_model under research: section
-m = re.search(r'expected_live_model:\s*[\"'\'']*([wW]\d+)', text)
-print(m.group(1).lower() if m else '')
-" 2>/dev/null || true)
-fi
+EXPECTED_MODEL=$(read_expected_live_model)
 
 # Numeric comparison: extract digits after 'w'
 if [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then

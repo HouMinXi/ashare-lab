@@ -232,12 +232,17 @@ class TestRetrainSkipsServeNowLive:
 
     def test_serve_now_guard_before_train(self):
         src = self.RETRAIN.read_text()
-        assert "serve-now" in src
         train_at = src.index("py -m ashare_lab.research.train --force")
-        guard_at = src.index("serve-now")
-        assert guard_at < train_at
+        comment_at = src.index("Serve-now live models")
+        fn_at = src.index("read_expected_live_model()")
+        assert fn_at < comment_at < train_at
         assert "-ge 100" in src
         assert "skipping --force all-windows" in src
+        fn_end = src.index("\n}", fn_at) + 2
+        fn = src[fn_at:fn_end]
+        assert "awk" in fn
+        assert "python3 -c" not in fn
+        assert "2>/dev/null" not in fn
 
 
 class TestWakeLibBehavior:
