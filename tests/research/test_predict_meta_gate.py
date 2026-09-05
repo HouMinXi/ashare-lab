@@ -129,6 +129,24 @@ def test_gate_symlink_stale_mismatch(tmp_path):
     assert reason == "mismatch"
 
 
+def test_gate_live_era_regular_file_copy(tmp_path):
+    """LIVE-ERA on gpu-win: latest.pt is a copy of w11.pt, not a symlink."""
+    w11 = tmp_path / "w11.pt"
+    w11.write_bytes(b"tra-weights-w11")
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(w11.read_bytes())
+    meta = {
+        "model_file": "w11.pt",
+        "train_date": (date.today() - timedelta(days=3)).isoformat(),
+    }
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    result, reason = read_model_meta(latest)
+    assert result is not None
+    assert reason is None
+    age = (date.today() - date.fromisoformat(result["train_date"])).days
+    assert age == 3
+
+
 def test_gate_warn_only_semantics(tmp_path):
     """6. Threshold semantics: age 8 -> warn-only, prediction proceeds."""
     model_path = _make_meta(tmp_path, train_date=(date.today() - timedelta(days=8)).isoformat())

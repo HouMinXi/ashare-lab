@@ -149,6 +149,40 @@ def test_read_meta_symlink_mismatch(tmp_path):
     assert reason == "mismatch"
 
 
+def test_read_meta_regular_file_copy_of_named_model(tmp_path):
+    """gpu-win: latest.pt is a byte copy of w11.pt, not a symlink.
+
+    resolve().name stays 'latest.pt' so a name-only check mismatches
+    even though the bytes are the model meta.json describes.
+    """
+    w11 = tmp_path / "w11.pt"
+    w11.write_bytes(b"tra-weights-w11")
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(w11.read_bytes())
+    meta = {"model_file": "w11.pt", "train_date": "2026-08-04"}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    result, reason = read_model_meta(latest)
+    assert result is not None, f"copy of named model rejected: {reason}"
+    assert reason is None
+    assert latest.is_symlink() is False
+    assert latest.resolve().name == "latest.pt"
+
+
+def test_read_meta_regular_file_copy_of_other_model(tmp_path):
+    """gpu-win copy of w10.pt must still mismatch a w11.pt meta."""
+    w10 = tmp_path / "w10.pt"
+    w10.write_bytes(b"tra-weights-w10")
+    w11 = tmp_path / "w11.pt"
+    w11.write_bytes(b"tra-weights-w11")
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(w10.read_bytes())
+    meta = {"model_file": "w11.pt", "train_date": "2026-08-04"}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    result, reason = read_model_meta(latest)
+    assert result is None
+    assert reason == "mismatch"
+
+
 # -- Injection tests --
 
 def test_injection_delete_writer(tmp_path):

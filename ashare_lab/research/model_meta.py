@@ -15,6 +15,7 @@ Schema (FROZEN):
 """
 from __future__ import annotations
 
+import filecmp
 import json
 import logging
 import socket
@@ -33,6 +34,23 @@ _TRAIN_HOST = "train_host"
 
 # Asia/Shanghai offset (UTC+8)
 _CST = timezone(timedelta(hours=8))
+
+
+def _is_byte_copy_of(candidate: Path, named: Path) -> bool:
+    """True when candidate is a regular-file copy of named.
+
+    gpu-win cannot ship latest.pt as a symlink; predict.py already
+    treats that host as a byte copy. Name-only identity would then
+    always mismatch on the live path.
+    """
+    try:
+        if not named.is_file() or not candidate.is_file():
+            return False
+        if candidate.resolve() == named.resolve():
+            return True
+        return filecmp.cmp(candidate, named, shallow=False)
+    except OSError:
+        return False
 
 
 def write_model_meta(
@@ -110,11 +128,15 @@ def read_model_meta(
     if train_date > today:
         return None, "train_date future"
 
-    # model_file mismatch check (R4 #3: use resolve().name)
+    # Identity: symlink resolve (X500 latest.pt -> wN.pt) OR a
+    # regular-file copy of the named model (gpu-win cannot ship
+    # the same symlink; predict.py already treats that as a copy).
     expected_model = raw.get(_MODEL_FILE)
     if expected_model is not None:
         actual_name = model_path.resolve().name
-        if expected_model != actual_name:
+        if expected_model != actual_name and not _is_byte_copy_of(
+            model_path, model_path.parent / expected_model
+        ):
             return None, "mismatch"
 
     return raw, None
