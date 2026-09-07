@@ -2593,22 +2593,32 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
                 if len(parts) == 2:
                     entries.append((parts[0], parts[1]))
 
+    kept: list[tuple[str, str]] = []
+    saw_finite_t5 = False
     for d, existing in entries:
         if d != t5_date:
+            kept.append((d, existing))
             continue
         try:
             existing_f = float(existing)
         except (TypeError, ValueError):
             existing_f = None
         if existing_f is not None and _math.isfinite(existing_f):
+            saw_finite_t5 = True
+            kept.append((d, existing))
+        # else: drop placeholder (empty / "None" / nan / inf)
+    if saw_finite_t5:
+        if kept == entries:
             logger.debug("IC history: %s already recorded, skipping", t5_date)
             return
-        # Placeholder from the old writer (empty / "None") -- replace.
-        entries = [(dd, vv) for dd, vv in entries if dd != t5_date]
-        break
+        entries = kept
+        logger.info("IC history: dropped placeholder rows for %s", t5_date)
+    else:
+        ic_str = str(float(ic_val))
+        entries = kept
+        entries.append((t5_date, ic_str))
+        logger.info("IC history: recorded %s -> %s", t5_date, ic_str)
 
-    ic_str = str(float(ic_val))
-    entries.append((t5_date, ic_str))
     entries.sort(key=lambda e: e[0])
     entries = entries[-30:]
 
@@ -2617,8 +2627,6 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
         for d, v in entries:
             f.write(f"{d}\t{v}\n")
     tmp_path.rename(history_path)
-
-    logger.info("IC history: recorded %s -> %s", t5_date, ic_str)
 
 
 # ------------------------------------------------------------------

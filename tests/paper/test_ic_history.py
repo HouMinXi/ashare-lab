@@ -123,3 +123,63 @@ def test_finite_ic_is_not_overwritten(tmp_path, monkeypatch):
 
     rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
     assert rows == ["2026-08-26\t-0.042"]
+
+
+def test_nan_placeholder_does_not_block_valid_ic(tmp_path, monkeypatch):
+    """A TSV nan token is numeric but not finite; replace it."""
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.042, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\tnan\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]
+
+
+def test_inf_placeholder_does_not_block_valid_ic(tmp_path, monkeypatch):
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.042, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\tinf\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]
+
+
+def test_placeholder_before_finite_same_date_keeps_finite(tmp_path, monkeypatch):
+    """Corrupt TSV: placeholder then a finite row for the same date.
+    Keep the finite value; do not wipe both and rewrite."""
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.099, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\tNone\n2026-08-26\t-0.042\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]
