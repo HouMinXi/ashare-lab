@@ -46,9 +46,13 @@ exit /b 1
 %NSSM% stop llama-server >nul 2>&1
 if errorlevel 1 (echo ERROR: failed to stop llama-server & call :cleanup_lock & exit /b 1)
 %NSSM% status OllamaService 2>nul | findstr /I "SERVICE_RUNNING" >nul 2>&1
-if not errorlevel 1 (echo OllamaService already running, skipping start & call :cleanup_lock & exit /b 0)
+if not errorlevel 1 (
+    echo ollama> H:\ollama\logs\gpu-last-consumer.txt
+    echo OllamaService already running, skipping start & call :cleanup_lock & exit /b 0
+)
 %NSSM% start OllamaService
 if errorlevel 1 (echo ERROR: failed to start OllamaService & call :cleanup_lock & exit /b 1)
+echo ollama> H:\ollama\logs\gpu-last-consumer.txt
 call :cleanup_lock
 exit /b 0
 
@@ -57,9 +61,13 @@ exit /b 0
 %NSSM% stop OllamaService >nul 2>&1
 if errorlevel 1 (echo ERROR: failed to stop OllamaService & call :cleanup_lock & exit /b 1)
 %NSSM% status llama-server 2>nul | findstr /I "SERVICE_RUNNING" >nul 2>&1
-if not errorlevel 1 (echo llama-server already running, skipping start & call :cleanup_lock & exit /b 0)
+if not errorlevel 1 (
+    echo llama-server> H:\ollama\logs\gpu-last-consumer.txt
+    echo llama-server already running, skipping start & call :cleanup_lock & exit /b 0
+)
 %NSSM% start llama-server
 if errorlevel 1 (echo ERROR: failed to start llama-server & call :cleanup_lock & exit /b 1)
+echo llama-server> H:\ollama\logs\gpu-last-consumer.txt
 call :cleanup_lock
 exit /b 0
 

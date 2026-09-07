@@ -177,17 +177,14 @@ try_gpu_inference() {
         return 1
     fi
 
-    # W4: detect current GPU consumer before clearing
-    local gpu_restore_target="ollama"
-    local _llama_running
+    # W4: live process wins; else last durable consumer (survives reboot).
+    local _llama_running _last_consumer gpu_restore_target
     _llama_running=$(ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
         'tasklist /FI "IMAGENAME eq llama-server.exe" /NH 2>NUL | findstr /I llama-server' 2>/dev/null | tr -d '\r')
-    if [ -n "$_llama_running" ]; then
-        gpu_restore_target="llama-server"
-        echo "GPU consumer detected: llama-server"
-    else
-        echo "GPU consumer detected: ollama (default)"
-    fi
+    _last_consumer=$(ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
+        'type H:\ollama\logs\gpu-last-consumer.txt 2>NUL' 2>/dev/null | tr -d '\r')
+    gpu_restore_target=$(resolve_gpu_restore_target "$_llama_running" "$_last_consumer")
+    echo "GPU consumer detected: $gpu_restore_target"
 
     # W4: clear GPU for predict (stop ollama + llama-server)
     ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training' || \

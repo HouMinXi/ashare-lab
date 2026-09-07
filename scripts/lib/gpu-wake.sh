@@ -74,3 +74,23 @@ wake_gpu() {
 
     return 0
 }
+
+# resolve_gpu_restore_target LIVE_TASKLIST LAST_CONSUMER
+#   Prints ollama or llama-server. Live llama-server.exe wins; otherwise
+#   LAST_CONSUMER if it is a serve target; else ollama. DEMAND_START
+#   reboot leaves no process, so LAST_CONSUMER is the only memory.
+resolve_gpu_restore_target() {
+    local live="${1:-}" last="${2:-}"
+    last="${last//$'\r'/}"
+    last="${last//$'\n'/}"
+    last="${last#"${last%%[![:space:]]*}"}"
+    last="${last%"${last##*[![:space:]]}"}"
+    if printf '%s' "$live" | grep -qi 'llama-server'; then
+        echo llama-server
+        return 0
+    fi
+    case "$last" in
+        llama-server|ollama) echo "$last" ;;
+        *) echo ollama ;;
+    esac
+}

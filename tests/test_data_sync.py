@@ -225,6 +225,64 @@ class TestGpuCodeSyncShipsModelMeta:
         assert "predict.py" in staging
 
 
+class TestGpuLastConsumer:
+    """After a DEMAND_START reboot, llama is not running. Restore must
+    follow the last durable consumer, not the ollama default."""
+
+    PIPELINE = Path(SCRIPT).resolve().parent / "ashare-pipeline.sh"
+    LIB = Path(SCRIPT).resolve().parent / "lib" / "gpu-wake.sh"
+    SWITCH = Path(SCRIPT).resolve().parent / "gpu-switch.bat"
+
+    def _run_lib(self, snippet: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", "-c", f"source {self.LIB}\n" + snippet],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    def test_live_llama_wins_over_stale_file(self):
+        r = self._run_lib(
+            'resolve_gpu_restore_target "llama-server.exe 1234" "ollama"; echo RC=$?'
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip().splitlines()[-2:] == ["llama-server", "RC=0"] or (
+            r.stdout.strip().splitlines()[-1] == "llama-server"
+        )
+
+    def test_reboot_uses_last_llama_when_process_gone(self):
+        r = self._run_lib('resolve_gpu_restore_target "" "llama-server"')
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip().splitlines()[-1] == "llama-server"
+
+    def test_reboot_uses_last_ollama(self):
+        r = self._run_lib('resolve_gpu_restore_target "" "ollama\\r"')
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip().splitlines()[-1] == "ollama"
+
+    def test_unknown_or_empty_last_stays_ollama(self):
+        r = self._run_lib('resolve_gpu_restore_target "" "training"')
+        assert r.stdout.strip().splitlines()[-1] == "ollama"
+        r2 = self._run_lib('resolve_gpu_restore_target "" ""')
+        assert r2.stdout.strip().splitlines()[-1] == "ollama"
+
+    def test_pipeline_calls_resolver_not_hardcoded_default(self):
+        src = self.PIPELINE.read_text()
+        fn = src[src.index("try_gpu_inference()"): src.index("gpu-switch.bat training")]
+        assert "resolve_gpu_restore_target" in fn
+        assert "gpu_restore_target=\"ollama\"" not in fn
+
+    def test_switch_writes_durable_consumer_for_serve_targets(self):
+        src = self.SWITCH.read_text()
+        assert "gpu-last-consumer.txt" in src
+        ollama = src[src.index("\n:ollama\n"): src.index("\n:llama-server\n")]
+        llama = src[src.index("\n:llama-server\n"): src.index("\n:training\n")]
+        training = src[src.index("\n:training\n"): src.index("\n:training-3080\n")]
+        train3080 = src[src.index("\n:training-3080\n"):]
+        assert "gpu-last-consumer.txt" in ollama
+        assert "gpu-last-consumer.txt" in llama
+        assert "gpu-last-consumer.txt" not in training
+        assert "gpu-last-consumer.txt" not in train3080
+
+
 class TestRetrainSkipsServeNowLive:
     """Walk-forward --force must not clobber a serve-now live model (w115)."""
 
