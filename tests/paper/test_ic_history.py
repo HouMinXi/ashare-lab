@@ -12,6 +12,9 @@ _MOD = "ashare_lab.paper.pipeline"
 
 
 def _walk_back(_date: dt.date) -> dt.date:
+    # Isolates the unit from the exchange calendar. Production walks
+    # previous_trading_day (skips weekends/holidays); this mock subtracts
+    # one calendar day so fixtures can pick T-5 as trade_date minus 5 days.
     return _date - dt.timedelta(days=1)
 
 
@@ -60,3 +63,63 @@ def test_append_ignores_live_ic_field(tmp_path, monkeypatch):
 
     rows = (tmp_path / "data" / "ic_history.tsv").read_text().strip().splitlines()
     assert rows == ["2026-08-26\t0.096"]
+
+
+def test_empty_placeholder_does_not_block_valid_ic(tmp_path, monkeypatch):
+    """An old empty-IC row for T-5 must not keep a later valid value out."""
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.042, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\t\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]
+
+
+def test_non_numeric_placeholder_does_not_block_valid_ic(tmp_path, monkeypatch):
+    """A 'None' string from the old writer must not keep a later valid value out."""
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.042, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\tNone\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]
+
+
+def test_finite_ic_is_not_overwritten(tmp_path, monkeypatch):
+    """A numeric T-5 row stays; backfill does not rewrite it."""
+    monkeypatch.setattr(f"{_MOD}.PROJECT_ROOT", tmp_path)
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    (pred_dir / "2026-08-31.parquet").touch()
+    (pred_dir / "2026-08-26.meta.json").write_text(
+        json.dumps({"lagged_ic_t5": -0.099, "ic": None})
+    )
+    hist = tmp_path / "data"
+    hist.mkdir()
+    (hist / "ic_history.tsv").write_text("2026-08-26\t-0.042\n")
+
+    with patch(f"{_MOD}.previous_trading_day", side_effect=_walk_back):
+        append_ic_history(pred_dir / "2026-08-31.parquet", "2026-08-31")
+
+    rows = (hist / "ic_history.tsv").read_text().strip().splitlines()
+    assert rows == ["2026-08-26\t-0.042"]

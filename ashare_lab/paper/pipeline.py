@@ -2593,10 +2593,19 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
                 if len(parts) == 2:
                     entries.append((parts[0], parts[1]))
 
-    for d, _ in entries:
-        if d == t5_date:
+    for d, existing in entries:
+        if d != t5_date:
+            continue
+        try:
+            existing_f = float(existing)
+        except (TypeError, ValueError):
+            existing_f = None
+        if existing_f is not None and _math.isfinite(existing_f):
             logger.debug("IC history: %s already recorded, skipping", t5_date)
             return
+        # Placeholder from the old writer (empty / "None") -- replace.
+        entries = [(dd, vv) for dd, vv in entries if dd != t5_date]
+        break
 
     ic_str = str(float(ic_val))
     entries.append((t5_date, ic_str))
