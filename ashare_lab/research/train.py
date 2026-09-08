@@ -636,7 +636,7 @@ if __name__ == "__main__":
     import sys
 
     # Deferred import to avoid circular dependency (smoke_test imports train)
-    from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import get_all_windows, get_window  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(
         description="Walk-forward window training driver"
@@ -660,38 +660,68 @@ if __name__ == "__main__":
         help="Qlib universe (default: csi1000)",
     )
     parser.add_argument(
+        "--serve-now",
+        type=int,
+        default=None,
+        metavar="STEP",
+        help=(
+            "Train one walk-forward STEP whose test period has not started "
+            "yet (serve-now). Bypasses the get_all_windows cutoff, which "
+            "only yields windows already past test_start."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Re-train windows whose model file already exists",
     )
     args = parser.parse_args()
 
-    # Resolve windows
-    all_windows = get_all_windows()
-    if not all_windows:
-        log.error("no training windows available")
+    if args.serve_now is not None and args.windows:
+        log.error("--serve-now and --windows are mutually exclusive")
         sys.exit(2)
 
-    if args.windows:
-        selected = []
-        for wid in args.windows.split(","):
-            wid = wid.strip()
-            if wid.startswith("w"):
-                wid = wid[1:]
-            try:
-                wid_int = int(wid)
-            except ValueError:
-                log.error("invalid window ID: %s", wid)
-                sys.exit(2)
-            for w in all_windows:
-                if w["window_id"] == wid_int:
-                    selected.append(w)
-                    break
-            else:
-                log.error("window %d not found in config", wid_int)
-                sys.exit(2)
+    # Resolve windows
+    if args.serve_now is not None:
+        # get_all_windows stops at the last window whose test period has
+        # started, so a freshly-trainable window is invisible to it. Ask
+        # for the step directly.
+        window = get_window(args.serve_now)
+        if not window:
+            log.error("serve-now step %d has no window", args.serve_now)
+            sys.exit(2)
+        selected = [window]
+        log.info(
+            "serve-now: step %d -> W%d train %s..%s",
+            args.serve_now, window["window_id"],
+            window["train_start"], window["train_end"],
+        )
     else:
-        selected = all_windows
+        all_windows = get_all_windows()
+        if not all_windows:
+            log.error("no training windows available")
+            sys.exit(2)
+
+        if args.windows:
+            selected = []
+            for wid in args.windows.split(","):
+                wid = wid.strip()
+                if wid.startswith("w"):
+                    wid = wid[1:]
+                try:
+                    wid_int = int(wid)
+                except ValueError:
+                    log.error("invalid window ID: %s", wid)
+                    sys.exit(2)
+                for w in all_windows:
+                    if w["window_id"] == wid_int:
+                        selected.append(w)
+                        break
+                else:
+                    log.error("window %d not found in config", wid_int)
+                    sys.exit(2)
+        else:
+            selected = all_windows
 
     if not selected:
         log.error("empty window selection -- nothing to train")

@@ -1,5 +1,6 @@
 """Tests for sync_gpu_data in scripts/ashare-data-update.sh."""
 
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -284,23 +285,64 @@ class TestGpuLastConsumer:
 
 
 class TestRetrainSkipsServeNowLive:
-    """Walk-forward --force must not clobber a serve-now live model (w115)."""
+    """A serve-now live model (w115) must be retrained on its own window,
+    never by --force over the walk-forward set, which would write w11.pt
+    and displace it."""
 
     RETRAIN = Path(SCRIPT).resolve().parent / "ashare-retrain.sh"
 
+    def test_serve_now_step_is_derived_not_hardcoded(self):
+        """get_all_windows() stops at the last window whose test period has
+        started, so the freshest trainable step is always its length. A
+        literal step number silently trains a stale window once the data
+        grows past the next window boundary."""
+        src = self.RETRAIN.read_text()
+        assert "SERVE_NOW_STEP=11" not in src, (
+            "step is hardcoded; derive it from len(get_all_windows())"
+        )
+        assert "get_all_windows" in src
+
     def test_serve_now_guard_before_train(self):
         src = self.RETRAIN.read_text()
-        train_at = src.index("py -m ashare_lab.research.train --force")
+        train_at = src.index("py -m ashare_lab.research.train $TRAIN_ARGS")
         comment_at = src.index("Serve-now live models")
         fn_at = src.index("read_expected_live_model()")
         assert fn_at < comment_at < train_at
         assert "-ge 100" in src
-        assert "skipping --force all-windows" in src
+        assert "--serve-now $SERVE_NOW_STEP --force" in src
         fn_end = src.index("\n}", fn_at) + 2
         fn = src[fn_at:fn_end]
         assert "awk" in fn
         assert "python3 -c" not in fn
         assert "2>/dev/null" not in fn
+
+    def test_deploy_gate_uses_train_date_for_serve_now(self):
+        """w12 is numerically below w115, so the numeric gate would deploy a
+        staler model without complaint. Serve-now deploys compare train_date,
+        and a serve-now run that cannot read both dates shelves rather than
+        falling through to a gate that cannot judge it."""
+        src = self.RETRAIN.read_text()
+        assert "NEW_TRAIN_DATE" in src
+        assert "LIVE_TRAIN_DATE" in src
+        gate_at = src.index('if [ "$SERVE_NOW_LIVE" -eq 1 ]')
+        numeric_at = src.index('elif [ -n "$NEW_MODEL" ]')
+        assert gate_at < numeric_at
+        closed = src.index('if [ -z "$NEW_TRAIN_DATE" ] || [ -z "$LIVE_TRAIN_DATE" ]')
+        assert gate_at < closed < numeric_at
+
+    def test_alerts_do_not_interpolate_values_into_python(self):
+        """Alert values read off gpu-win are data, not code. Embedding
+        them in the inline python source lets a quote in meta.json break
+        the alert, so the shelved-model warning is lost. Shell log lines
+        are unaffected; only the python -c blocks are scanned."""
+        src = self.RETRAIN.read_text()
+        blocks = re.findall(r"python3 -c (.)\n(.*?)\n\1", src, re.S)
+        assert blocks, "no inline python blocks found"
+        for _quote, body in blocks:
+            assert "$" not in body, (
+                f"shell value interpolated into inline python:\n{body}"
+            )
+        assert src.count("os.environ[") >= 4
 
 
 class TestWakeLibBehavior:

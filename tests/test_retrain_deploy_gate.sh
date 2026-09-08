@@ -24,6 +24,10 @@ _run_test() {
     local scp_fails="${7:-no}" # "yes" = scp shim exits 1
     local expect_llama="${8:-yes}"
     local expect_serve_now="${9:-no}"
+    local expect_train_args="${10:-}"  # substring the train ssh command must carry
+    local new_train_date="${11-2026-06-30}"   # gpu-side meta.json train_date ("" = unreadable)
+    local live_train_date="${12-2026-01-23}"  # local models/meta.json train_date
+    local break_step="${13:-no}"              # make the step derivation fail
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -47,6 +51,9 @@ YAML
     # Pre-create models dir with a dummy w10.pt (existing production model)
     touch "$tmpdir/models/w10.pt"
     ln -sf w10.pt "$tmpdir/models/latest.pt"
+    cat > "$tmpdir/models/meta.json" <<JSON
+{"model_file": "w10.pt", "train_date": "$live_train_date", "window_id": "w10"}
+JSON
 
     # --- Create a copy of retrain script with PROJECT_DIR overridden ---
     # Symlink script into tmpdir so SCRIPT_DIR resolves to tmpdir
@@ -85,7 +92,11 @@ echo "ssh \$@" >> "\$SHIM_LOG"
 # meta.json read
 if echo "\$*" | grep -q "meta.json"; then
     if [ -n "$new_model" ]; then
-        echo "$new_model"
+        if echo "\$*" | grep -q "train_date"; then
+            [ -n "$new_train_date" ] && echo "$new_train_date"
+        else
+            echo "$new_model"
+        fi
     else
         exit 1
     fi
@@ -126,10 +137,13 @@ SH
 
     # python3: pass through. The expected_live_model parser must run
     # for real; stubbing it hid a syntax-broken regex on 2026-09-05.
-    cat > "$shim_bin/python3" <<'SH'
+    cat > "$shim_bin/python3" <<SH
 #!/bin/bash
-echo "python3 $@" >> "$SHIM_LOG"
-exec /usr/bin/python3 "$@"
+echo "python3 \$@" >> "\$SHIM_LOG"
+if [ "$break_step" = "yes" ] && echo "\$*" | grep -q "get_all_windows"; then
+    exit 1
+fi
+exec /usr/bin/python3 "\$@"
 SH
     chmod +x "$shim_bin/python3"
 
@@ -179,6 +193,13 @@ SH
         fi
     fi
 
+    if [ -n "$expect_train_args" ]; then
+        if ! grep -q -- "$expect_train_args" "$SHIM_LOG" 2>/dev/null; then
+            echo "  FAIL: train command missing '$expect_train_args'"
+            test_passed="no"
+        fi
+    fi
+
     if [ "$test_passed" = "yes" ]; then
         echo "  PASS"
         PASS=$((PASS + 1))
@@ -213,8 +234,17 @@ _run_test "T5" "" "w10" "yes" "yes" "no"
 echo "T6: normal deploy + scp failure (sentinel must NOT be written)"
 _run_test "T6" "w11.pt" "w11" "yes" "no" "no" "yes"
 
-echo "T7: serve-now live (EXPECTED=w115) skips --force all-windows"
-_run_test "T7" "w11.pt" "w115" "no" "no" "no" "no" "no" "yes"
+echo "T7: serve-now live (EXPECTED=w115) retrains the serve-now window"
+_run_test "T7" "w12.pt" "w115" "yes" "yes" "no" "no" "yes" "no" "--serve-now"
+
+echo "T8: serve-now trains an older window -> shelved on train_date"
+_run_test "T8" "w12.pt" "w115" "no" "yes" "yes" "no" "yes" "no" "--serve-now" "2025-12-31" "2026-01-23"
+
+echo "T9: serve-now with unreadable train_date -> shelved, never deployed"
+_run_test "T9" "w12.pt" "w115" "no" "yes" "yes" "no" "yes" "no" "--serve-now" "" "2026-01-23"
+
+echo "T10: serve-now step underivable -> abort, never bare --force"
+_run_test "T10" "" "w115" "no" "no" "no" "no" "no" "no" "" "" "2026-01-23" "yes"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

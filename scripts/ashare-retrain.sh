@@ -86,14 +86,27 @@ fi
 log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 
 
-# Serve-now live models (w115) sit outside walk-forward (w1..w11).
-# --force all windows would write w11.pt on gpu-win; predict loads
-# w11.pt when it exists and displaces live w115.
+# Serve-now live models (w115) sit outside walk-forward (w1..w11), so
+# --force all-windows would write w11.pt on gpu-win and displace live
+# w115. Train the newest window instead: get_all_windows stops at the
+# last window whose test period has started, so the freshest trainable
+# window needs --serve-now <step> to reach.
 EXPECTED_MODEL=$(read_expected_live_model)
 EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
+TRAIN_ARGS="--force"
 if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
-    log "serve-now live model ${EXPECTED_MODEL} is outside walk-forward; skipping --force all-windows"
-    exit 0
+    # get_all_windows() stops at the last window whose test period has
+    # started, so its length is the step of the freshest trainable window.
+    SERVE_NOW_STEP=$(PYTHONPATH="$PROJECT_DIR" python3 -c '
+from ashare_lab.research.smoke_test import get_all_windows
+print(len(get_all_windows()))
+' 2>/dev/null || true)
+    if [ -z "$SERVE_NOW_STEP" ]; then
+        log "serve-now live model ${EXPECTED_MODEL}: cannot derive step; aborting rather than running --force over the walk-forward set"
+        exit 1
+    fi
+    log "serve-now live model ${EXPECTED_MODEL}: training step ${SERVE_NOW_STEP} instead of --force all-windows"
+    TRAIN_ARGS="--serve-now $SERVE_NOW_STEP --force"
 fi
 
 # --- Step 1: Wake GPU ---
@@ -129,7 +142,7 @@ ssh -o ConnectTimeout=5 "$GPU_HOST" "del H:\\ashare-lab\\models\\meta.json 2>NUL
 log "Starting training..."
 PT_OK=0
 TRAIN_RC=0
-if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd $GPU_REPO && py -m ashare_lab.research.train --force" >> "$LOG_FILE" 2>&1; then
+if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd $GPU_REPO && py -m ashare_lab.research.train $TRAIN_ARGS" >> "$LOG_FILE" 2>&1; then
     :
 else
     TRAIN_RC=$?
@@ -148,19 +161,71 @@ NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
 # Read expected_live_model from baseline config
 EXPECTED_MODEL=$(read_expected_live_model)
 
+# Serve-now models carry an out-of-band window number (w115), so "12 > 115"
+# is false and a staler w12 would sail through the numeric gate. Compare
+# training dates instead: only a model trained on newer data may deploy.
+# The branch is closed: a serve-now run that cannot read both dates shelves
+# rather than falling back to the numeric gate that cannot judge it.
+SERVE_NOW_LIVE=0
+NEW_TRAIN_DATE=""
+LIVE_TRAIN_DATE=""
+if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
+    SERVE_NOW_LIVE=1
+    NEW_TRAIN_DATE=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
+        "cd $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['train_date'])\"" 2>/dev/null || true)
+    if [ -f "$PROJECT_DIR/models/meta.json" ]; then
+        LIVE_TRAIN_DATE=$(META_PATH="$PROJECT_DIR/models/meta.json" \
+        PYTHONPATH="$PROJECT_DIR" python3 -c '
+import json, os
+print(json.load(open(os.environ["META_PATH"])).get("train_date", ""))
+' 2>/dev/null || true)
+    fi
+fi
+
+if [ "$SERVE_NOW_LIVE" -eq 1 ]; then
+    if [ -z "$NEW_TRAIN_DATE" ] || [ -z "$LIVE_TRAIN_DATE" ]; then
+        DEPLOY_SKIP=1
+        log "serve-now deploy gate: train_date unavailable (new='${NEW_TRAIN_DATE}', live='${LIVE_TRAIN_DATE}'); not deploying"
+        NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
+        PYTHONPATH="$PROJECT_DIR" python3 -c '
+import os
+from ashare_lab.bridge import send_bridge_alert
+send_bridge_alert("ashare retrain: model shelved",
+                  "serve-now deploy gate could not read train_date "
+                  "(new=%s, live=%s), artifact left on gpu-win"
+                  % (os.environ["NEW_TRAIN_DATE"], os.environ["LIVE_TRAIN_DATE"]))
+' >>"$LOG_FILE" 2>&1 || true
+    elif [ "$NEW_TRAIN_DATE" \< "$LIVE_TRAIN_DATE" ] || [ "$NEW_TRAIN_DATE" = "$LIVE_TRAIN_DATE" ]; then
+        DEPLOY_SKIP=1
+        log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} is not newer than live ${LIVE_TRAIN_DATE}; not deploying"
+        NEW_MODEL="$NEW_MODEL" NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
+        PYTHONPATH="$PROJECT_DIR" python3 -c '
+import os
+from ashare_lab.bridge import send_bridge_alert
+send_bridge_alert("ashare retrain: model shelved",
+                  "%s train_date %s not newer than live %s, artifact left on gpu-win"
+                  % (os.environ["NEW_MODEL"], os.environ["NEW_TRAIN_DATE"],
+                     os.environ["LIVE_TRAIN_DATE"]))
+' >>"$LOG_FILE" 2>&1 || true
+    else
+        log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} supersedes live ${LIVE_TRAIN_DATE}; deploying"
+    fi
 # Numeric comparison: extract digits after 'w'
-if [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then
+elif [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then
     NEW_N=$(echo "$NEW_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
-    EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
     if [ -n "$NEW_N" ] && [ -n "$EXPECTED_N" ] && [ "$NEW_N" -gt "$EXPECTED_N" ]; then
         DEPLOY_SKIP=1
         log "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}); not deploying"
         # Alert via the bridge module (failure must not affect script)
-        PYTHONPATH="$PROJECT_DIR" python3 -c "
+        NEW_N="$NEW_N" EXPECTED_N="$EXPECTED_N" \
+        PYTHONPATH="$PROJECT_DIR" python3 -c '
+import os
 from ashare_lab.bridge import send_bridge_alert
-send_bridge_alert('ashare retrain: model shelved',
-                  'w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}), artifact left on gpu-win')
-" >>"$LOG_FILE" 2>&1 || true
+send_bridge_alert("ashare retrain: model shelved",
+                  "w%s trained but shelved (expected_live_model=w%s), "
+                  "artifact left on gpu-win"
+                  % (os.environ["NEW_N"], os.environ["EXPECTED_N"]))
+' >>"$LOG_FILE" 2>&1 || true
     fi
 elif [ -z "$NEW_MODEL" ]; then
     log "WARNING: could not read gpu-side meta.json, deploying as fallback"
