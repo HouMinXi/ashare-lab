@@ -113,8 +113,15 @@ def check_graduation(
     return passed, stats
 
 
+def _send_graduation_text(text: str) -> bool:
+    """Send graduation notice to QQ. Isolated for tests to patch."""
+    from ashare_lab.bridge import send_qqbot_text
+
+    return send_qqbot_text(text)
+
+
 def notify_graduation(conn: sqlite3.Connection, stats: dict) -> bool:
-    """Send a WeChat graduation notification via iLink.
+    """Send a QQ graduation notification.
 
     Writes graduated_at and notified_at to graduation_status on
     successful delivery.  On failure, does NOT write timestamps so
@@ -122,16 +129,6 @@ def notify_graduation(conn: sqlite3.Connection, stats: dict) -> bool:
 
     Returns True on success, False on failure.
     """
-    try:
-        import asyncio
-        import aiohttp
-        from ashare_lab.paper.report import (
-            send_text_ilink, _get_secret,
-        )
-    except Exception:
-        log.warning("graduation: failed to import iLink dependencies")
-        return False
-
     text = (
         f"[graduation gate PASSED]\n"
         f"success: {stats['success']}, error: {stats['error']}, "
@@ -141,20 +138,11 @@ def notify_graduation(conn: sqlite3.Connection, stats: dict) -> bool:
     )
 
     try:
-        token = _get_secret("ashare/weixin-token")
-        chat_id = _get_secret("ashare/weixin-chat-id")
+        if not _send_graduation_text(text):
+            log.warning("graduation: QQ delivery failed")
+            return False
     except Exception:
-        log.warning("graduation: failed to read iLink secrets")
-        return False
-
-    async def _send() -> dict:
-        async with aiohttp.ClientSession() as session:
-            return await send_text_ilink(session, token, chat_id, text)
-
-    try:
-        asyncio.run(_send())
-    except Exception:
-        log.warning("graduation: iLink delivery failed", exc_info=True)
+        log.warning("graduation: QQ delivery failed", exc_info=True)
         return False
 
     # Delivery succeeded -- write one-shot guard

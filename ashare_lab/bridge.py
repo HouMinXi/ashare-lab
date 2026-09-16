@@ -12,6 +12,9 @@ Token resolution (shared by all callers):
 Uses stdlib urllib to avoid importing requests/aiohttp in the predict
 path.  Callers that need chunking split externally and call this per
 chunk.
+
+Outbound is QQ via X500 alert-bridge (:8377) then hermes send --to qqbot.
+iLink / weixin send is not used.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -30,14 +34,9 @@ _BRIDGE_TOKEN_PATHS = (
     os.path.expanduser("~/.secrets/bridge-token"),  # POSIX
 )
 
-_GATEWAY_URL = "http://192.168.100.10:8642/api/weixin/send"
-_GATEWAY_TOKEN_PATHS = (
-    r"H:\.secrets\hermes-gateway-token",
-    os.path.expanduser("~/.secrets/hermes-gateway-token"),
-)
-_GATEWAY_CHAT_ID_PATHS = (
-    r"H:\.secrets\hermes-weixin-chat-id",
-    os.path.expanduser("~/.secrets/hermes-weixin-chat-id"),
+_HERMES_BIN_CANDIDATES = (
+    os.path.expanduser("~/code/hermes-agent/venv/bin/hermes"),
+    os.path.expanduser("~/code/hermes-agent/hermes"),
 )
 
 
@@ -63,42 +62,45 @@ def bridge_token() -> str:
     return _read_secret("X_BRIDGE_TOKEN", _BRIDGE_TOKEN_PATHS)
 
 
-def _send_via_gateway(title: str, body: str, timeout: int) -> bool:
-    """Fallback: send alert via hermes-gateway /api/weixin/send."""
-    gw_token = _read_secret("HERMES_GATEWAY_TOKEN", _GATEWAY_TOKEN_PATHS)
-    chat_id = _read_secret("HERMES_WEIXIN_CHAT_ID", _GATEWAY_CHAT_ID_PATHS)
-    if not gw_token or not chat_id:
-        logger.warning("bridge: gateway config missing (token=%s, chat_id=%s), skipping fallback",
-                       bool(gw_token), bool(chat_id))
+def send_qqbot_text(text: str, timeout: int = 30) -> bool:
+    """Send one text to QQBot home channel via hermes CLI. Never raises."""
+    hermes = next((p for p in _HERMES_BIN_CANDIDATES if os.path.isfile(p)), "")
+    if not hermes:
+        logger.warning("bridge: hermes CLI missing, skip QQ send")
         return False
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {gw_token}",
-    }
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "message": f"{title}\n{body}",
-    }).encode("utf-8")
-    req = urllib.request.Request(_GATEWAY_URL, data=payload, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        if result.get("success"):
-            logger.info("bridge: fallback alert sent via gateway")
+        r = subprocess.run(
+            [hermes, "send", "-t", "qqbot", "--json"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", errors="replace")[:200]
+            logger.warning("bridge: QQ send rc=%s: %s", r.returncode, err)
+            return False
+        data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+        if data.get("success"):
+            logger.info("bridge: QQ sent")
             return True
-        logger.warning("bridge: gateway returned success=false: %s", result)
+        logger.warning("bridge: QQ reply success=false: %s", data)
         return False
     except Exception as exc:
-        logger.warning("bridge: gateway fallback failed: %s", exc)
+        logger.warning("bridge: QQ send failed: %s", exc)
         return False
+
+
+def _send_via_gateway(title: str, body: str, timeout: int) -> bool:
+    """Fallback when :8377 is down: hermes send --to qqbot."""
+    return send_qqbot_text(f"{title}\n{body}", timeout=timeout)
 
 
 def send_bridge_alert(title: str, body: str, timeout: int = 10) -> bool:
     """Send one alert via the bridge.  Returns True on success.
 
     Fail-open: logs warning and returns False on any error.  Never raises.
-    Fallback: on transport failure (URLError/timeout/5xx), try hermes-gateway.
+    Fallback: on transport failure (URLError/timeout/5xx), hermes send qqbot.
     """
     token = bridge_token()
     if not token:

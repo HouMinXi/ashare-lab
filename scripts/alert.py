@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
 """Independent pipeline failure alert -- stdlib only, no ashare_lab imports."""
 
-import base64
 import json
 import logging
 import os
-import secrets
-import struct
 import subprocess
 import sys
-import urllib.request
-import uuid
 from datetime import date, timedelta
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-
-# iLink constants (inlined from report.py, not imported)
-ILINK_URL = "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage"
-CHANNEL_VERSION = "2.2.0"
-ILINK_APP_ID = "bot"
-ILINK_APP_CLIENT_VERSION = str((2 << 16) | (2 << 8) | 0)
-ITEM_TEXT = 1
-MSG_TYPE_BOT = 2
-MSG_STATE_FINISH = 2
 
 DEFAULT_STAMP = os.path.expanduser("~/.cache/ashare-alert-last.stamp")
 
@@ -31,64 +17,33 @@ DEFAULT_STAMP = os.path.expanduser("~/.cache/ashare-alert-last.stamp")
 # available outside venv. Add XSHG holiday list if precision matters.
 ALERT_INTERVAL_TRADING_DAYS = 3
 
-
-def _get_pass(key: str) -> str:
-    """Read a secret from pass(1)."""
-    r = subprocess.run(
-        ["pass", "show", key],
-        capture_output=True, text=True, check=True, timeout=5,
-    )
-    return r.stdout.strip()
+_HERMES_BIN_CANDIDATES = (
+    os.path.expanduser("~/code/hermes-agent/venv/bin/hermes"),
+    os.path.expanduser("~/code/hermes-agent/hermes"),
+)
 
 
-def _random_wechat_uin() -> str:
-    val = struct.unpack(">I", secrets.token_bytes(4))[0]
-    return base64.b64encode(str(val).encode()).decode()
-
-
-def _ilink_headers(token: str, body: str) -> dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "AuthorizationType": "ilink_bot_token",
-        "Content-Length": str(len(body.encode("utf-8"))),
-        "X-WECHAT-UIN": _random_wechat_uin(),
-        "iLink-App-Id": ILINK_APP_ID,
-        "iLink-App-ClientVersion": ILINK_APP_CLIENT_VERSION,
-        "Authorization": f"Bearer {token}",
-    }
-
-
-def _send_ilink(token: str, chat_id: str, text: str) -> bool:
-    """Send a text message via iLink. Returns True on success."""
-    payload = {
-        "msg": {
-            "from_user_id": "",
-            "to_user_id": chat_id,
-            "client_id": str(uuid.uuid4()),
-            "message_type": MSG_TYPE_BOT,
-            "message_state": MSG_STATE_FINISH,
-            "item_list": [
-                {"type": ITEM_TEXT, "text_item": {"text": text}},
-            ],
-        },
-        "base_info": {"channel_version": CHANNEL_VERSION},
-    }
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    headers = _ilink_headers(token, body)
-    req = urllib.request.Request(
-        ILINK_URL,
-        data=body.encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
+def _send_qqbot(text: str) -> bool:
+    """Send one text to QQBot home channel via hermes CLI."""
+    hermes = next((p for p in _HERMES_BIN_CANDIDATES if os.path.isfile(p)), "")
+    if not hermes:
+        logger.warning("hermes CLI missing")
+        return False
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status == 200:
-                return True
-            logger.warning("iLink HTTP %d", resp.status)
+        r = subprocess.run(
+            [hermes, "send", "-t", "qqbot", "--json"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if r.returncode != 0:
+            logger.warning("QQ send rc=%s", r.returncode)
             return False
+        data = json.loads(r.stdout.decode("utf-8", errors="replace"))
+        return bool(data.get("success"))
     except Exception as exc:
-        logger.warning("iLink send failed: %s", exc)
+        logger.warning("QQ send failed: %s", exc)
         return False
 
 
@@ -171,15 +126,8 @@ def main() -> None:
     if not _should_alert():
         sys.exit(0)
 
-    try:
-        token = _get_pass("ashare/weixin-token")
-        chat_id = _get_pass("ashare/weixin-chat-id")
-    except Exception as exc:
-        logger.warning("Cannot read secrets: %s", exc)
-        sys.exit(1)
-
     msg = _format_alert(exit_code, stage, stderr_tail, elapsed_s)
-    if _send_ilink(token, chat_id, msg):
+    if _send_qqbot(msg):
         _write_stamp()
         sys.exit(0)
     else:

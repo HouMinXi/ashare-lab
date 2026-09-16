@@ -102,42 +102,40 @@ class TestBridgeFallback:
         assert result is False
         mock_gw.assert_called_once()
 
+    @mock.patch("ashare_lab.bridge.os.path.isfile", return_value=False)
     @mock.patch("ashare_lab.bridge.bridge_token", return_value="tok")
     @mock.patch("urllib.request.urlopen", side_effect=_mock_bridge_url_error())
-    def test_t6_no_gateway_config(self, _, __):
-        """T6: no gateway config -> no fallback, False, no exception."""
-        with mock.patch("ashare_lab.bridge._read_secret", return_value=""):
-            result = send_bridge_alert("t6", "body")
+    def test_t6_no_gateway_config(self, _, __, ___):
+        """T6: hermes CLI missing -> no fallback, False, no exception."""
+        result = send_bridge_alert("t6", "body")
         assert result is False
 
 
 class TestGatewayPayload:
-    """Verify gateway receives correct chat_id and message."""
+    """Verify QQ fallback argv when :8377 is down."""
 
+    @mock.patch("ashare_lab.bridge.os.path.isfile", return_value=True)
+    @mock.patch("ashare_lab.bridge.subprocess.run")
     @mock.patch("ashare_lab.bridge.bridge_token", return_value="tok")
     @mock.patch("urllib.request.urlopen")
-    def test_gateway_payload_fields(self, mock_urlopen, _):
-        """Gateway receives chat_id + message (title + body)."""
-        # Bridge fails
-        mock_urlopen.side_effect = [
-            _mock_bridge_url_error(),
-            _mock_gateway_ok(),
-        ]
-        with mock.patch("ashare_lab.bridge._read_secret") as mock_secret:
-            mock_secret.side_effect = lambda env, paths: {
-                "HERMES_GATEWAY_TOKEN": "gw_tok",
-                "HERMES_WEIXIN_CHAT_ID": "chat@test",
-            }.get(env, "")
-            result = send_bridge_alert("My Title", "My Body")
+    def test_gateway_payload_fields(self, mock_urlopen, _, mock_run, __):
+        """Fallback calls hermes send -t qqbot with title+body on stdin."""
+        mock_urlopen.side_effect = _mock_bridge_url_error()
+        mock_run.return_value = mock.Mock(
+            returncode=0,
+            stdout=b'{"success": true}',
+            stderr=b"",
+        )
+        result = send_bridge_alert("My Title", "My Body")
 
         assert result is True
-        # Second call is gateway
-        gw_req = mock_urlopen.call_args_list[1][0][0]
-        assert "8642" in gw_req.full_url
-        assert gw_req.get_header("Authorization") == "Bearer gw_tok"
-        body = json.loads(gw_req.data)
-        assert body["chat_id"] == "chat@test"
-        assert body["message"] == "My Title\nMy Body"
+        mock_run.assert_called_once()
+        args = mock_run.call_args
+        argv = args[0][0]
+        assert argv[-3:] == ["send", "-t", "qqbot"] or (
+            "send" in argv and "qqbot" in argv
+        )
+        assert args.kwargs["input"] == b"My Title\nMy Body"
 
 
 class TestBugInjection:

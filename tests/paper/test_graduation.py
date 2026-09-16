@@ -10,7 +10,7 @@ success, delivery failure).
 from __future__ import annotations
 
 import sqlite3
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -266,15 +266,13 @@ def test_should_notify_preserved_on_regression(
 def test_notify_graduation_writes_timestamp(
     conn: sqlite3.Connection,
 ) -> None:
-    """Mock iLink send -> verify graduation_status.notified_at is set."""
+    """Mock QQ send -> verify graduation_status.notified_at is set."""
     _fill(conn, 30)
     _, stats = check_graduation(conn)
 
-    mock_send = AsyncMock(return_value={"errcode": 0})
-    with (
-        patch("ashare_lab.paper.report._get_secret",
-              return_value="fake"),
-        patch("ashare_lab.paper.report.send_text_ilink", mock_send),
+    with patch(
+        "ashare_lab.paper.graduation._send_graduation_text",
+        return_value=True,
     ):
         result = notify_graduation(conn, stats)
 
@@ -288,15 +286,13 @@ def test_notify_graduation_writes_timestamp(
 def test_notify_graduation_no_write_on_failure(
     conn: sqlite3.Connection,
 ) -> None:
-    """Mock iLink send to raise -> notified_at stays NULL."""
+    """Mock QQ send failure -> notified_at stays NULL."""
     _fill(conn, 30)
     _, stats = check_graduation(conn)
 
-    mock_send = AsyncMock(side_effect=RuntimeError("network error"))
-    with (
-        patch("ashare_lab.paper.report._get_secret",
-              return_value="fake"),
-        patch("ashare_lab.paper.report.send_text_ilink", mock_send),
+    with patch(
+        "ashare_lab.paper.graduation._send_graduation_text",
+        return_value=False,
     ):
         result = notify_graduation(conn, stats)
 

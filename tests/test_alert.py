@@ -96,3 +96,13 @@ class TestNoAshareImports:
                 imports.append(node.module)
         bad = [i for i in imports if "ashare" in i or "aiohttp" in i or "requests" == i]
         assert bad == [], f"Forbidden imports: {bad}"
+
+
+class TestOutboundChannel:
+    def test_uses_hermes_qqbot_not_ilink(self):
+        src = (
+            Path(__file__).resolve().parent.parent / "scripts" / "alert.py"
+        ).read_text()
+        assert "ilinkai.weixin.qq.com" not in src
+        assert "qqbot" in src
+        assert "hermes" in src.lower() or "HERMES" in src
