@@ -9,24 +9,34 @@ __pycache__/
 # Secrets
 .env
 *.token
-# Data artifacts (qlib data lives in ~/.qlib, outside the repo)
-data/cache/
-data/baostock_cache/
-*.tar.gz
-mlruns/
-models/*.pkl
-models/*.bin
+# Training data and model artifacts stay off the public remote.
+# Market data, fitted models, predictions, and replay output are local only.
+data/
+!ashare_lab/data/
+models/
+predictions/
+experiments/
+results/
+results_*/
+*.parquet
+*.csv
+*.tsv
+*.feather
+*.pt
+*.pkl
+*.bin
+*.npy
+*.npz
 *.sqlite
 *.sqlite3
 *.db
+*.tar.gz
+mlruns/
 # Editor / OS
 .idea/
 .vscode/
 *.swp
 .DS_Store
-models/*.pt
-experiments/
-predictions/
 CLAUDE.md
 # Claude Code local state (worktrees, settings)
 .claude/
