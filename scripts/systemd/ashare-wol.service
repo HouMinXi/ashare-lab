@@ -1,0 +1,9 @@
+[Unit]
+Description=Wake gpu-win and wait for SSH (17:30 CST)
+
+[Service]
+Type=oneshot
+ExecStart=%h/code/ashare-lab/scripts/ashare-wol.sh
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal

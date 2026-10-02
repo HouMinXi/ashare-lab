@@ -110,19 +110,17 @@ print(len(get_all_windows()))
 fi
 
 # --- Step 1: Wake GPU ---
+# Same sequence as data-update and pipeline. The old inline loops logged
+# "GPU online" and kept going when neither ping nor ssh ever answered, so
+# systemd recorded a green run and the deploy fallback rewrote latest.pt
+# from whatever models were already on disk.
+# shellcheck source=scripts/lib/gpu-wake.sh
+source "$PROJECT_DIR/scripts/lib/gpu-wake.sh"
 log "Waking GPU..."
-wol "$WOL_MAC"
-for i in $(seq 1 40); do
-    ping -c 1 -W 2 "${GPU_HOST#*@}" >/dev/null 2>&1 && break
-    sleep 5
-done
-
-# Wait for SSH
-for i in $(seq 1 60); do
-    ssh -o ConnectTimeout=5 "$GPU_HOST" "echo ok" >/dev/null 2>&1 && break
-    sleep 5
-done
-
+if ! wake_gpu "${GPU_HOST#*@}" "$WOL_MAC" "${GPU_HOST%%@*}" 300; then
+    log "GPU not reachable, aborting retrain"
+    exit 1
+fi
 log "GPU online"
 
 # --- Step 2: Switch GPU to training mode ---

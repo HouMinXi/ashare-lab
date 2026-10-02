@@ -55,12 +55,17 @@ YAML
 {"model_file": "w10.pt", "train_date": "$live_train_date", "window_id": "w10"}
 JSON
 
+    mkdir -p "$tmpdir/scripts/lib"
+    cp "$PROJECT_DIR/scripts/lib/gpu-wake.sh" "$tmpdir/scripts/lib/gpu-wake.sh"
+
     # --- Create a copy of retrain script with PROJECT_DIR overridden ---
     # Symlink script into tmpdir so SCRIPT_DIR resolves to tmpdir
     local script_copy="$tmpdir/bin"
     mkdir -p "$script_copy"
     # Copy the script and override PROJECT_DIR at the top
-    sed "s|^PROJECT_DIR=.*|PROJECT_DIR=\"$tmpdir\"|" "$RETRAIN_SCRIPT" > "$script_copy/retrain.sh"
+    sed -e "s|^PROJECT_DIR=.*|PROJECT_DIR=\"$tmpdir\"|" \
+        -e 's|wake_gpu \(.*\) 300|wake_gpu \1 5|' \
+        "$RETRAIN_SCRIPT" > "$script_copy/retrain.sh"
     chmod +x "$script_copy/retrain.sh"
 
     # --- Create PATH shims ---
