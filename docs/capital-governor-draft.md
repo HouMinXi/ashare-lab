@@ -129,10 +129,33 @@ indicators. The governor is a mechanical safety net, not a trading signal.
 
 ## 5. User Decisions Required (at graduation signing)
 
-- [ ] PILOT capital amount (proposed: 50K-100K CNY) -- judge: pending
+- [x] PILOT capital amount: 50K CNY total, fixed cap -- judge: accepted 2026-10-02 -- evidence: Section 6 item 1, user stated 50K is the most that can be lost
 - [ ] SCALE step size (proposed: +50K/quarter) -- judge: pending
 - [ ] DE-RISK drawdown threshold (proposed: -10%) -- judge: pending
-- [ ] HALT drawdown threshold (proposed: -15%) -- judge: pending
+- [x] HALT drawdown threshold: -15% of invested principal (7,500 CNY on 50K), independent of the paper NAV drawdown -- judge: accepted 2026-10-02 -- evidence: Section 6 item 2, paper NAV hit -15.55% on 2026-07-30
 - [ ] HARVEST threshold (proposed: 8K CNY/yr) -- judge: pending
 - [ ] Cash buffer floor for IPO (proposed: max single-lot cost) -- judge: pending
 - [ ] Confirm annual export spec sufficient for accountant -- judge: pending
+
+## 6. Decisions Recorded 2026-10-02 (discussion, not graduation signing)
+
+Status stays DRAFT. The graduation signature is still outstanding and no
+code is written until it is given.
+
+1. Loss ceiling is 50K CNY. That is the PILOT total and the SCALE starting
+   point. No additional capital before PILOT passes.
+2. HALT is measured on invested principal: -15% is 7,500 CNY on 50K. It does
+   not follow the paper NAV drawdown. The paper book reached -15.55% on
+   2026-07-30, so a paper-linked line would have flattened a real account on
+   that day.
+3. PILOT is judged on paper-vs-real drift (under 2% of daily turnover for 30
+   consecutive trading days). Return is not a PILOT criterion and does not
+   trigger adding capital.
+4. Treasuries are not an alternative to PILOT. Money outside the 50K is
+   handled separately.
+
+Evidence at the time of the decision (paper book, 2026-07-01 to 2026-09-30,
+62 trading days): strategy -6.2%, CSI300 -12.1%, CSI1000 -17.8%. Excess over
+CSI1000 by month: +9.0%, -0.3%, +2.6%. Beat CSI1000 on 31 of 61 days. One
+down regime only. This supports the risk controls working in a decline, not
+a stable stock-selection edge.
