@@ -11,7 +11,7 @@ an execution engine.
 ```
 X500 pipeline (18:00 CST)
   -> orders/{date}.json (new)
-  -> WeChat order card ~09:15 CST (evening US)
+  -> QQ order card ~09:15 CST (evening US)
   -> user keys 1-3 orders into iQuant manually
   -> fill-entry CLI (new)
   -> reconciliation table (new)
@@ -45,10 +45,12 @@ Schema:
 File path: `~/code/ashare-lab/orders/{date}.json` on X500.
 Retention: 90 days (older files auto-cleaned).
 
-## 3. WeChat Order Card Format
+## 3. QQ Order Card Format
 
-Sent via the existing iLink delivery path (report.py) as a separate
-message after the daily report, only on days with non-empty orders.
+Sent through the X500 alert-bridge (POST :8377/alert) and then
+`hermes send --to qqbot`, the same path ashare_lab/bridge.py already uses
+for graduation and risk alerts. A separate message after the daily report,
+only on days with non-empty orders. iLink / WeChat is not used.
 
 ```
 [ashare-lab] 明日交易卡 2026-07-10
@@ -103,12 +105,20 @@ buys (negative = favorable); reverse sign for sells.
 
 Drift = |paper_nav - real_nav| / paper_nav
 
-Reuses ADR-0001 criterion: drift < 2% of daily turnover for 30
-consecutive days to declare bridge healthy. Tracked as a daily column
-in the reconciliation table or a separate drift_history table.
+Drift is judged against daily turnover, not against NAV: the bridge is
+healthy when the paper-versus-real difference stays under 2% of that day's
+traded value for 30 consecutive trading days. Against NAV on a 50K account
+2% is 1,000 CNY, which is looser than a day that trades a few thousand.
+Tracked as a daily column in the reconciliation table or a separate
+drift_history table.
 
-ADR-0001 kill switch: halt real orders if paper NAV drawdown > 10% from
-peak. The kill switch reads paper.db, not real account data.
+Stop line (decided 2026-10-02, capital-governor-draft.md section 6): the
+real account is flattened when losses reach 15% of invested principal, which
+is 7,500 CNY on a 50K PILOT. The line is read from the real fills recorded
+by `paper fill`, not from paper.db. The older rule here, halt when the paper
+NAV drawdown exceeds 10%, is withdrawn: the paper book crossed 10% on
+2026-07-27 and 15% on 2026-07-30, so a paper-linked line would have fired on
+the real account for reasons the real account never experienced.
 
 ## 7. Skip-Day Rule
 
@@ -169,7 +179,25 @@ Research results in docs/broker-alternatives.md.
 
 ## 10. Gates
 
-- Phase 6 graduation PASS (30 trading days, ~27 remaining)
-- ADR-0001 kill switch armed
+- Phase 6 graduation: gate passed 2026-08-12 (30 of 30). Signature still outstanding
+- Stop line armed: 15% of invested principal, read from real fills
 - Governor Phase 10 doc signed
 - Bridge health: drift < 2% for 30 days before Phase 8b consideration
+
+## 11. Flatten Delivery (open question, QQ channel)
+
+The bridge is semi-automatic. X500 can tell the user to flatten; it cannot
+sell. When the stop line trips:
+
+1. X500 sends a QQ card: "STOP LINE HIT: flatten all positions in iQuant".
+   Lists each held symbol and quantity.
+2. The user sells manually in iQuant and enters each fill with `paper fill`.
+3. Until every position shows filled in the reconciliation table, the
+   pipeline keeps resending the card once per trading morning.
+
+Open, needs the user's answer before signing: how long after the card is
+acceptable before the flatten is done, and what happens if the card is not
+acted on. Options are accept the delay, or add a second reminder at a fixed
+interval. Nothing here is an automatic sell. Until this is answered, the
+stop line is a reminder, not a guard, and the capital draft should not call
+it automatic.
