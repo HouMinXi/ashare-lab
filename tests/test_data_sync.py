@@ -271,6 +271,153 @@ class TestGpuLastConsumer:
         assert "resolve_gpu_restore_target" in fn
         assert "gpu_restore_target=\"ollama\"" not in fn
 
+    def test_restore_target_variable_is_actually_used(self):
+        """Setting the variable is worthless if the restore call ignores it.
+
+        An earlier version of this guard only checked the assignment, which
+        would have stayed green if someone hardcoded the restore argument.
+        """
+        src = self.PIPELINE.read_text()
+        fn = self._function_body(src, "try_gpu_inference()")
+
+        lines = fn.splitlines()
+        switch_at = [
+            i for i, ln in enumerate(lines)
+            if "gpu-switch.bat" in ln and "ssh" in ln
+        ]
+        assert switch_at, "no gpu-switch invocation found"
+
+        # Identify the restore call by position, not by shape. Checking
+        # "any call uses the variable" is satisfied by the pre-inference
+        # clear, so hardcoding the restore argument would slip through while
+        # gpu_restore_target -- and with it the resolver and the dedicated
+        # switch -- became dead weight.
+        predict_at = min(
+            i for i, ln in enumerate(lines)
+            if "predict.py" in ln or "research.predict" in ln
+        )
+        after = [i for i in switch_at if i > predict_at]
+        assert after, (
+            "no gpu-switch call after predict; nothing restores the card"
+        )
+
+        restore_line = lines[min(after)]
+        assert "${gpu_restore_target}" in restore_line, (
+            f"the restore call after predict ignores gpu_restore_target, so "
+            f"the dedicated switch has no effect: {restore_line.strip()}"
+        )
+
+    def test_preinference_clear_stops_llama_server_too(self):
+        """Clearing the card before predict has to stop llama-server.
+
+        Plain "training" stops only OllamaService, so llama-server kept all
+        8 GiB and predict fell back to the second GPU index instead of
+        running on a free card.
+        """
+        src = self.PIPELINE.read_text()
+        fn = self._function_body(src, "try_gpu_inference()")
+
+        literal = [
+            ln for ln in fn.splitlines()
+            if "gpu-switch.bat" in ln and "${gpu_restore_target}" not in ln
+            and "ssh" in ln
+        ]
+        assert literal, "no literal pre-inference clear found"
+        for ln in literal:
+            assert "training-3080" in ln, (
+                f"pre-inference clear uses a target that leaves llama-server "
+                f"running: {ln.strip()}"
+            )
+
+    @staticmethod
+    def _function_body(src, name):
+        """Return a function body bounded by balanced braces.
+
+        Slicing to the first line starting with '}' breaks the moment a
+        top-level brace appears inside the body: the window shrinks and
+        every check inside it silently passes on an empty string.
+        """
+        start = src.index(name)
+        open_at = src.index("{", start)
+        depth = 0
+        for i in range(open_at, len(src)):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    body = src[open_at + 1:i]
+                    assert body.strip(), f"{name} body came back empty"
+                    return body
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_switch_off_keeps_the_resolver_result(self):
+        """With the switch off, the resolved consumer has to survive.
+
+        The guard overwrites a value the resolver computed just above it, so
+        an unconditional assignment would silently discard that work and
+        make ASHARE_GPU_DEDICATED=0 impossible to honour.
+        """
+        src = self.PIPELINE.read_text()
+        fn = self._function_body(src, "try_gpu_inference()")
+
+        assert "resolve_gpu_restore_target" in fn, (
+            "resolver call is gone from try_gpu_inference; the dedicated "
+            "switch has nothing to fall back to"
+        )
+        assert "ASHARE_GPU_DEDICATED" in fn, "dedicated switch is gone"
+        resolve_at = fn.index("resolve_gpu_restore_target")
+        guard_at = fn.index("ASHARE_GPU_DEDICATED")
+        assert resolve_at < guard_at, (
+            "guard runs before the resolver, so the resolved value is lost"
+        )
+
+        # Start the window at the line opening the guard, not at the variable
+        # name: the "if" keyword sits to the left of it.
+        line_start = fn.rfind("\n", 0, guard_at) + 1
+        guard = fn[line_start:]
+        override = re.search(r"gpu_restore_target=(\S+)", guard)
+        assert override, "dedicated branch assigns nothing"
+
+        # The override must sit inside a conditional, not run every time.
+        head = guard[:override.start()]
+        assert "if " in head and "then" in head, (
+            "override is unconditional; ASHARE_GPU_DEDICATED=0 is ignored"
+        )
+        closing = guard[override.end():]
+        assert re.search(r"^\s*fi\s*$", closing, re.MULTILINE), (
+            "no 'fi' after the override; the branch never closes"
+        )
+
+    def test_dedicated_mode_releases_the_card_not_just_ollama(self):
+        """The card is dedicated to this pipeline, so after inference it has
+        to come back free.
+
+        This host has one GPU and llama-server is what holds its memory.
+        gpu-switch.bat has two stop targets and only one of them touches
+        llama-server: plain "training" stops OllamaService alone and says so
+        in its own echo, leaving all 8 GiB pinned. Accepting both names here
+        would hide exactly that bug, so only the target that stops
+        llama-server counts.
+
+        The window is bounded by the function's own closing brace and starts
+        at the guard, so moving either end cannot silently empty it.
+        """
+        src = self.PIPELINE.read_text()
+        fn = self._function_body(src, "try_gpu_inference()")
+        assert "ASHARE_GPU_DEDICATED" in fn, "dedicated switch missing"
+
+        guard = fn[fn.index("ASHARE_GPU_DEDICATED"):]
+        assigned = re.findall(r"gpu_restore_target=(\S+)", guard)
+        assert assigned, "dedicated branch assigns no restore target"
+
+        for value in assigned:
+            bare = value.strip('"').strip("'")
+            assert bare == "training-3080", (
+                f"dedicated mode restores to {value!r}; only 'training-3080' "
+                f"stops llama-server and actually frees the card"
+            )
+
     def test_switch_writes_durable_consumer_for_serve_targets(self):
         src = self.SWITCH.read_text()
         assert "gpu-last-consumer.txt" in src
