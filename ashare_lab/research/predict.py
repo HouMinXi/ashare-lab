@@ -30,6 +30,11 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     import numpy as np
 
+# Set by _resolve_model_path: True when the loaded model is the one
+# expected_live_model pins. A pinned model is a standing decision, so its
+# age must not page anyone; the age is still logged.
+_LAST_RESOLUTION: dict[str, bool] = {"deliberate": False}
+
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
 # -- Alert infrastructure (fail-open, stdlib only) --------------------------
@@ -299,6 +304,9 @@ def _resolve_model_path(
     missing-model situations; deliberately mismatches (expected_live_model)
     are logged at INFO only.
     """
+    # Reset per call: the flag is module state, and a stale True would
+    # suppress a genuine staleness alert on a later trade date.
+    _LAST_RESOLUTION["deliberate"] = False
     window: dict | None = None
 
     for w in windows:
@@ -352,6 +360,18 @@ def _resolve_model_path(
                         f"Action: train w{window_id}.pt"
                     )
                 model_path = fallback
+
+    # A pinned model is a standing decision regardless of which branch
+    # resolved the path, so judge it by content here, once.
+    expected = cfg.get("research", {}).get("expected_live_model")
+    expected_file = models_dir / f"{expected}.pt" if expected else None
+    if (
+        expected_file is not None
+        and expected_file.exists()
+        and model_path.exists()
+        and filecmp.cmp(str(model_path), str(expected_file), shallow=False)
+    ):
+        _LAST_RESOLUTION["deliberate"] = True
 
     if not model_path.exists():
         raise FileNotFoundError(
@@ -429,16 +449,20 @@ def predict_for_date(
         model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
         age_source = f"mtime-fallback({meta_reason})"
     if model_age_days > _MODEL_STALE_DAYS:
+        pinned = _LAST_RESOLUTION["deliberate"]
         log.warning(
-            "MODEL STALE: %s is %.0f days old (threshold: %d days, source: %s). "
-            "Consider retraining.",
+            "MODEL STALE: %s is %.0f days old (threshold: %d days, source: %s)%s",
             model_path.name, model_age_days, _MODEL_STALE_DAYS, age_source,
+            " [pinned by expected_live_model, not paging]"
+            if pinned
+            else ". Consider retraining.",
         )
-        _send_alert(
-            f"[predict] model stale: {model_path.name} is {model_age_days:.1f} days old "
-            f"(threshold: {_MODEL_STALE_DAYS}, source: {age_source}) on {trade_date}. "
-            f"Action: retrain"
-        )
+        if not pinned:
+            _send_alert(
+                f"[predict] model stale: {model_path.name} is "
+                f"{model_age_days:.1f} days old (threshold: {_MODEL_STALE_DAYS}, "
+                f"source: {age_source}) on {trade_date}. Action: retrain"
+            )
 
     log.info(
         "predict %s: window W%d, model %s",
