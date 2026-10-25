@@ -854,3 +854,123 @@ class TestIndexMembershipGate:
         return provider
 
     # Reuse _make_csv from TestDumpBinUpdate (same signature, includes 'change' column).
+
+
+# ---------------------------------------------------------------------------
+# backfill_missing_dates
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillMissingDates:
+    def _provider(self, root: Path, dates: list[str]) -> Path:
+        p = root / "provider"
+        (p / "calendars").mkdir(parents=True)
+        (p / "calendars" / "day.txt").write_text("\n".join(dates) + "\n")
+        (p / "features").mkdir()
+        (p / "instruments").mkdir()
+        return p
+
+    def test_fills_gap_and_keeps_calendar_sorted(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        got: list[str] = []
+
+        def fake_fetch(trade_date: str) -> dict:
+            got.append(trade_date)
+            return {"sz000001": pd.DataFrame([{
+                "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
+                "close": 1.0, "volume": 1.0, "factor": 1.0, "change": 0.0,
+            }])}
+
+        def fake_dump(csv_dir: Path, provider_uri: Path) -> None:
+            cal = provider_uri / "calendars" / "day.txt"
+            have = [ln for ln in cal.read_text().splitlines() if ln.strip()]
+            cal.write_text("\n".join(sorted(set(have) | set(got))) + "\n")
+
+        monkeypatch.setattr(
+            "ashare_lab.data.fetcher.fetch_today_data", fake_fetch)
+        monkeypatch.setattr(
+            "ashare_lab.data.fallback._dump_bin_update", fake_dump)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(
+                Path(tmp), ["2024-03-01", "2024-03-05"])
+            filled = backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            calendar = (provider / "calendars" / "day.txt").read_text().splitlines()
+
+        assert filled == ["2024-03-04"]
+        assert got == ["2024-03-04"]
+        assert calendar == sorted(calendar)
+        assert "2024-03-04" in calendar
+
+    def test_failed_day_does_not_undo_filled_days(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        def fake_fetch(trade_date: str) -> dict:
+            if trade_date == '2024-03-04':
+                raise RuntimeError('token locked')
+            return {'sz000001': pd.DataFrame([{
+                'date': trade_date, 'open': 1.0, 'high': 1.0, 'low': 1.0,
+                'close': 1.0, 'volume': 1.0, 'factor': 1.0, 'change': 0.0,
+            }])}
+
+        def fake_dump(csv_dir: Path, provider_uri: Path) -> None:
+            cal = provider_uri / 'calendars' / 'day.txt'
+            have = {ln.strip() for ln in cal.read_text().splitlines() if ln.strip()}
+            added = set()
+            for csv in csv_dir.glob('*.csv'):
+                added.update(line.split(',')[0] for line in csv.read_text().splitlines()[1:])
+            cal.write_text('\n'.join(sorted(have | added)) + '\n')
+
+        monkeypatch.setattr('ashare_lab.data.fetcher.fetch_today_data', fake_fetch)
+        monkeypatch.setattr('ashare_lab.data.fallback._dump_bin_update', fake_dump)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(Path(tmp), ['2024-03-01'])
+            filled = backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            calendar = (provider / 'calendars' / 'day.txt').read_text().splitlines()
+
+        assert filled == ['2024-03-05']
+        assert '2024-03-05' in calendar
+        assert '2024-03-04' not in calendar
+
+    def test_calendar_rewrite_does_not_write_day_txt_directly(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        def fake_fetch(trade_date: str) -> dict:
+            return {"sz000001": pd.DataFrame([{
+                "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
+                "close": 1.0, "volume": 1.0, "factor": 1.0, "change": 0.0}])}
+
+        real_write = Path.write_text
+
+        def guard(self, *a, **k):
+            if self.name == "day.txt":
+                raise OSError("disk full")
+            return real_write(self, *a, **k)
+
+        monkeypatch.setattr("ashare_lab.data.fetcher.fetch_today_data", fake_fetch)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(Path(tmp), ["2024-03-05", "2024-03-01"])
+            (provider / "features" / "sz000001").mkdir(parents=True)
+            for field in ["open", "close", "high", "low", "volume", "factor"]:
+                (provider / "features" / "sz000001" / f"{field}.day.bin").write_bytes(
+                    bytes(4))
+            (provider / "instruments" / "all.txt").write_text(
+                "SZ000001\t2024-03-01\t2024-03-01\n")
+            before = (provider / "calendars" / "day.txt").read_bytes()
+            monkeypatch.setattr(Path, "write_text", guard)
+            backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            after = (provider / "calendars" / "day.txt").read_bytes()
+        assert after != before
+        assert b"2024-03-04" in after

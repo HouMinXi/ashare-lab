@@ -296,3 +296,42 @@ def test_stock_names_cache(tmp_path: Path):
     cached = pd.read_csv(cache_path)
     assert list(cached.columns) == ["symbol", "name"]
     assert len(cached) == 2
+
+
+def test_fetch_today_backfills_gaps_after_writing_today(monkeypatch):
+    """A gap behind the day just written gets filled, and a backfill
+    failure does not turn the day's success into a failure."""
+    import datetime as dt
+
+    from ashare_lab.cli import cmd_fetch_today
+
+    seen = {}
+
+    def fake_backfill(start, end, provider_uri=None):
+        seen['span'] = (start, end)
+        raise RuntimeError('tushare down')
+
+    monkeypatch.setattr('ashare_lab.data.calendar.is_trading_day', lambda d: True)
+    monkeypatch.setattr(
+        'ashare_lab.data.calendar.latest_trading_day', lambda d: dt.date(2024, 3, 5))
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.fetch_today_data', lambda d: {'sz000001': object()})
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.fetch_cross_validation_sample',
+        lambda *a, **k: {})
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.refresh_stock_names_cache', lambda *a, **k: {})
+    monkeypatch.setattr(
+        'ashare_lab.data.validator.validate_daily_data',
+        lambda *a, **k: type('R', (), {'passed': True, 'warnings': []})())
+    monkeypatch.setattr('ashare_lab.cli._write_csvs', lambda *a, **k: 1)
+    monkeypatch.setattr('ashare_lab.cli._dump_bin_update', lambda *a, **k: None)
+    monkeypatch.setattr('ashare_lab.data.fallback.backfill_missing_dates', fake_backfill)
+    monkeypatch.setattr(
+        'ashare_lab.data.fallback._calendar_dates',
+        lambda provider: {'2024-02-01', '2024-02-28'})
+
+    rc = cmd_fetch_today(type('A', (), {})())
+
+    assert rc == 0
+    assert seen['span'] == (dt.date(2024, 2, 27), dt.date(2024, 3, 5))

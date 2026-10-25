@@ -104,6 +104,25 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         return 1
 
     log.info("fetch-today complete for %s (%d symbols)", trade_date, len(tushare_data))
+
+    # A day that failed to fetch leaves a hole the next run never revisits,
+    # so fill anything missing behind the day just written. A backfill
+    # failure must not fail the day that already landed.
+    try:
+        from ashare_lab.data.fallback import (  # noqa: PLC0415
+            _calendar_dates,
+            backfill_missing_dates,
+        )
+        have = _calendar_dates(DEFAULT_PROVIDER_URI)
+        earlier = [d for d in have if d < trade_date]
+        start = (
+            dt.date.fromisoformat(max(earlier)) - dt.timedelta(days=1)
+            if earlier
+            else dt.date.fromisoformat(trade_date)
+        )
+        backfill_missing_dates(start, dt.date.fromisoformat(trade_date))
+    except Exception as exc:
+        log.warning("gap backfill failed (non-fatal): %s", exc)
     return 0
 
 

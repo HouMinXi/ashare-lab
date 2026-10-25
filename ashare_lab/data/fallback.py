@@ -568,3 +568,49 @@ def gap_fill(
 
     log.info("gap-fill complete: %d date(s) filled", len(missing))
     return 0
+
+
+def backfill_missing_dates(
+    start: dt.date,
+    end: dt.date,
+    provider_uri: Path = DEFAULT_PROVIDER_URI,
+) -> list[str]:
+    """Fill trading days absent from the qlib calendar using tushare.
+
+    A failed day is logged and skipped; days already filled stay filled.
+    The calendar is rewritten in date order afterwards, because qlib drops
+    dates that were appended out of order.
+
+    Returns the dates that were filled.
+    """
+    from ashare_lab.data.fetcher import fetch_today_data  # noqa: PLC0415
+
+    missing = find_missing_dates(start.isoformat(), end.isoformat(), provider_uri)
+    filled: list[str] = []
+    for day in missing:
+        try:
+            data = fetch_today_data(day)
+        except Exception as exc:
+            log.warning("backfill %s: fetch failed: %s", day, exc)
+            continue
+        if not data:
+            log.warning("backfill %s: no rows", day)
+            continue
+        with tempfile.TemporaryDirectory(prefix="ashare_backfill_") as tmp:
+            csv_dir = Path(tmp) / "csv"
+            _write_csvs(data, csv_dir)
+            _dump_bin_update(csv_dir, provider_uri)
+        filled.append(day)
+
+    cal_path = provider_uri / "calendars" / "day.txt"
+    if cal_path.exists():
+        dates = sorted({ln.strip() for ln in cal_path.read_text(encoding="utf-8").splitlines() if ln.strip()})
+        fd, tmp_path = tempfile.mkstemp(dir=cal_path.parent, suffix=".tmp")
+        try:
+            os.close(fd)
+            Path(tmp_path).write_text("\n".join(dates) + "\n", encoding="utf-8")
+            os.replace(tmp_path, cal_path)
+        except Exception:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
+    return filled
