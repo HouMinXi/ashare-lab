@@ -18,6 +18,7 @@ from ashare_lab.paper.ledger import (
     record_nav,
     record_run,
 )
+from tests.module_patch import patched_modules
 from ashare_lab.paper.risk import RiskCheckResult
 
 _MOD = "ashare_lab.paper.pipeline"
@@ -215,16 +216,13 @@ def _pipeline_patches(
         "bump_carry_days": patch(f"{_MOD}.bump_carry_days"),
         "bump_suspension_carry_days": patch(f"{_MOD}.bump_suspension_carry_days"),
         # Patch deferred imports via sys.modules
-        "qlib_data": patch.dict(
-            sys.modules,
+        "qlib_data": patched_modules(
             {"qlib": MagicMock(), "qlib.data": qlib_data_mod},
         ),
-        "baostock": patch.dict(
-            sys.modules,
+        "baostock": patched_modules(
             {"baostock": MagicMock()},
         ),
-        "update_mod": patch.dict(
-            sys.modules,
+        "update_mod": patched_modules(
             {"ashare_lab.data.update": update_mod},
         ),
     }
@@ -358,8 +356,7 @@ class TestDataStaleSkip:
             patch(f"{_MOD}.load_config", return_value=base_config),
             patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
             patch(f"{_MOD}.is_day_settled", return_value=False),
-            patch.dict(
-                sys.modules,
+            patched_modules(
                 {"ashare_lab.data.update": update_mod},
             ),
         ):
@@ -390,8 +387,7 @@ class TestDataStaleSkip:
             patch(f"{_MOD}.load_config", return_value=base_config),
             patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
             patch(f"{_MOD}.is_day_settled", return_value=False),
-            patch.dict(
-                sys.modules,
+            patched_modules(
                 {"ashare_lab.data.update": update_mod},
             ),
         ):

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ashare_lab.paper.pipeline import _step5_fetch_prices_and_universe, DailyRunContext
+from tests.module_patch import patched_modules
 
 
 @pytest.fixture
@@ -36,7 +37,7 @@ def mock_qlib():
     mock_qlib_data = MagicMock()
     mock_qlib_data.D = mock_D
 
-    with patch.dict(sys.modules, {
+    with patched_modules({
         "qlib": MagicMock(),
         "qlib.data": mock_qlib_data,
     }):
@@ -56,7 +57,7 @@ def test_step5_returns_2_on_qlib_import_failure(
 ):
     """Test that step5 returns 2 when qlib import fails."""
     # Remove qlib from sys.modules to simulate import failure
-    with patch.dict(sys.modules, {"qlib": None, "qlib.data": None}):
+    with patched_modules({"qlib": None, "qlib.data": None}):
         result = _step5_fetch_prices_and_universe(ctx)
 
     assert result == 2
