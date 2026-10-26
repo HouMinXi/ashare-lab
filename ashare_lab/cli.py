@@ -123,6 +123,21 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         backfill_missing_dates(start, dt.date.fromisoformat(trade_date))
     except Exception as exc:
         log.warning("gap backfill failed (non-fatal): %s", exc)
+
+    # The daily fetch covers stocks only, so every index keeps the tail it
+    # had when the full package was last unpacked. A reader of a stale index
+    # gets no error, just an older last date. Refresh them separately so a
+    # failure here leaves the gap backfill above intact.
+    try:
+        from ashare_lab.data.fallback import (  # noqa: PLC0415
+            backfill_stale_indexes,
+        )
+
+        filled = backfill_stale_indexes(trade_date)
+        if filled:
+            log.info("refreshed stale indexes: %s", filled)
+    except Exception as exc:
+        log.warning("index refresh failed (non-fatal): %s", exc)
     return 0
 
 

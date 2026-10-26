@@ -32,10 +32,16 @@ _DEFAULT_SESSION_REFRESH_N = 50
 # baostock adjustflag=1 means qfq (forward-adjusted prices)
 _BAOSTOCK_ADJUST_FLAG = "1"
 _BAOSTOCK_FIELDS = "date,open,high,low,close,volume,pctChg,adjustfactor"
+# An index has no adjustment factor and baostock rejects the field for one.
+_INDEX_FIELDS = "date,open,high,low,close,volume,pctChg"
 _BAOSTOCK_FREQ = "d"
 
 # Columns written to per-symbol CSVs (consumed by qlib dump_bin update)
 _CSV_COLUMNS = ["date", "open", "high", "low", "close", "volume", "factor", "change"]
+
+# Index instruments only refresh when the full package is replaced, so a
+# daily incremental run leaves them behind the stocks.
+INDEX_SYMBOLS = ("SH000300", "SH000852", "SH000905", "SH000906", "SZ399300")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +126,8 @@ def _fetch_symbol(
     symbol: str,
     start_date: str,
     end_date: str,
+    *,
+    index: bool = False,
 ) -> list[dict]:
     """Fetch OHLCV + adjustfactor for one symbol from baostock.
 
@@ -128,6 +136,7 @@ def _fetch_symbol(
         symbol: qlib-format symbol (e.g. 'SZ000001').
         start_date: YYYY-MM-DD.
         end_date: YYYY-MM-DD.
+        index: fetch an index, which carries no adjustment factor.
 
     Returns:
         List of row dicts with keys: date, open, high, low, close, volume,
@@ -136,18 +145,24 @@ def _fetch_symbol(
     Suspended days (empty or zero close) are skipped silently.
     Rows with unparseable numeric fields are skipped with a DEBUG log.
     """
-    rs = bs.query_history_k_data_plus(
-        _qlib_to_bs(symbol),
-        fields=_BAOSTOCK_FIELDS,
-        start_date=start_date,
-        end_date=end_date,
-        frequency=_BAOSTOCK_FREQ,
-        adjustflag=_BAOSTOCK_ADJUST_FLAG,
-    )
+    query = {
+        "fields": _INDEX_FIELDS if index else _BAOSTOCK_FIELDS,
+        "start_date": start_date,
+        "end_date": end_date,
+        "frequency": _BAOSTOCK_FREQ,
+    }
+    if not index:
+        query["adjustflag"] = _BAOSTOCK_ADJUST_FLAG
+    rs = bs.query_history_k_data_plus(_qlib_to_bs(symbol), **query)
     rows: list[dict] = []
     while rs.error_code == "0" and rs.next():
         try:
-            date_, open_, high_, low_, close_, vol_, pct_, adj_ = rs.get_row_data()
+            row = rs.get_row_data()
+            if index:
+                date_, open_, high_, low_, close_, vol_, pct_ = row
+                adj_ = None
+            else:
+                date_, open_, high_, low_, close_, vol_, pct_, adj_ = row
         except (ValueError, TypeError) as exc:
             log.debug("skipping %s row: field unpack error %s", symbol, exc)
             continue
@@ -179,6 +194,8 @@ def _fetch_all(
     start_date: str,
     end_date: str,
     session_refresh_n: int,
+    *,
+    index: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Fetch OHLCV+factor for all symbols, refreshing the baostock session.
 
@@ -226,7 +243,7 @@ def _fetch_all(
                     i + 1,
                     len(symbols),
                 )
-            rows = _fetch_symbol(bs, sym, start_date, end_date)
+            rows = _fetch_symbol(bs, sym, start_date, end_date, index=index)
             if rows:
                 results[sym] = pd.DataFrame(rows)
     finally:
@@ -383,6 +400,68 @@ def check_index_membership(
     log.info("membership gate: %s %d active on %s (OK)", index, active, trade_date)
 
 
+def _symbol_trails(sym_dir: Path, wanted: set[int], fields: list[str]) -> bool:
+    """Whether any maintained field of a symbol has a free slot in ``wanted``.
+
+    Appending is positional, so a row only helps when it lands on a field's
+    next free slot. Only the fields this writer maintains count: adjclose,
+    amount and vwap arrive with the full package and are never written here,
+    so they sit weeks behind and would make every symbol look stale.
+
+    Args:
+        sym_dir: that symbol's feature directory.
+        wanted: calendar indices the available rows could fill.
+        fields: the field names this writer maintains.
+
+    Returns:
+        True when at least one of those fields is waiting for such a row.
+    """
+    return any(
+        _bin_next_slot(sym_dir / f"{field}.day.bin") in wanted
+        for field in fields
+    )
+
+
+def _feature_dir(feat_root: Path, symbol: str) -> Path:
+    """Feature directory holding one symbol's bin files.
+
+    ``instruments/all.txt`` names symbols in upper case while the feature
+    directories are lower case, so every lookup has to normalise or it
+    silently misses the files.
+
+    Args:
+        feat_root: the ``features`` directory.
+        symbol: symbol in either case.
+
+    Returns:
+        Path to that symbol's directory, which may not exist.
+    """
+    return feat_root / symbol.lower()
+
+
+def _bin_next_slot(bin_path: Path) -> int | None:
+    """Calendar index the next point appended to ``bin_path`` would occupy.
+
+    A qlib bin file opens with a float32 holding the calendar index of its
+    first point, so the next free slot sits at that index plus the number of
+    points stored.
+
+    Args:
+        bin_path: one ``<field>.day.bin`` file.
+
+    Returns:
+        The index, or None when the file is absent or too short to carry a
+        header.
+    """
+    if not bin_path.exists():
+        return None
+    raw = bin_path.read_bytes()
+    if len(raw) < 4:
+        return None
+    start = int(struct.unpack("<f", raw[:4])[0])
+    return start + (len(raw) - 4) // 4
+
+
 def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     """Append daily CSV data to qlib binary feature files.
 
@@ -413,11 +492,31 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
         new_dates = sorted({row["date"] for row in csv_mod.DictReader(f)})
 
     # Append missing dates to calendar.
-    existing_dates: set[str] = set()
+    calendar: list[str] = []
     if cal_path.exists():
-        existing_dates = set(cal_path.read_text(encoding="utf-8").splitlines())
+        # positions here must line up with the ones qlib built, and
+        # qlib skips blank lines
+        calendar = [
+            ln.strip()
+            for ln in cal_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+    existing_dates: set[str] = set(calendar)
     dates_to_add = [d for d in new_dates if d not in existing_dates]
-    if not dates_to_add:
+
+    # A symbol can trail the calendar it shares with its peers: an index
+    # only refreshes when the full package is unpacked, so the stocks move
+    # the calendar forward without it. Those rows still need writing even
+    # though the calendar already knows every date.
+    cal_pos = {d: i for i, d in enumerate(calendar)}
+    wanted = {cal_pos[d] for d in new_dates if d in cal_pos}
+    maintained = [c for c in _CSV_COLUMNS if c != "date"]
+    trailing = bool(wanted) and any(
+        _symbol_trails(_feature_dir(feat_dir, cf.stem), wanted, maintained)
+        for cf in csv_files
+    )
+
+    if not dates_to_add and not trailing:
         log.info("dump_bin update: all dates already in calendar, skipping")
         # Gate: extend open rows + check membership even when no new dates.
         latest_date = (
@@ -432,6 +531,9 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     with open(cal_path, "a", encoding="utf-8") as f:
         for d in dates_to_add:
             f.write(d + "\n")
+    if dates_to_add:
+        calendar = calendar + dates_to_add
+        cal_pos = {d: i for i, d in enumerate(calendar)}
 
     # Append binary data per instrument.
     count = 0
@@ -439,21 +541,37 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     for csv_file in csv_files:
         sym = csv_file.stem
         traded_syms.add(sym.upper())
-        sym_dir = feat_dir / sym
+        sym_dir = _feature_dir(feat_dir, sym)
         if not sym_dir.exists():
             continue
 
         with open(csv_file, encoding="utf-8") as f:
             rows = sorted(csv_mod.DictReader(f), key=lambda r: r["date"])
 
+        # A bin carries no dates, only a position. Fields drift apart, so a
+        # field that already holds a date must be left alone: appending to it
+        # again would shift every later value onto the wrong day.
+        next_slot = {
+            field: _bin_next_slot(sym_dir / f"{field}.day.bin")
+            for field in fields
+        }
+        wrote = False
         for row in rows:
+            idx = cal_pos.get(row["date"])
             for field in fields:
+                slot = next_slot.get(field)
+                if slot is not None and idx is not None and idx < slot:
+                    continue
                 bin_path = sym_dir / f"{field}.day.bin"
                 if not bin_path.exists():
                     continue
                 with open(bin_path, "ab") as bf:
                     bf.write(struct.pack("<f", float(row[field])))
-        count += 1
+                if slot is not None:
+                    next_slot[field] = slot + 1
+                wrote = True
+        if wrote:
+            count += 1
 
     if not count:
         raise RuntimeError("no instruments updated (feature dirs missing?)")
@@ -613,4 +731,77 @@ def backfill_missing_dates(
         except Exception:
             Path(tmp_path).unlink(missing_ok=True)
             raise
+    return filled
+
+
+def _instrument_end_dates(provider_uri: Path = DEFAULT_PROVIDER_URI) -> dict[str, str]:
+    """Collect ``symbol -> end_date`` from ``instruments/all.txt``.
+
+    Args:
+        provider_uri: qlib data root.
+
+    Returns:
+        Mapping of symbol to its last stored date, empty when the file is
+        absent.
+    """
+    path = Path(provider_uri) / "instruments" / "all.txt"
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            out[parts[0]] = parts[2]
+    return out
+
+
+def backfill_stale_indexes(
+    trade_date: str,
+    provider_uri: Path = DEFAULT_PROVIDER_URI,
+) -> list[str]:
+    """Fill index rows that lag behind ``trade_date``.
+
+    The daily incremental fetch only covers stocks, so every index keeps the
+    tail it had when the full package was last unpacked. Readers of a stale
+    index get no error, just an older last date, which silently turns a
+    date-keyed lookup into a miss.
+
+    Args:
+        trade_date: YYYY-MM-DD, the date the stocks were just written up to.
+        provider_uri: qlib data root.
+
+    Returns:
+        Symbols that were written, empty when every index is current.
+    """
+    root = Path(provider_uri)
+    end_dates = _instrument_end_dates(root)
+    target = str(trade_date)
+    stale = {
+        sym: end_dates[sym]
+        for sym in INDEX_SYMBOLS
+        if sym in end_dates and end_dates[sym] < target
+    }
+    if not stale:
+        return []
+
+    earliest = min(stale.values())
+    start = (dt.date.fromisoformat(earliest) + dt.timedelta(days=1)).isoformat()
+    log.info(
+        "index backfill: %d stale, fetching %s..%s", len(stale), start, target
+    )
+    # Measured: one index over a two-week gap takes under a second, and the
+    # whole set about two, inside the ~30s baostock idle timeout. One login
+    # covers the batch.
+    symbols = sorted(stale)
+    data = _fetch_all(symbols, start, target, len(symbols), index=True)
+    if not data:
+        log.warning("index backfill: no rows returned for %s", sorted(stale))
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="ashare_index_") as tmp:
+        csv_dir = Path(tmp)
+        _write_csvs(data, csv_dir)
+        _dump_bin_update(csv_dir, root)
+    filled = sorted(data)
+    log.info("index backfill: wrote %s", filled)
     return filled
