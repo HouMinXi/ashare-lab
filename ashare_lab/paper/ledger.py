@@ -587,20 +587,27 @@ def insert_order(
     carry_day: int,
     created_run_date: str,
     source: str = "signal",
+    *,
+    cancel_reason: str | None = None,
 ) -> int:
     """Insert an order row; return the new rowid.
 
     *created_at* is computed internally (UTC ISO-8601).
+
+    *cancel_reason* tags an order created by a specific mechanism rather
+    than by a signal, so that mechanism can recognise its own work later.
+    It stays NULL for ordinary orders, which is what settlement matches on.
     """
     created_at = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO orders "
         "(trade_date, symbol, side, target_qty, price, status, "
-        " carry_day, created_run_date, source, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " carry_day, created_run_date, source, created_at, cancel_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             trade_date, symbol, side, target_qty, price,
             status, carry_day, created_run_date, source, created_at,
+            cancel_reason,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
