@@ -44,12 +44,19 @@ def topk_dropout_orders(
     if not signals:
         return [], []
 
-    ranked = sorted(signals.items(), key=lambda kv: kv[1], reverse=True)
+    # symbol breaks score ties so the buy order is reproducible; the
+    # score is negated rather than the sort reversed, which would
+    # reverse the symbol too
+    ranked = sorted(signals.items(), key=lambda kv: (-kv[1], kv[0]))
     top_k_symbols = {sym for sym, _ in ranked[:topk]}
 
     # Sell: positions not in top-K, capped to n_drop worst-ranked
     sell_cands = [s for s in current_positions if s not in top_k_symbols]
-    sell_cands.sort(key=lambda s: signals.get(s, float("-inf")))
+    # holdings absent from the signals all score -inf and so tie with
+    # each other; the symbol breaks that tie, because current_positions
+    # arrives as a set and a stable sort would otherwise hand the pick
+    # to per-process string hashing
+    sell_cands.sort(key=lambda s: (signals.get(s, float("-inf")), s))
     sell_list = sell_cands[:n_drop]
 
     # Buy: refill to topk

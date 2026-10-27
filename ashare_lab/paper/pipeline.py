@@ -1232,11 +1232,15 @@ def _step8_settle(ctx: DailyRunContext) -> int | None:
         ).fetchall()
     topk_symbols = {r["symbol"] for r in topk_rows}
 
+    # ORDER BY id is the order SQLite already gave this query; asking
+    # for it keeps settlement off the accident of how rows landed,
+    # since cash is consumed as the list is walked
     pending_orders = [
         dict(r) for r in ctx.conn.execute(
             "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
             "suspension_carry_day FROM orders "
-            "WHERE status IN ('pending','carry') AND trade_date <= ?",
+            "WHERE status IN ('pending','carry') AND trade_date <= ? "
+            "ORDER BY id",
             (ctx.trade_date,),
         ).fetchall()
     ]
@@ -1721,7 +1725,9 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             desired_sell_qty[s] = forced_sells[s]
 
     next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
-    for s in sell_set:
+    # sorted, not set order: settlement reads pending orders by rowid,
+    # so the insert order decides which sell fills first
+    for s in sorted(sell_set):
         already = ctx.conn.execute(
             "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
             "WHERE symbol=? AND side='sell' AND status IN ('pending','carry')",
@@ -1917,8 +1923,18 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
     ctx.conn.commit()
 
+    # Settled first, then snapshot. Carry-forward anchors on the newest
+    # settled run, so a backup taken before this row is written restores to
+    # a book that looks one day behind and re-opens a position this day
+    # sold. A failed backup is already non-fatal here, so there is nothing
+    # to gain from holding the row back.
+    record_run(ctx.conn, ctx.trade_date, "settled")
+    ctx.conn.commit()
+
     # Integrity gate: check DB health before backup
-    backup_dir = PROJECT_ROOT / "backups"
+    # beside the ledger, not beside the project: a run pointed at some
+    # other ledger must not write into, or prune, the real one's backups
+    backup_dir = ctx.db_path.parent / "backups"
     backup_path = backup_dir / f"paper_{ctx.trade_date}.db"
 
     backup_result = hot_backup_with_integrity(ctx.db_path, backup_path)
@@ -1934,9 +1950,6 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
     # Monthly golden backup (immutable, never cleaned up)
     create_golden_backup(ctx.db_path, backup_dir)
-
-    record_run(ctx.conn, ctx.trade_date, "settled")
-    ctx.conn.commit()
 
 
 # Single source of truth for the Book B shadow ledger ids: the m=1.0
@@ -2034,11 +2047,14 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # mirroring Book A's flow: _step8_settle -> _step10_signals.
         from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
 
+        # ORDER BY id for the same reason as the main book: settlement
+        # walks this list and spends cash as it goes
         pending_orders = [
             dict(r) for r in book_conn.execute(
                 "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
                 "suspension_carry_day FROM orders "
-                "WHERE status IN ('pending','carry') AND trade_date <= ?",
+                "WHERE status IN ('pending','carry') AND trade_date <= ? "
+                "ORDER BY id",
                 (ctx.trade_date,),
             ).fetchall()
         ]
@@ -2117,7 +2133,9 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
             else:
                 desired_sell_qty[s] = forced_sells[s]
 
-        for s in sell_set:
+        # sorted, not set order: settlement reads pending orders by
+        # rowid, so the insert order decides which fills first
+        for s in sorted(sell_set):
             to_insert = desired_sell_qty[s]
             if to_insert > 0:
                 insert_order(book_conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
