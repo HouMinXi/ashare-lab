@@ -1111,7 +1111,7 @@ class TestWriteAbcArtifactNavB:
         ctx.benchmarks = {"csi1000": 5000.0}
 
         # Write artifact
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         # Read artifact
@@ -1156,7 +1156,7 @@ class TestWriteAbcArtifactNavB:
         ctx.paper_cfg = base_config["paper"]
         ctx.benchmarks = {"csi1000": 5000.0}
 
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         artifact_path = tmp_path / "experiments" / "control_books" / "2025-01-06_none.json"

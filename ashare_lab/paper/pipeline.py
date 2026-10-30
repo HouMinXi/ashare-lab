@@ -1395,7 +1395,7 @@ def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
 
     next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
 
-  
+
     ctx.conn.execute(
         "DELETE FROM orders WHERE trade_date=? AND source='hedge' AND status='pending'",
         (next_td_str,),
@@ -1448,8 +1448,10 @@ def _step9c_nav_hedge_split(ctx: DailyRunContext) -> None:
     )
 
 
-def timing_multiplier(trade_date: str, model: str = "none") -> float:
-    """Return the timing multiplier m for the given trade date and model.
+def timing_multiplier_detail(
+    trade_date: str, model: str = "none"
+) -> tuple[float, str | None]:
+    """Return the timing multiplier m and why it fell back, if it did.
 
     m scales top-k target weights at order generation (cash allocation),
     not signal scores.  Supported values: {0, 0.5, 1.0}.
@@ -1460,25 +1462,34 @@ def timing_multiplier(trade_date: str, model: str = "none") -> float:
       "n2"   = 20d realized volatility percentile
       "n3"   = drawdown state map
 
+    A bare m of 1.0 cannot be interpreted on its own: a model can legitimately
+    return 1.0 for "stay fully invested", and every failure path also falls
+    back to 1.0.  Treating the two as the same number makes a comparison
+    against Book A look clean precisely when the timing model contributed
+    nothing, so the reason is reported alongside the value.
+
     Args:
         trade_date: ISO date string (YYYY-MM-DD).
         model: Model identifier.
 
     Returns:
-        Float multiplier in {0, 0.5, 1.0}.
+        (m, degraded) where m is in {0, 0.5, 1.0} and degraded is None for a
+        value the model actually produced, or a short reason string when 1.0
+        is a fallback.  model="none" is Book A's design, not a degradation,
+        so it reports None.
     """
     if model == "none":
-        return 1.0
+        return 1.0, None
 
     if model not in ("n1", "n2", "n3"):
         logger.warning("Unknown timing model %r, defaulting to m=1.0", model)
-        return 1.0
+        return 1.0, "unknown_model"
 
     try:
         closes = _fetch_csi1000_closes_for_timing(trade_date)
         if closes is None or closes.empty:
             logger.warning("[timing] No CSI1000 data for %s, m=1.0", trade_date)
-            return 1.0
+            return 1.0, "no_index_data"
 
         from ashare_lab.research.timing_nulls import (  # noqa: PLC0415
             ma_trend_multiplier,
@@ -1498,15 +1509,24 @@ def timing_multiplier(trade_date: str, model: str = "none") -> float:
                 "[timing] trade_date %s not in m series (model=%s), m=1.0",
                 trade_date, model,
             )
-            return 1.0
+            return 1.0, "date_not_in_series"
 
         m = float(m_series.loc[trade_date])
         logger.info("[timing] %s on %s: m=%.1f", model, trade_date, m)
-        return m
+        return m, None
 
     except Exception:
         logger.warning("[timing] %s failed for %s, m=1.0", model, trade_date, exc_info=True)
-        return 1.0
+        return 1.0, "computation_error"
+
+
+def timing_multiplier(trade_date: str, model: str = "none") -> float:
+    """Return the timing multiplier m, discarding the degradation reason.
+
+    Callers that record or compare multipliers want timing_multiplier_detail
+    so that a fallback 1.0 stays distinguishable from a real one.
+    """
+    return timing_multiplier_detail(trade_date, model)[0]
 
 
 def _fetch_csi1000_closes_for_timing(trade_date: str):
@@ -2018,7 +2038,7 @@ def _step12_book_b(ctx: DailyRunContext) -> None:
 
 def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
     """Book B implementation.  Isolated for testability."""
-    m = timing_multiplier(ctx.trade_date, model=book_id)
+    m, m_degraded = timing_multiplier_detail(ctx.trade_date, model=book_id)
 
     # Open Book B database
     db_dir = ctx.db_path.parent if ctx.db_path else Path("data")
@@ -2082,7 +2102,13 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         )
 
         signals = generate_signals(ctx.trade_date, pred_path=ctx.pred_path)
-        candidate_syms = [s for s in signals if s in ctx.universe_symbols and s not in ctx.ipo_listing_syms and s not in ctx.st_names]
+        candidate_syms = [
+            s
+            for s in signals
+            if s in ctx.universe_symbols
+            and s not in ctx.ipo_listing_syms
+            and s not in ctx.st_names
+        ]
         filtered_syms = filter_candidates(
             candidate_syms, ctx.market_data,
             ctx.config.get("universe", {}).get("listing_min_days", 60),
@@ -2181,7 +2207,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
             insert_order(book_conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
 
         # Write A/B/C artifact
-        _write_abc_artifact(ctx, book_conn, book_id, m)
+        _write_abc_artifact(ctx, book_conn, book_id, m, m_degraded)
 
         book_conn.commit()
 
@@ -2190,7 +2216,12 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         record_run(book_conn, ctx.trade_date, "settled")
         book_conn.commit()
 
-        logger.info("[book_b] completed for %s (m=%.1f, book_id=%s)", ctx.trade_date, m, book_id)
+        logger.info(
+            "[book_b] completed for %s (m=%.1f%s, book_id=%s)",
+            ctx.trade_date, m,
+            f" degraded={m_degraded}" if m_degraded else "",
+            book_id,
+        )
     finally:
         book_conn.close()
 
@@ -2222,8 +2253,23 @@ def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
     logger.info("[book_b] bootstrapped %s -> %s", prod_db_path, book_b_path)
 
 
-def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float) -> None:
-    """Write daily A/B/C comparison artifact to experiments/control_books/."""
+def _write_abc_artifact(
+    ctx: DailyRunContext,
+    book_conn,
+    book_id: str,
+    m: float,
+    m_degraded: str | None,
+) -> None:
+    """Write daily A/B/C comparison artifact to experiments/control_books/.
+
+    m_degraded records why m fell back to 1.0, or None when the timing model
+    produced the value.  Without it a reader cannot tell a day the model
+    scored from a day it failed on, and both look like full investment.
+
+    It has no default on purpose: a forgotten argument would write exactly
+    what a clean day writes, so the omission has to fail at the call site
+    rather than wait for a test to notice.
+    """
     from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash  # noqa: PLC0415
 
     # Book A NAV (from production)
@@ -2255,6 +2301,7 @@ def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float)
         "excess_a": round(excess_a, 6),
         "excess_b": round(excess_b, 6),
         "m": m,
+        "m_degraded": m_degraded,
     }
     artifact_path = artifact_dir / f"{ctx.trade_date}_{book_id}.json"
     # Atomic write via same-directory temp + rename: a crashed writer must

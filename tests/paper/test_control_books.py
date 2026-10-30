@@ -17,6 +17,8 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from ashare_lab.paper.ledger import init_schema
 from ashare_lab.paper.pipeline import (
     timing_multiplier,
@@ -27,6 +29,16 @@ from ashare_lab.paper.pipeline import (
 
 
 # -- timing_multiplier -------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _cd_tmp_path(tmp_path, monkeypatch):
+    """Keep artifact writes inside tmp_path.
+
+    _write_abc_artifact builds a relative path, so without this the suite
+    writes fixture artifacts into the real experiments/control_books/
+    directory whenever it runs from a working checkout.
+    """
+    monkeypatch.chdir(tmp_path)
 
 class TestTimingMultiplier:
     def test_none_model_returns_one(self):
@@ -141,7 +153,7 @@ class TestABCArtifact:
 
         book_conn = sqlite3.connect(str(book_b_db))
         book_conn.row_factory = sqlite3.Row
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         artifact_path = Path("experiments/control_books/2026-07-25_none.json")
@@ -151,6 +163,9 @@ class TestABCArtifact:
         assert artifact["book_id"] == "none"
         assert artifact["nav_a"] == 300000.0
         assert artifact["m"] == 1.0
+        # the baseline arm is defined to run without a timing model, so its
+        # multiplier is not a fallback
+        assert artifact["m_degraded"] is None
 
 
 # -- Known-answer (R3) -------------------------------------------------------
