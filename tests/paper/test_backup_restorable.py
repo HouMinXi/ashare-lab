@@ -19,6 +19,7 @@ via cleanup_old_backups -- the real one's backups.
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,23 @@ from ashare_lab.paper.pipeline import (
 )
 
 TRADE_DATE = "2026-10-22"
+PREVIOUS_DATE = "2026-10-21"
+
+
+class _FrozenDate(date):
+    """A date whose today() never moves.
+
+    cleanup_old_backups prunes against date.today(), so a test that pins a
+    trade date and uses the production retention window deletes its own backup
+    once the calendar moves on -- 2026-10-22 fell out of a 7-day window on
+    2026-10-30. Deriving the date from today() instead trades that for a
+    dependence on when the suite runs, including across midnight. Pinning the
+    clock removes both: the assertion is fixed and the cutoff is fixed.
+    """
+
+    @classmethod
+    def today(cls) -> date:
+        return date.fromisoformat(TRADE_DATE)
 
 
 def _ctx(tmp_path: Path) -> DailyRunContext:
@@ -38,7 +56,7 @@ def _ctx(tmp_path: Path) -> DailyRunContext:
     conn = get_connection(db_path)
     init_schema(conn)
     # a settled yesterday, so the step has a predecessor like a real run
-    record_run(conn, "2026-10-21", "settled")
+    record_run(conn, PREVIOUS_DATE, "settled")
     conn.commit()
 
     ctx = DailyRunContext.__new__(DailyRunContext)
@@ -47,6 +65,12 @@ def _ctx(tmp_path: Path) -> DailyRunContext:
     ctx.trade_date = TRADE_DATE
     ctx.paper_cfg = {"backup_retention_days": 7}
     return ctx
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch):
+    """Measure the retention window from the trade date, not from now."""
+    monkeypatch.setattr("ashare_lab.paper.ledger.date", _FrozenDate)
 
 
 @pytest.fixture
