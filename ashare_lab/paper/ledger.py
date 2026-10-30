@@ -1161,12 +1161,62 @@ def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     return golden_path
 
 
+def _backup_data_extent(backup_path: Path) -> str:
+    """Return the latest trade date a backup actually contains.
+
+    An empty string means the file holds no ledger history, whether because
+    the table is absent, unreadable, or simply has no rows.  Used to order
+    restore candidates, so the answer only needs to be comparable, not
+    precise.
+    """
+    try:
+        conn = sqlite3.connect(
+            backup_path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+    except (sqlite3.Error, OSError, ValueError):
+        return ""
+    try:
+        row = conn.execute("SELECT MAX(trade_date) FROM nav").fetchone()
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else ""
+
+
+def _rank_restore_candidates(paths: list[Path]) -> list[tuple[Path, str]]:
+    """Order restore candidates by the history they hold, newest first.
+
+    Filename order alone is not safe: a snapshot of the wrong file lands under
+    a perfectly good name, and sorting by name hands it back ahead of a
+    complete backup.  Ties and empty backups fall back to filename order so a
+    single fresh backup is still returned when it is all there is.
+
+    Returns (path, extent) pairs.  Each candidate is read exactly once and its
+    answer carried, because this runs on a recovery path where the system is
+    already in trouble and every open is against a file that may be damaged.
+    """
+    extents = [(path, _backup_data_extent(path)) for path in paths]
+    ranked = sorted(extents, key=lambda pair: (pair[1], pair[0].name), reverse=True)
+    if len(ranked) > 1 and not any(extent for _, extent in ranked):
+        # Reading history from every candidate failed, so this ordering is
+        # filename order again -- the exact behaviour that let an empty
+        # snapshot outrank a populated one. Worth a word: a renamed ledger
+        # table would land here with no other symptom.
+        logger.warning(
+            "No restore candidate reports any ledger history; "
+            "ranking %d candidates by filename only",
+            len(ranked),
+        )
+    return ranked
+
+
 def find_best_backup(backup_dir: Path, target_date: str | None = None) -> Path | None:
     """Find the best available backup by priority.
 
     Priority:
     1. Daily backup for target_date (if provided)
-    2. Most recent daily backup passing integrity check
+    2. Daily backup holding the most recent history, passing integrity check
     3. Golden backup for current month (last resort)
 
     Returns the path to the best backup, or None if nothing found.
@@ -1181,23 +1231,26 @@ def find_best_backup(backup_dir: Path, target_date: str | None = None) -> Path |
             if check.is_healthy:
                 return exact
 
-    # Priority 2: most recent daily backup passing integrity
-    daily_backups = sorted(
-        backup_dir.glob("paper_*.db"),
-        key=lambda f: f.name,
-        reverse=True,
-    )
-    for bp in daily_backups:
+    # Priority 2: the daily backup carrying the most history.  Integrity only
+    # proves the file is well formed, so the ordering has to look at content.
+    for bp, extent in _rank_restore_candidates(list(backup_dir.glob("paper_*.db"))):
         check = check_db_integrity(bp)
         if check.is_healthy:
+            logger.info(
+                "Selected backup %s (history through %s)",
+                bp.name, extent or "no ledger rows",
+            )
             return bp
 
     # Priority 3: golden backup
     if golden_dir.exists():
-        golden_files = sorted(golden_dir.glob("*.db"), reverse=True)
-        for gp in golden_files:
+        for gp, extent in _rank_restore_candidates(list(golden_dir.glob("*.db"))):
             check = check_db_integrity(gp)
             if check.is_healthy:
+                logger.info(
+                    "Selected golden backup %s (history through %s)",
+                    gp.name, extent or "no ledger rows",
+                )
                 return gp
 
     return None
