@@ -50,6 +50,54 @@ def _no_mock_artifacts(request):
             )
 
 
+# The repository's own experiment record, resolved from this file rather than
+# from the cwd, so a test that moved the cwd is still measured against the
+# real directory.
+REPO_ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "experiments" / "control_books"
+
+
+def _artifact_names() -> frozenset[str]:
+    try:
+        return frozenset(p.name for p in REPO_ARTIFACT_DIR.iterdir())
+    except OSError:
+        return frozenset()
+
+
+@pytest.fixture(scope="session")
+def _artifacts_at_session_start() -> frozenset[str]:
+    return _artifact_names()
+
+
+@pytest.fixture(autouse=True)
+def _no_artifacts_in_the_repo(_artifacts_at_session_start, request):
+    """Fail a test that writes into the real experiment record.
+
+    _write_abc_artifact builds a relative path, so a test that reaches it
+    without moving the cwd drops fixture values next to genuine daily
+    records. Six files did, and the fixture artifacts they left in the
+    production directory are indistinguishable from real ones at a glance:
+    same naming, plausible shape, nav figures that are simply wrong.
+
+    Adding a chdir fixture per file fixes the files that exist today. This
+    fails the next one on its first run, and says which test did it.
+    """
+    yield
+    added = _artifact_names() - _artifacts_at_session_start
+    if added:
+        for name in added:
+            try:
+                (REPO_ARTIFACT_DIR / name).unlink()
+            except OSError:
+                pass
+        pytest.fail(
+            f"{request.node.nodeid} wrote {sorted(added)} into "
+            f"{REPO_ARTIFACT_DIR}, the real experiment record.\n"
+            "The artifact writer uses a relative path: add "
+            "monkeypatch.chdir(tmp_path) to this file, as the other "
+            "artifact tests do."
+        )
+
+
 # Column names that carry a trading date somewhere in the ledger.
 LEDGER_DATE_COLUMNS = ("trade_date", "date", "as_of_date")
 

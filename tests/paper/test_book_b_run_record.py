@@ -31,6 +31,22 @@ from ashare_lab.paper.pipeline import _bootstrap_book_b, _run_book_b
 
 
 # ---------------------------------------------------------------------------
+# Fixtures
+
+
+@pytest.fixture(autouse=True)
+def _cd_tmp_path(tmp_path, monkeypatch):
+    """Keep artifact writes inside tmp_path.
+
+    These tests run the real _run_book_b, which writes the daily comparison
+    artifact to a relative path. Without this the suite drops fixture
+    artifacts into the real experiments/control_books/ directory whenever it
+    runs from a working checkout.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

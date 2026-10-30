@@ -33,6 +33,18 @@ from ashare_lab.paper.turnover import (
 # -------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _cd_tmp_path(tmp_path, monkeypatch):
+    """Keep artifact writes inside tmp_path.
+
+    The _step10 integration tests reach the daily comparison artifact writer,
+    which builds a relative path. Without this the suite drops fixture
+    artifacts into the real experiments/control_books/ directory whenever it
+    runs from a working checkout.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture()
 def turnover_conn(tmp_path: Path) -> sqlite3.Connection:
     """In-memory SQLite with paper_state table."""
