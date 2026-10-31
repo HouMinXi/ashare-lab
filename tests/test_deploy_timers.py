@@ -1,6 +1,5 @@
 """Verify systemd timer schedules and WorkingDirectory in deploy.sh."""
 
-import os
 import re
 import stat
 from pathlib import Path

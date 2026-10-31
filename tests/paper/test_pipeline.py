@@ -6,7 +6,6 @@ import contextlib
 import datetime as dt
 import json
 import sqlite3
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -708,8 +707,6 @@ class TestPreCommitNavGate:
         """NAV change >20% -> row deleted, preventing corrupted persistence."""
         from ashare_lab.paper.ledger import get_connection, init_schema, record_nav
         from ashare_lab.paper.pipeline import DailyRunContext, _step12_backup_and_finalize
-        from dataclasses import dataclass, field
-        from pathlib import Path
         from unittest.mock import patch
 
         db_path = tmp_path / "test.db"
@@ -1069,7 +1066,7 @@ class TestWriteAbcArtifactNavB:
         """nav_b must reflect post-settle positions, not just cash."""
         from ashare_lab.paper.ledger import (
             get_connection, init_schema, snapshot_positions,
-            record_nav, record_run,
+            record_run,
         )
         from ashare_lab.paper.pipeline import _write_abc_artifact, DailyRunContext
 

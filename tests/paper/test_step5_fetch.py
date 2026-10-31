@@ -1,7 +1,6 @@
 """Tests for _step5_fetch_prices_and_universe with mocked qlib ecosystem."""
 import json
 import subprocess
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest

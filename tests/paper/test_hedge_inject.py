@@ -3,7 +3,6 @@
 Each inject: modify code/config → assert test FAILS → revert → assert PASS.
 Run manually: pytest tests/paper/test_hedge_inject.py -v
 """
-import copy
 import pytest
 import yaml
 from ashare_lab.paper.hedge import (

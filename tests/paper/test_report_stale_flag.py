@@ -8,7 +8,6 @@ ASHARE_USE_STALE='0' even though every downstream consumer treats only
 import logging
 import sqlite3
 
-import pytest
 
 from ashare_lab.paper.pipeline import DailyRunContext, _step13_report
 

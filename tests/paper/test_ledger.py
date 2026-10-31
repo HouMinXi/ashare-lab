@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 
 from ashare_lab.paper.ledger import (
-    IntegrityResult,
-    BackupResult,
     bump_carry_days,
     check_db_integrity,
     cleanup_old_backups,

@@ -13,19 +13,12 @@ settle_day orchestrates one trading day atomically.
 from __future__ import annotations
 
 import logging
-import math
 import sqlite3
 from dataclasses import dataclass, field
 
-from ashare_lab.paper.fees import calculate_fees
 from ashare_lab.paper.ledger import (
     compute_nav,
-    insert_order,
-    insert_trade,
-    log_settle_change,
     record_nav,
-    snapshot_positions,
-    update_order,
 )
 
 logger = logging.getLogger(__name__)

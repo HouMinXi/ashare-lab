@@ -6,20 +6,13 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from ashare_lab.paper.signal_quality import (
-    _IC_THRESHOLD,
-    _MIN_INSTRUMENTS,
-    _ROLLING_WINDOW,
     SignalQualityError,
-    compute_forward_returns,
     lagged_ic_for_date,
     load_reference_scores,
     rolling_lagged_ic,

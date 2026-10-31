@@ -10,7 +10,6 @@ Usage: Load this file in QMT UI -> Strategy -> New Strategy -> Run
 
 import json
 import os
-import time
 import logging
 
 log = logging.getLogger('qmt_strategy')

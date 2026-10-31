@@ -702,7 +702,6 @@ class TestOpenRowExtension:
     def test_early_return_path_extends(self, tmp_path: Path) -> None:
         """T4: early-return path in _dump_bin_update still extends open rows."""
         from ashare_lab.data.fallback import _dump_bin_update
-        from ashare_lab.data.fallback import _write_csvs as _wc
 
         symbols = [f"SH{i:06d}" for i in range(1000)]
 

@@ -8,12 +8,10 @@ flat sentiment sub-config directly.
 
 from __future__ import annotations
 
-import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ashare_lab.paper.ledger import init_schema
 from ashare_lab.paper.sentiment import (
     SentimentVetoResult,
     _check_cache,

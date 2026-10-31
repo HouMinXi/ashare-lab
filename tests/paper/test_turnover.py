@@ -12,7 +12,6 @@ T8: bug-injection at the call site (bypass cap -> all orders inserted)
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
@@ -302,7 +301,6 @@ def _make_ctx(conn, signals, prices, config, *, positions=None, tmp_path=None):
     from ashare_lab.paper.pipeline import DailyRunContext
     from unittest.mock import MagicMock
     from ashare_lab.paper.risk import RiskCheckResult
-    from pathlib import Path
 
     # Create dummy prediction file if tmp_path provided
     pred_path = None
@@ -353,7 +351,7 @@ class TestTurnoverCapIntegration:
     def test_cap_on_binding_day(self, turnover_conn, tmp_path):
         """Cap ON: fewer buy orders than uncapped."""
         from ashare_lab.paper.pipeline import _step10_signal_generation
-        from ashare_lab.paper.ledger import insert_order, init_schema
+        from ashare_lab.paper.ledger import init_schema
         from unittest.mock import patch as P
 
         init_schema(turnover_conn)
@@ -506,7 +504,7 @@ class TestBookBCapIntegration:
     def test_book_b_cap_independent(self, tmp_path):
         """Book B cap binds based on its own NAV, independent of Book A."""
         from ashare_lab.paper.pipeline import _run_book_b, DailyRunContext
-        from ashare_lab.paper.ledger import init_schema, get_connection, snapshot_positions, record_nav
+        from ashare_lab.paper.ledger import init_schema, snapshot_positions, record_nav
         from unittest.mock import MagicMock, patch
         from ashare_lab.paper.risk import RiskCheckResult
 

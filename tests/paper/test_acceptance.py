@@ -11,36 +11,27 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ashare_lab.paper.adjust import check_and_apply_adjustfactor
 from ashare_lab.paper.engine import (
-    SettleResult,
     apply_slippage,
-    cap_fill_by_volume,
     compute_nav,
-    get_limit_threshold,
-    is_limit_up,
     round_lots,
     settle_day,
 )
-from ashare_lab.paper.fees import FeeResult, calculate_fees
+from ashare_lab.paper.fees import calculate_fees
 from ashare_lab.paper.ledger import (
     bump_carry_days,
     force_reset_day,
     get_connection,
-    get_latest_cash,
-    get_latest_positions,
     init_schema,
     insert_order,
-    insert_trade,
     is_day_settled,
     record_nav,
     record_run,
     snapshot_positions,
-    update_order,
 )
 
 
@@ -756,7 +747,7 @@ class TestIntegrationSmoke:
             assert rc in (0, 1), f"run_daily({date_str}) returned {rc}"
 
         # Verify 5 nav rows
-        from ashare_lab.paper.ledger import get_connection, init_schema
+        from ashare_lab.paper.ledger import get_connection
         from ashare_lab.config import PROJECT_ROOT, load_config
 
         config = load_config()
