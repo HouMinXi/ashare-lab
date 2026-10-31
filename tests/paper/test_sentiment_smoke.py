@@ -1,6 +1,6 @@
 """T3 smoke tests: real eastmoney news fetch + real LLM scoring via OmniRoute.
 
-Run on X500 only (needs pass store with api/omniroute).
+Run on W1 only (needs pass store with api/omniroute).
 All tests marked @pytest.mark.integration -- excluded from normal runs.
 """
 

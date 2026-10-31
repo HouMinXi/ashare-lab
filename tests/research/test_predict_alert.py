@@ -19,7 +19,7 @@ def _make_predict_env(tmp_path: Path, window_id: int = 11,
                       use_copy: bool = False):
     """Set up a minimal environment for testing the fallback logic.
 
-    Production layout (X500):
+    Production layout (W1):
       models/latest.pt -> w10.pt   (symlink)
       models/w10.pt                (actual model)
       models/w11.pt                (missing = shelved)

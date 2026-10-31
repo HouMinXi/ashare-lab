@@ -128,7 +128,7 @@ def read_model_meta(
     if train_date > today:
         return None, "train_date future"
 
-    # Identity: symlink resolve (X500 latest.pt -> wN.pt) OR a
+    # Identity: symlink resolve (W1 latest.pt -> wN.pt) OR a
     # regular-file copy of the named model (gpu-win cannot ship
     # the same symlink; predict.py already treats that as a copy).
     expected_model = raw.get(_MODEL_FILE)

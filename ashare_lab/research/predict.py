@@ -335,7 +335,7 @@ def _resolve_model_path(
             if fallback.exists():
                 expected = cfg.get("research", {}).get("expected_live_model")
                 # Check if latest.pt contains the expected model.
-                # Works for both symlinks (X500) and regular-file copies (gpu-win).
+                # Works for both symlinks (W1) and regular-file copies (gpu-win).
                 expected_file = models_dir / f"{expected}.pt" if expected else None
                 is_expected = (
                     expected

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# External deadman: runs on Z66 via cron, checks X500 pipeline ran today.
+# External deadman: runs on Z66 via cron, checks W1 pipeline ran today.
 # Alerts via iLink (reuses alert.py's path) if stale.
-# Does NOT touch pipeline.sh or any production code on X500.
+# Does NOT touch pipeline.sh or any production code on W1.
 set -euo pipefail
 
-X500="houminxi@192.168.100.10"
+W1="houminxi@192.168.100.10"
 DB="/home/houminxi/code/ashare-lab/paper.db"
 ALERT_SCRIPT="/home/houminxi/code/ashare-lab/scripts/alert.py"
 
@@ -17,8 +17,8 @@ fi
 
 TODAY=$(date +%Y-%m-%d)
 
-# Query X500's pipeline_runs for today's row via SSH + Python (no sqlite3 CLI on X500)
-ROW=$(ssh -o ConnectTimeout=10 "$X500" \
+# Query W1's pipeline_runs for today's row via SSH + Python (no sqlite3 CLI on W1)
+ROW=$(ssh -o ConnectTimeout=10 "$W1" \
     "python3 -c \"import sqlite3; c=sqlite3.connect('${DB}'); r=c.execute('SELECT status FROM pipeline_runs WHERE trade_date=? ORDER BY created_at DESC, id DESC LIMIT 1',('${TODAY}',)).fetchone(); print(r[0] if r else 'MISSING')\"" \
     2>/dev/null) || ROW="SSH_FAIL"
 
@@ -27,8 +27,8 @@ case "$ROW" in
         exit 0
         ;;
     MISSING|SSH_FAIL|error|stale)
-        # Alert via the existing alert.py on X500 (it has the iLink secrets)
-        ssh -o ConnectTimeout=10 "$X500" \
+        # Alert via the existing alert.py on W1 (it has the iLink secrets)
+        ssh -o ConnectTimeout=10 "$W1" \
             "python3 ${ALERT_SCRIPT} 1 'deadman: pipeline_runs ${ROW} for ${TODAY}' 0" \
             2>/dev/null || true
         ;;

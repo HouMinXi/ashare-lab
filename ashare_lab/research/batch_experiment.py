@@ -1,6 +1,6 @@
 """Orchestrator for model matrix experiments.
 
-Runs on X500 (Linux), SSHes to GPU (admin@192.168.100.11) per-cell.
+Runs on W1 (Linux), SSHes to GPU (admin@192.168.100.11) per-cell.
 Each cell = one candidate config x one walk-forward window, executed
 via matrix_runner.py in a subprocess on the GPU host.
 
@@ -465,7 +465,7 @@ def _run_matrix_inner(
                     record["model"] = seed_tag
 
                     # SCP artifacts BEFORE marking complete (W2-F2: a cell
-                    # is complete only when its parquets are on X500).
+                    # is complete only when its parquets are on W1).
                     pred_name = f"pred_w{wid}_seed{seed}.parquet"
                     scp_pred_from_gpu(
                         gpu_host, gpu_repo,

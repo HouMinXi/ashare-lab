@@ -1,5 +1,5 @@
 #!/bin/bash
-# deploy.sh -- two-stage deploy for ashare-lab on X500
+# deploy.sh -- two-stage deploy for ashare-lab on W1
 # Fresh clone or incremental sync, then install systemd timers.
 #
 # Usage: bash scripts/deploy.sh

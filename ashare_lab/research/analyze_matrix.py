@@ -5,7 +5,7 @@ Computes Spearman correlation matrices, per-window winner/oracle headroom,
 and generates GATE_DECISION.md with per-candidate verdicts.
 
 Pure reader -- no qlib, no torch, no GPU.  stdlib + pandas + scipy only.
-Runs on X500 after batch_experiment.py completes on GPU.
+Runs on W1 after batch_experiment.py completes on GPU.
 """
 
 from __future__ import annotations
