@@ -28,6 +28,9 @@ ashare-baseline = "ashare_lab.research.report:main"
 include = ["ashare_lab*"]
 
 [tool.pytest.ini_options]
+# The sentiment smoke tests reach the network and the LLM, so they stay
+# out of the default run; select them with `pytest -m integration`.
+addopts = "-m 'not integration'"
 markers = [
     "integration: requires qlib runtime with real price data",
 ]
