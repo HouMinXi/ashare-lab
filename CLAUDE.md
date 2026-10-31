@@ -32,7 +32,7 @@ Three machines, three distinct roles:
     push via tar/scp.
   - SSH key: W1 ed25519 authorized via `C:\ProgramData\ssh\administrators_authorized_keys`
     (Windows OpenSSH admin user rule -- NOT `~/.ssh/authorized_keys`).
-- **W1 (x500:~/code/ashare-lab)**: permanent archive AND Phase 3+ execution host. Code, models, predictions, and results all land here permanently. Phase 3/4/5 paper engine runs on W1; test results are collected from W1.
+- **W1 (w1:~/code/ashare-lab)**: permanent archive AND Phase 3+ execution host. Code, models, predictions, and results all land here permanently. Phase 3/4/5 paper engine runs on W1; test results are collected from W1.
 
 W1 and GPU machine details in project memory `reference_gpu_machine.md`.
 
@@ -43,7 +43,7 @@ Full flow for any code change:
 
 1. Local worktree edit
 2. Forge review + anti-ai-audit + non-ASCII check
-3. Commit to main, push to x500 remote: `git push x500 main`
+3. Commit to main, push to the bare: `git push origin main` on W1, `git push w1 main` from z66
 4. If GPU training needed: tar/scp worktree to GPU -> run -> scp results back -> local verify -> clean GPU temp files
 5. Sync verified results + data artifacts to W1 (see W1 Sync below)
 
@@ -77,12 +77,14 @@ W1 is the only permanent store. Local machine reboots unpredictably -- a result 
 
 ```bash
 # Code
-git push x500 main
+git push w1 main          # from z66
+# on W1 itself the bare is the origin remote
+git push origin main
 
 # Gitignored data (models, predictions, results)
-scp -r results/ x500:code/ashare-lab/
-scp experiments/<dir>/models/*.pt x500:code/ashare-lab/experiments/<dir>/models/
-scp experiments/<dir>/predictions/*.parquet x500:code/ashare-lab/experiments/<dir>/predictions/
+scp -r results/ w1:code/ashare-lab/
+scp experiments/<dir>/models/*.pt w1:code/ashare-lab/experiments/<dir>/models/
+scp experiments/<dir>/predictions/*.parquet w1:code/ashare-lab/experiments/<dir>/predictions/
 ```
 
 Phase 3+ paper engine runs on W1. Test results for Phase 3/4/5 are collected from W1, not local.

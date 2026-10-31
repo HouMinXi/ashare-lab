@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO="$HOME/code/ashare-lab"
-REPO_URL="x500:code/ashare-lab.git"
+REPO_URL="w1:code/ashare-lab.git"
 GPU_HOST="192.168.100.11"
 GPU_USER="admin"
 
