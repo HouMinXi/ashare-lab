@@ -1,5 +1,11 @@
 # Phase 8a: Semi-Auto Bridge Design
 
+> **Host naming.** This design was written when the pipeline host was called
+> X500. That machine's disk now runs as W1; every mention of X500 below means
+> W1. The body is left as written because it records what was designed and
+> verified in July, including the alert path it was tested on.
+
+
 Status: DESIGN ONLY. No execution, no deploy. Gated on Phase 6 graduation.
 
 ## 1. Architecture
