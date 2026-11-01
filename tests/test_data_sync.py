@@ -52,12 +52,12 @@ class TestSyncCallOrder:
 class TestSyncHappyPath:
     def test_creates_and_cleans_tarball(self, tmp_path):
         """Verify tar creates the archive and trap cleans it on return."""
-        r = _run(textwrap.dedent(f"""\
+        r = _run(textwrap.dedent("""\
             QLIB_DIR=$(mktemp -d)
             mkdir -p "$QLIB_DIR/cn_data"
             touch "$QLIB_DIR/cn_data/dummy.bin"
-            scp() {{ return 0; }}
-            ssh() {{ return 0; }}
+            scp() { return 0; }
+            ssh() { return 0; }
             export -f scp ssh
             sync_gpu_data
             [ ! -f "$HOME/.cache/ashare-sync/cn_data_sync.tar.gz" ] && [ ! -f /tmp/cn_data_sync.tar.gz ] && echo CLEANED
@@ -101,12 +101,12 @@ class TestSyncTarFailure:
 
 class TestSyncScpFailure:
     def test_returns_nonzero(self, tmp_path):
-        r = _run(textwrap.dedent(f"""\
+        r = _run(textwrap.dedent("""\
             QLIB_DIR=$(mktemp -d)
             mkdir -p "$QLIB_DIR/cn_data"
             touch "$QLIB_DIR/cn_data/dummy.bin"
-            scp() {{ return 1; }}
-            ssh() {{ echo "BUG: ssh should not be called"; return 0; }}
+            scp() { return 1; }
+            ssh() { echo "BUG: ssh should not be called"; return 0; }
             export -f scp ssh
             sync_gpu_data
         """))
@@ -116,12 +116,12 @@ class TestSyncScpFailure:
 
 class TestSyncSshFailure:
     def test_returns_nonzero(self, tmp_path):
-        r = _run(textwrap.dedent(f"""\
+        r = _run(textwrap.dedent("""\
             QLIB_DIR=$(mktemp -d)
             mkdir -p "$QLIB_DIR/cn_data"
             touch "$QLIB_DIR/cn_data/dummy.bin"
-            scp() {{ return 0; }}
-            ssh() {{ return 1; }}
+            scp() { return 0; }
+            ssh() { return 1; }
             export -f scp ssh
             sync_gpu_data
         """))

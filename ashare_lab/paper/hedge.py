@@ -13,11 +13,16 @@ ChiNext/STAR stocks (41.5% of CSI1000) have 20% daily limits.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import json
 import logging
 from dataclasses import dataclass
 
 from ashare_lab.paper.engine import round_lots
+
+if TYPE_CHECKING:
+    from ashare_lab.paper.pipeline import DailyRunContext
 
 logger = logging.getLogger(__name__)
 
