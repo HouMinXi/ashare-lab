@@ -6,7 +6,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -16,6 +16,16 @@ DEFAULT_STAMP = os.path.expanduser("~/.cache/ashare-alert-last.stamp")
 # ponytail: weekday proxy for trading days -- no exchange_calendars
 # available outside venv. Add XSHG holiday list if precision matters.
 ALERT_INTERVAL_TRADING_DAYS = 3
+
+# The alerting script must survive a broken venv, so it cannot import the
+# calendar module. This is the same +08:00 the application uses; if the exchange
+# ever changes zone, both places change.
+EXCHANGE_TZ = timezone(timedelta(hours=8))
+
+
+def _exchange_today() -> date:
+    """Today on the exchange, which is the day the interval is measured in."""
+    return datetime.now(EXCHANGE_TZ).date()
 
 _HERMES_BIN_CANDIDATES = (
     os.path.expanduser("~/code/hermes-agent/venv/bin/hermes"),
@@ -69,13 +79,13 @@ def _should_alert(stamp_path: str = DEFAULT_STAMP) -> bool:
             last = date.fromisoformat(f.read().strip())
     except (ValueError, OSError):
         return True
-    return _weekdays_between(last, date.today()) >= ALERT_INTERVAL_TRADING_DAYS
+    return _weekdays_between(last, _exchange_today()) >= ALERT_INTERVAL_TRADING_DAYS
 
 
 def _write_stamp(stamp_path: str = DEFAULT_STAMP) -> None:
     os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
     with open(stamp_path, "w") as f:
-        f.write(date.today().isoformat())
+        f.write(_exchange_today().isoformat())
 
 
 def clear_stamp(stamp_path: str | None = None) -> None:
