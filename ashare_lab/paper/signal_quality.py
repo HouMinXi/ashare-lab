@@ -42,8 +42,14 @@ _MIN_INSTRUMENTS = 50
 # ---------------------------------------------------------------------------
 # Helper: atomic sidecar writes
 # ---------------------------------------------------------------------------
-def _write_sidecar(path: Path, data: dict) -> None:
-    """Atomic read-modify-write of a .meta.json sidecar file."""
+def _write_sidecar(path: Path, data: dict, clear: tuple[str, ...] = ()) -> None:
+    """Atomic read-modify-write of a .meta.json sidecar file.
+
+    *clear* is a tuple of key names removed before the update: a success must not
+    leave an error from an earlier attempt sitting beside a value it has since
+    produced. Keys listed in *data* are written afterwards, so clearing and
+    setting the same key in one call is defined as "set".
+    """
     def _to_native(obj):
         if isinstance(obj, np.bool_):
             return bool(obj)
@@ -55,12 +61,16 @@ def _write_sidecar(path: Path, data: dict) -> None:
             return obj.tolist()
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    existing = {}
+    existing: dict = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text())
+            loaded = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
-            pass
+            loaded = None
+        if isinstance(loaded, dict):
+            existing = loaded
+    for key in clear:
+        existing.pop(key, None)
     existing.update(data)
     dir_path = path.parent
     tmp = None
@@ -171,7 +181,11 @@ def signal_quality_psi_step(ctx: DailyRunContext) -> None:
         psi = compute_psi(ref, scores)
         if psi is None:
             log.warning("PSI computation returned None (empty/degenerate)")
-        _write_sidecar(sidecar, {"psi": psi, "psi_reference_days": ref_n})
+        _write_sidecar(
+            sidecar,
+            {"psi": psi, "psi_reference_days": ref_n},
+            clear=("psi_error", "psi_reason"),
+        )
         if psi is not None and psi > _PSI_THRESHOLD:
             if dry_run:
                 log.warning("dry-run: alert suppressed")
@@ -353,7 +367,15 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
     t5_sidecar_path = predictions_dir / f"{date_t5_str}.meta.json"
     if not pred_t5_path.exists():
         log.warning("missing t-5 parquet for %s", date_t5_str)
-        _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": None, "lagged_ic_t5_n": 0, "lagged_ic_t5_reason": "missing_t5_parquet"})
+        _write_sidecar(
+            t5_sidecar_path,
+            {
+                "lagged_ic_t5": None,
+                "lagged_ic_t5_n": 0,
+                "lagged_ic_t5_reason": "missing_t5_parquet",
+            },
+            clear=("lagged_ic_error",),
+        )
         ic, n_instruments = None, 0
     else:
         try:
@@ -363,10 +385,25 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
             coverage = n_instruments / len(instruments) if instruments else 0
             if coverage < 0.95:
                 log.warning("low instrument coverage (%.1f%%)", coverage * 100)
-            _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": ic, "lagged_ic_t5_n": n_instruments})
+            _write_sidecar(
+                t5_sidecar_path,
+                {"lagged_ic_t5": ic, "lagged_ic_t5_n": n_instruments},
+                clear=("lagged_ic_error", "lagged_ic_t5_reason"),
+            )
+            # The t-5 derivation failure is recorded on today's file, which the
+            # write above cannot reach; clear it here so a later success wins.
+            _write_sidecar(
+                predictions_dir / f"{trade_date}.meta.json",
+                {},
+                clear=("lagged_ic_error",),
+            )
         except Exception as exc:
             log.error("IC computation failed: %s", exc, exc_info=True)
-            _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": None, "lagged_ic_error": f"{type(exc).__name__}: {exc}"})
+            _write_sidecar(
+                t5_sidecar_path,
+                {"lagged_ic_t5": None, "lagged_ic_error": f"{type(exc).__name__}: {exc}"},
+                clear=("lagged_ic_t5_n", "lagged_ic_t5_reason"),
+            )
     try:
         mean, n = rolling_lagged_ic(predictions_dir, trade_date)
     except Exception as exc:
