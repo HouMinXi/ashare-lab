@@ -506,6 +506,36 @@ def is_day_settled(conn: sqlite3.Connection, trade_date: str) -> bool:
     return row is not None
 
 
+def settlement_gaps(
+    conn: sqlite3.Connection, calendar_days: list[str]
+) -> list[dict]:
+    """Trading days between the first and last settled day that are not settled.
+
+    A missing day is not automatically an error: the pipeline leaves stale days
+    retryable, so the run status says why the day has no NAV. What this prevents
+    is the day disappearing from view entirely.
+
+    *calendar_days* comes from the caller, which keeps this function free of a
+    calendar dependency and testable in memory.
+    """
+    settled = {
+        row[0]
+        for row in conn.execute(
+            "SELECT trade_date FROM runs WHERE status = 'settled'"
+        )
+    }
+    if not settled:
+        return []
+    first, anchor = min(settled), max(settled)
+    # runs is keyed by trade_date (one row per day), so no ordering is needed.
+    statuses = dict(conn.execute("SELECT trade_date, status FROM runs"))
+    return [
+        {"date": day, "status": statuses.get(day, "no_run_record")}
+        for day in calendar_days
+        if first < day < anchor and day not in settled
+    ]
+
+
 def force_reset_day(conn: sqlite3.Connection, trade_date: str) -> None:
     """Idempotently undo a settled day so it can be re-run.
 

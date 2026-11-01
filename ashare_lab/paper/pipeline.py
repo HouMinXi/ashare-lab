@@ -71,6 +71,7 @@ from ashare_lab.paper.ledger import (
     log_settle_change,
     record_nav,
     record_run,
+    settlement_gaps,
     open_pipeline_run,
     close_pipeline_run,
     set_cooldown,
@@ -2699,6 +2700,33 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
 # ------------------------------------------------------------------
 
 
+
+def _status_gaps(conn: sqlite3.Connection) -> list[dict]:
+    """Return settlement gaps for display, or an empty list if the scan fails.
+
+    Display-only: an unreadable date or a broken calendar must not take the
+    status command down, and nothing here writes to the ledger.
+    """
+    try:
+        settled_range = conn.execute(
+            "SELECT MIN(trade_date), MAX(trade_date) FROM runs WHERE status = 'settled'"
+        ).fetchone()
+        if not settled_range or not settled_range[0] or not settled_range[1]:
+            return []
+        from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
+        days = [
+            day.isoformat()
+            for day in trading_days_between(
+                dt.date.fromisoformat(settled_range[0]),
+                dt.date.fromisoformat(settled_range[1]),
+            )
+        ]
+    except Exception:
+        logger.warning("settlement gap scan skipped", exc_info=True)
+        return []
+    return settlement_gaps(conn, days)
+
+
 def get_status() -> dict:
     """Return current ledger status for CLI display."""
     config = load_config()
@@ -2726,6 +2754,8 @@ def get_status() -> dict:
         "WHERE status IN ('pending','carry')"
     ).fetchone()[0]
 
+    gaps = _status_gaps(conn)
+
     return {
         "last_trade_date": last_run["trade_date"] if last_run else None,
         "run_status": last_run["status"] if last_run else None,
@@ -2733,4 +2763,6 @@ def get_status() -> dict:
         "cash": float(nav_row["cash"]) if nav_row else None,
         "position_count": pos_count,
         "pending_orders": pending_count,
+        "gaps": gaps,
+        "gap_count": len(gaps),
     }
