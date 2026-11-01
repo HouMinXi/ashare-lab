@@ -528,6 +528,7 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
             _extend_instrument_end_dates(inst_dir, _traded, latest_date)
             check_index_membership(inst_dir, latest_date)
         return
+    cal_size = cal_path.stat().st_size if cal_path.exists() else 0
     with open(cal_path, "a", encoding="utf-8") as f:
         for d in dates_to_add:
             f.write(d + "\n")
@@ -576,6 +577,12 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
             count += 1
 
     if not count:
+        # Nothing was written, so the dates appended above point at rows that do
+        # not exist. Put the calendar back the way it was: a retry must fail the
+        # same way rather than report success over missing data.
+        if dates_to_add:
+            with open(cal_path, "r+b") as f:
+                f.truncate(cal_size)
         raise RuntimeError("no instruments updated (feature dirs missing?)")
 
     if new_dates:

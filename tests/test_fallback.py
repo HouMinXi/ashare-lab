@@ -1444,3 +1444,28 @@ class TestDumpBinTrailingSymbol:
 
         with pytest.raises(RuntimeError, match="no instruments updated"):
             _dump_bin_update(csv_dir, provider)
+
+    def test_a_failed_run_leaves_the_calendar_untouched(self, tmp_path: Path) -> None:
+        """The dates are appended before the write loop, so a run that writes
+        nothing must put them back. Otherwise the next run finds every date
+        present, skips the loop, and reports success over missing data."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        day_txt = provider / "calendars" / "day.txt"
+        before = day_txt.read_bytes()
+
+        csv_dir = tmp_path / "csvs"
+        csv_dir.mkdir()
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
+        assert day_txt.read_bytes() == before, "the calendar must not move"
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
