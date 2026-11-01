@@ -65,7 +65,13 @@ def _write_sidecar(path: Path, data: dict, clear: tuple[str, ...] = ()) -> None:
     if path.exists():
         try:
             loaded = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            # A sidecar written by an older tool, or truncated mid-UTF-8, is
+            # unreadable for our purposes; start from an empty one instead of
+            # letting the decode error escape into the step that called us.
+            # A sidecar written by an older tool, or truncated mid-UTF-8, is
+            # unreadable for our purposes; start from an empty one instead of
+            # letting the decode error escape into the step that called us.
             loaded = None
         if isinstance(loaded, dict):
             existing = loaded
@@ -322,7 +328,7 @@ def rolling_lagged_ic(
             continue
         try:
             meta = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             log.warning("corrupt sidecar skipped: %s", f)
             continue
         val = meta.get("lagged_ic_t5")
