@@ -540,10 +540,12 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
     traded_syms: set[str] = set()
     for csv_file in csv_files:
         sym = csv_file.stem
-        traded_syms.add(sym.upper())
         sym_dir = _feature_dir(feat_dir, sym)
         if not sym_dir.exists():
+            # Not traded, as far as the provider is concerned: nothing was
+            # written for it, so its instrument end date must not move either.
             continue
+        traded_syms.add(sym.upper())
 
         with open(csv_file, encoding="utf-8") as f:
             rows = sorted(csv_mod.DictReader(f), key=lambda r: r["date"])

@@ -1370,3 +1370,77 @@ class TestDumpBinTrailingSymbol:
         bin_path = provider / "features" / "sh000852" / "close.day.bin"
         points = (bin_path.stat().st_size - 4) // 4
         assert _instrument_end_dates(provider)["SH000852"] == cal[points - 1]
+
+    def test_a_symbol_without_a_directory_is_not_marked_as_updated(
+        self, tmp_path: Path
+    ) -> None:
+        """An index row for a symbol whose features have not landed must keep its
+        own end date: rolling it forward claims data that does not exist, and the
+        stale-index repair reads exactly this file to decide what is current."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        all_txt = provider / "instruments" / "all.txt"
+        all_txt.write_text(
+            all_txt.read_text(encoding="utf-8")
+            + "SZ999999\t2024-03-01\t2024-03-01\n",
+            encoding="utf-8",
+        )
+
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, ["2024-03-04"])
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        _dump_bin_update(csv_dir, provider)
+
+        rows = {
+            line.split("\t")[0]: line.split("\t")[1:]
+            for line in all_txt.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        assert rows["SH000852"][1] == "2024-03-04", "the written symbol advances"
+        assert rows["SZ999999"][1] == "2024-03-01", (
+            "nothing was written for it, so its end date must not move"
+        )
+
+    def test_a_csv_without_a_feature_directory_is_skipped(self, tmp_path: Path) -> None:
+        """A symbol the provider has no directory for cannot be written, but it
+        must not stop the symbols that can."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, ["2024-03-04"])
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        _dump_bin_update(csv_dir, provider)
+
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        assert (bin_path.stat().st_size - 4) // 4 == 2, "the symbol with a directory still got its row"
+
+    def test_a_run_with_nothing_to_write_raises(self, tmp_path: Path) -> None:
+        """If every CSV lacks a feature directory the run wrote nothing; that is
+        a broken provider layout, not a quiet success."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        # The date must be new to the calendar, otherwise the function returns
+        # early and never reaches the write loop this test is about.
+        cal = ["2024-03-01"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        csv_dir = tmp_path / "csvs"
+        csv_dir.mkdir()
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
