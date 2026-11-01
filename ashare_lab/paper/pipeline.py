@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import sqlite3
 import json
 import subprocess
 import sys
