@@ -26,10 +26,15 @@ def is_trading_day(date: dt.date) -> bool:
     return cal.is_session(ts)
 
 
+def market_today() -> dt.date:
+    """Today's date on the exchange clock, not the host's."""
+    return dt.datetime.now(TZ_SHANGHAI).date()
+
+
 def latest_trading_day(as_of: dt.date | None = None) -> dt.date:
     """Most recent completed trading day on or before *as_of* (default: today Shanghai)."""
     if as_of is None:
-        as_of = dt.datetime.now(TZ_SHANGHAI).date()
+        as_of = market_today()
     cal = _get_calendar()
     ts = pd.Timestamp(as_of)
     if ts > cal.last_session:

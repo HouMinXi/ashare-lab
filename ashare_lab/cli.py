@@ -49,7 +49,11 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 def cmd_fetch_today(args: argparse.Namespace) -> int:
     import datetime as dt  # noqa: PLC0415
-    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
+    from ashare_lab.data.calendar import (  # noqa: PLC0415
+        is_trading_day,
+        latest_trading_day,
+        market_today,
+    )
     from ashare_lab.data.fetcher import (  # noqa: PLC0415
         fetch_today_data,
         fetch_cross_validation_sample,
@@ -58,7 +62,7 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
     )
     from ashare_lab.data.validator import validate_daily_data  # noqa: PLC0415
 
-    today = dt.date.today()
+    today = market_today()
     if not is_trading_day(today):
         print("not a trading day")
         return 0
@@ -142,12 +146,15 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
 
 
 def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
-    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
+    from ashare_lab.data.calendar import (  # noqa: PLC0415
+        is_trading_day,
+        latest_trading_day,
+        market_today,
+    )
     from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS  # noqa: PLC0415
 
-    today = dt.date.today()
+    today = market_today()
     if not is_trading_day(today):
         print("not a trading day")
         return 0
@@ -182,11 +189,10 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_chenditc_diff(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
     from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
 
-    trade_date = str(latest_trading_day(dt.date.today()))
+    trade_date = str(latest_trading_day())
     snap_path = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
 
     if not snap_path.exists():

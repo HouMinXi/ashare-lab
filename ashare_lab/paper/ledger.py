@@ -1153,6 +1153,17 @@ def hot_backup_with_integrity(
     )
 
 
+def _golden_period() -> str:
+    """Month the golden snapshot belongs to, on the exchange clock.
+
+    A host west of Shanghai turns the month over later than the exchange, which
+    would file the first session of a month under the previous month.
+    """
+    from ashare_lab.data.calendar import market_today  # noqa: PLC0415
+
+    return market_today().strftime("%Y-%m")
+
+
 def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     """Create a monthly golden backup (immutable, chmod 444).
 
@@ -1162,7 +1173,7 @@ def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     Returns the path if created, None if already exists or integrity failed.
     """
     golden_dir = backup_dir / "golden"
-    golden_path = golden_dir / f"{date.today().strftime('%Y-%m')}.db"
+    golden_path = golden_dir / f"{_golden_period()}.db"
 
     if golden_path.exists():
         logger.debug("Golden backup already exists: %s", golden_path)
