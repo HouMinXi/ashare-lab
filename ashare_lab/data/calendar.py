@@ -26,9 +26,16 @@ def is_trading_day(date: dt.date) -> bool:
     return cal.is_session(ts)
 
 
-def market_today() -> dt.date:
-    """Today's date on the exchange clock, not the host's."""
-    return dt.datetime.now(TZ_SHANGHAI).date()
+def market_today(now: dt.datetime | None = None) -> dt.date:
+    """Today's date on the exchange, not on the machine.
+
+    ``now`` is injectable so a test can pin the instant instead of replacing the
+    datetime module.
+    """
+    moment = now if now is not None else dt.datetime.now(TZ_SHANGHAI)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=TZ_SHANGHAI)
+    return moment.astimezone(TZ_SHANGHAI).date()
 
 
 def latest_trading_day(as_of: dt.date | None = None) -> dt.date:

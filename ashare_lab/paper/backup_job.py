@@ -33,18 +33,16 @@ from ashare_lab.paper.ledger import hot_backup_with_integrity
 
 logger = logging.getLogger(__name__)
 
+from ashare_lab.data.calendar import market_today
+
 SUBDIR = "nightly"
-EXCHANGE_TZ = dt.timezone(dt.timedelta(hours=8))
-
-
 def exchange_today(now: dt.datetime | None = None) -> dt.date:
-    """The trading-day label for a snapshot, in the exchange's timezone.
+    """The trading-day label for a snapshot.
 
-    ``now`` is injectable so the date boundary can be tested instead of
-    being inferred from the machine this happens to run on.
+    The calendar owns the calculation; this name keeps the backup job's callers
+    reading naturally, and ``now`` passes through for the boundary tests.
     """
-    moment = now or dt.datetime.now(dt.timezone.utc)
-    return moment.astimezone(EXCHANGE_TZ).date()
+    return market_today(now)
 
 
 def configured_ledger() -> Path:
