@@ -125,6 +125,21 @@ def apply_price_filter(
     return pred[mask]
 
 
+def resolve_test_segment(window: dict) -> tuple[str, str]:
+    """The span the trainer evaluates on.
+
+    The freshest walk-forward window can have its test period still in the
+    future (window 11: test 2027-01-01..2026-11-06), which leaves the test
+    segment empty.  qlib's pytorch_tra then reads metrics["MSE"] off an empty
+    frame and raises KeyError after the first epoch, so a live retrain could
+    never finish.  A serve-now model has no held-out period to report; it is
+    trained on everything that exists, so report on the validation span.
+    """
+    if window["test_start"] > window["test_end"]:
+        return window["valid_start"], window["valid_end"]
+    return window["test_start"], window["test_end"]
+
+
 def train_window(
     window: dict,
     exp_dir: Path,
@@ -191,6 +206,14 @@ def train_window(
         window["test_end"],
         universe,
     )
+
+    if window["test_start"] > window["test_end"]:
+        _fallback = resolve_test_segment(window)
+        log.info(
+            "W%d: test period has not started (%s > %s); evaluating on %s..%s",
+            window_id, window["test_start"], window["test_end"],
+            _fallback[0], _fallback[1],
+        )
 
     # qlib.init() must only be called once per process; subsequent calls while
     # a QlibRecorder is active raise RecorderInitializationError.  Guard here
@@ -262,7 +285,7 @@ def train_window(
     segs = {
         "train": (window["train_start"], window["train_end"]),
         "valid": (window["valid_start"], window["valid_end"]),
-        "test": (window["test_start"], window["test_end"]),
+        "test": resolve_test_segment(window),
     }
 
     # Determine seq_len for time-series models (TRA/ALSTM).
