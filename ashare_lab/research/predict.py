@@ -291,6 +291,39 @@ def _update_diversity_history(
         log.debug("Failed to update diversity history", exc_info=True)
 
 
+def _model_age_days(
+    model_meta: dict | None,
+    model_path: Path,
+    today: date,
+    meta_reason: str = "",
+) -> tuple[float, str]:
+    """Days since this model was produced, and where the number came from.
+
+    meta.json's train_date is the cutoff of the training data, and in a
+    walk-forward window that cutoff lags today by months: the model retrained
+    on 2026-11-07 from window 11 carries train_date 2026-06-30 and would be
+    reported as 131 days stale the hour it was written. Staleness answers "has
+    anyone retrained", so anchor on trained_at and fall back to the cutoff only
+    when the timestamp is absent, then to the file's modification time.
+    """
+    if model_meta:
+        trained_at = model_meta.get("trained_at")
+        if trained_at:
+            try:
+                stamp = datetime.fromisoformat(str(trained_at).replace("Z", "+00:00"))
+                return float((today - stamp.date()).days), "meta.json(trained_at)"
+            except ValueError:
+                pass
+        train_date = model_meta.get("train_date")
+        if train_date:
+            try:
+                return float((today - date.fromisoformat(str(train_date))).days), "meta.json(train_date)"
+            except ValueError:
+                pass
+    age = (time.time() - model_path.stat().st_mtime) / 86400
+    return age, f"mtime-fallback({meta_reason})" if meta_reason else "mtime-fallback"
+
+
 def _resolve_model_path(
     trade_date: str,
     model_path: Path | None,
@@ -442,12 +475,9 @@ def predict_for_date(
     model_meta, meta_reason = read_model_meta(model_path)
     # fixed +08:00 offset, no tzdata dependency (works on hosts without IANA data)
     today = datetime.now(timezone(timedelta(hours=8))).date()
-    if model_meta is not None:
-        model_age_days = (today - date.fromisoformat(model_meta["train_date"])).days
-        age_source = "meta.json"
-    else:
-        model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
-        age_source = f"mtime-fallback({meta_reason})"
+    model_age_days, age_source = _model_age_days(
+        model_meta, model_path, today, meta_reason
+    )
     if model_age_days > _MODEL_STALE_DAYS:
         pinned = _LAST_RESOLUTION["deliberate"]
         log.warning(

@@ -317,3 +317,40 @@ def test_staleness_alert_is_gated_on_the_pin_flag():
         "the stale _send_alert must sit behind the pin check; "
         "without it every run pages about a deliberate deployment"
     )
+
+
+def test_staleness_counts_from_training_not_from_the_data_cutoff(tmp_path):
+    """A model retrained today over a window ending months ago is fresh.
+
+    train_date is the training window's cutoff -- 2026-06-30 for the newest
+    walk-forward window -- so measuring from it reported a model written
+    minutes earlier as 131 days stale, which is the number the 2026-11-07
+    retrain produced on its first prediction.
+    """
+    from datetime import date
+
+    from ashare_lab.research.predict import _model_age_days
+
+    p = tmp_path / "w12.pt"
+    p.write_bytes(b"model bytes")
+    meta = {"train_date": "2026-06-30", "trained_at": "2026-11-08T02:30:13+08:00"}
+
+    age, source = _model_age_days(meta, p, date(2026, 11, 8))
+
+    assert age == 0
+    assert source == "meta.json(trained_at)"
+
+
+def test_staleness_falls_back_to_train_date_then_mtime(tmp_path):
+    from datetime import date
+
+    from ashare_lab.research.predict import _model_age_days
+
+    p = tmp_path / "w1.pt"
+    p.write_bytes(b"model bytes")
+
+    age, source = _model_age_days({"train_date": "2026-06-01"}, p, date(2026, 6, 11))
+    assert (age, source) == (10.0, "meta.json(train_date)")
+
+    age, source = _model_age_days(None, p, date(2026, 6, 11))
+    assert source.startswith("mtime-fallback")
