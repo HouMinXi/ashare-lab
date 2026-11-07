@@ -11,10 +11,17 @@ cap applies, decaying linearly over N trading days to the normal cap.
 
 from __future__ import annotations
 
+import math
+
 import logging
 import sqlite3
 
 logger = logging.getLogger(__name__)
+
+# A-share cash equities trade in 100-share lots; a buy worth less
+# than one lot is not an order, and funding such a name would spend a
+# budget slot to send nothing.
+LOT_SIZE = 100
 
 
 def cap_rotation_buys(
@@ -30,7 +37,9 @@ def cap_rotation_buys(
     Parameters
     ----------
     buy_syms : list[str]
-        Symbols to buy (already filtered: no forced sells, no IPO exits).
+        Symbols to buy (already filtered: no forced sells, no IPO exits), in
+        rank order.  The allocation is order-sensitive: the budget funds the
+        front of this list first.
     target_value : float
         Per-stock target value (pre-lot, pre-cap).
     prices : dict
@@ -45,13 +54,20 @@ def cap_rotation_buys(
 
     Returns
     -------
-    (capped_syms, effective_cap, ramp_state)
-        capped_syms: symbols that survive the cap (may be shorter than buy_syms)
+    (funded_syms, value_per_name, effective_cap, ramp_state)
+        funded_syms: symbols to order today, in rank order.  Empty when the
+            budget cannot cover a single lot.
+        value_per_name: what each funded symbol is sized at.  Normally the
+            target value; in the fallback branch the whole budget for one name.
         effective_cap: the cap that was actually applied (may be ramp cap)
         ramp_state: updated ramp state (caller should persist)
     """
     if not buy_syms or equity_nav <= 0:
         return buy_syms, target_value, cap, ramp_state
+
+    if target_value <= 0:
+        # Nothing to size: a zero target means no order, not an unscaled list.
+        return [], target_value, cap, ramp_state
 
     # Compute effective cap (ramp or normal)
     effective_cap = cap
@@ -86,31 +102,45 @@ def cap_rotation_buys(
     if total_planned <= cap_value:
         return buy_syms, target_value, effective_cap, ramp_state
 
-    # Cap binding: scale all buys by uniform factor
-    factor = cap_value / total_planned if total_planned > 0 else 0.0
+    # Cap binding: fund a ranked prefix at full size.  Scaling every buy by a
+    # uniform factor and then discarding whatever falls below one lot deletes
+    # the plan exactly when the book is emptiest -- twelve planned buys become a
+    # quarter of a position each and none survives, which is how a book three
+    # names light stops buying altogether.  The budget limits how many names may
+    # move today, not how large each one is.
+    planned_value = target_value
+
+    def _orderable(sym: str, budget: float) -> bool:
+        close = prices.get(sym, {}).get("close")
+        if not isinstance(close, (int, float)) or not math.isfinite(close) or close <= 0:
+            return False
+        # One lot has to fit inside what this name would be given, or the order
+        # rounds to zero shares and still consumes a budget slot.
+        return close * LOT_SIZE <= budget
+
+    # Floor with tolerance: 0.20 * 15 / 0.95 is 3.157 in decimal but can land a
+    # hair under an integer in binary, and floor() would then fund one name
+    # fewer than the budget allows.
+    names_today = math.floor(cap_value / target_value + 1e-9)
+    if names_today >= 1:
+        candidates = [s for s in buy_syms if _orderable(s, target_value)]
+        chosen = candidates[:names_today]
+    else:
+        # Not even one full position fits: put the whole budget into the first
+        # name that can still buy a lot, instead of sending nothing.
+        candidates = [s for s in buy_syms if _orderable(s, cap_value)]
+        chosen = candidates[:1]
+        if chosen:
+            target_value = cap_value
+
     logger.info(
-        "[turnover] cap binding: planned=%.0f, cap=%.0f (=%.1f%% NAV), factor=%.4f",
-        total_planned, cap_value, effective_cap * 100, factor,
+        "[turnover] cap binding: planned=%d x %.0f = %.0f, cap=%.0f (%.1f%% NAV); "
+        "funding %d at %.0f, deferring %d",
+        len(buy_syms), planned_value, total_planned, cap_value,
+        effective_cap * 100, len(chosen), target_value,
+        len(buy_syms) - len(chosen),
     )
-
-    # Filter: keep only symbols where scaled target_value >= 1 lot
-    capped_syms = []
-    for sym in buy_syms:
-        close = prices.get(sym, {}).get("close", 0)
-        if close <= 0:
-            continue
-        scaled_value = target_value * factor
-        scaled_qty = int(scaled_value / close)
-        if scaled_qty >= 100:  # 1 lot minimum
-            capped_syms.append(sym)
-        else:
-            logger.warning(
-                "[turnover] skip %s: scaled_value=%.0f < 1 lot (price=%.2f)",
-                sym, scaled_value, close,
-            )
-
-    scaled_target_value = target_value * factor
-    return capped_syms, scaled_target_value, effective_cap, ramp_state
+    return chosen, target_value, effective_cap, ramp_state
 
 
 def load_turnover_ramp(conn: sqlite3.Connection) -> dict:

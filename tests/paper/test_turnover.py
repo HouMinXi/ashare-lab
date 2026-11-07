@@ -88,44 +88,136 @@ def test_cap_not_binding_unchanged(prices_5):
 
 
 # -------------------------------------------------------------------
-# T2: cap binding -> uniform factor, WARNING for 0-lot
+# T2: cap binding -> ranked prefix at full size
 # -------------------------------------------------------------------
 
 
-def test_cap_binding_uniform_factor(prices_5):
-    """When cap binds, all buys scaled by same factor."""
+def test_cap_funds_a_ranked_prefix_at_full_size(prices_5):
+    """The budget limits how many names move, not how large each one is."""
     buy_syms = ["SZ000001", "SZ000002", "SZ000003", "SZ000004", "SZ000005"]
-    target_value = 20000.0  # 5 * 20000 = 100000
+    target_value = 20000.0   # 5 * 20000 = 100000 planned
     equity_nav = 300000.0
-    cap = 0.10  # 10% of 300K = 30K; 100K > 30K -> binding, factor = 0.3
-    ramp_state = {"active": False, "k": 0}
+    cap = 0.10               # 30K budget -> room for one full position
 
-    capped, _, _, _ = cap_rotation_buys(
-        buy_syms, target_value, prices_5, equity_nav, cap, ramp_state,
+    capped, value, _, _ = cap_rotation_buys(
+        buy_syms, target_value, prices_5, equity_nav, cap, {"active": False, "k": 0},
     )
-    # factor = 30000 / 100000 = 0.3
-    # SZ000001: 20000*0.3 = 6000 / 10.0 = 600 shares (>= 100) -> keep
-    # SZ000002: 20000*0.3 = 6000 / 20.0 = 300 shares (>= 100) -> keep
-    # SZ000003: 20000*0.3 = 6000 / 30.0 = 200 shares (>= 100) -> keep
-    # SZ000004: 20000*0.3 = 6000 / 40.0 = 150 shares (>= 100) -> keep
-    # SZ000005: 20000*0.3 = 6000 / 50.0 = 120 shares (>= 100) -> keep
-    assert len(capped) == 5
+
+    assert capped == ["SZ000001"], f"expected the top-ranked name, got {capped}"
+    assert value == target_value, f"a funded name keeps its full size, got {value}"
 
 
-def test_cap_binding_0lot_skip(prices_5):
-    """Orders scaled to < 1 lot are skipped with WARNING."""
+def test_an_empty_book_still_buys_when_the_cap_binds():
+    """Twelve planned buys used to scale to a quarter position each and vanish.
+
+    This is the 2026-08 ledger shape: three names held, twelve wanted, a 20%
+    cap.  The book bought nothing for six weeks.
+    """
+    symbols = [f"SZ{i:06d}" for i in range(12)]
+    prices = {s: {"close": 60.0} for s in symbols}
+    nav = 275_000.0
+    target_value = nav * 0.95 / 15       # 17,417
+    capped, value, _, _ = cap_rotation_buys(
+        symbols, target_value, prices, nav, 0.20, {"active": False, "k": 0},
+    )
+
+    assert len(capped) == 3, f"expected three full positions, got {capped}"
+    assert capped == symbols[:3], "the prefix must follow rank order"
+    assert value == target_value, f"positions must not be scaled down, got {value}"
+
+
+def test_the_budget_contracts_the_trade_instead_of_cancelling_it(prices_5):
+    """Less room than one position, more than one lot: buy the top name with it."""
+    buy_syms = ["SZ000001", "SZ000002"]
+    target_value = 20000.0
+    equity_nav = 300000.0
+    cap = 0.05               # 15K budget, a full position needs 20K
+
+    capped, value, _, _ = cap_rotation_buys(
+        buy_syms, target_value, prices_5, equity_nav, cap, {"active": False, "k": 0},
+    )
+
+    assert capped == ["SZ000001"], f"expected the top name, got {capped}"
+    assert value == 15000.0, f"the trade absorbs the whole budget, got {value}"
+
+
+def test_a_name_that_cannot_buy_one_lot_is_skipped_for_a_cheaper_one():
+    """Funding an expensive name would round to zero shares and waste the slot."""
+    symbols = ["EXPENSIVE", "CHEAP1", "CHEAP2"]
+    prices = {"EXPENSIVE": {"close": 500.0}, "CHEAP1": {"close": 10.0},
+              "CHEAP2": {"close": 20.0}}
+    nav = 1_000_000.0
+    target_value = 10_000.0          # 500 yuan needs 50,000 for one lot
+    capped, _, _, _ = cap_rotation_buys(
+        symbols, target_value, prices, nav, 0.022, {"active": False, "k": 0},
+    )
+    assert capped == ["CHEAP1", "CHEAP2"], f"expected the lot-feasible names, got {capped}"
+
+
+def test_the_fallback_takes_the_first_name_that_can_buy_a_lot():
+    """The budget must not stop at a name whose price it cannot cover."""
+    symbols = ["EXPENSIVE", "CHEAP"]
+    prices = {"EXPENSIVE": {"close": 500.0}, "CHEAP": {"close": 10.0}}
+    capped, value, _, _ = cap_rotation_buys(
+        symbols, 100_000.0, prices, 1_000_000.0, 0.005, {"active": False, "k": 0},
+    )
+    assert capped == ["CHEAP"], f"expected the affordable name, got {capped}"
+    assert value == 5_000.0
+
+
+def test_the_funded_prefix_stays_inside_the_budget():
+    """Aggregate spend is bounded by the cap, not just by the name count."""
+    symbols = [f"S{i:03d}" for i in range(9)]
+    prices = {s: {"close": 33.0} for s in symbols}
+    nav = 300_000.0
+    target_value = 19_000.0
+    cap = 0.20
+    capped, value, _, _ = cap_rotation_buys(
+        symbols, target_value, prices, nav, cap, {"active": False, "k": 0},
+    )
+    from ashare_lab.paper.engine import round_lots
+    spend = sum(round_lots(value / prices[s]["close"], "buy") * prices[s]["close"]
+                for s in capped)
+    assert spend <= cap * nav, f"spend {spend} exceeds cap {cap * nav}"
+    assert len(capped) == 3
+
+
+def test_a_zero_target_selects_nothing():
+    capped, _, _, _ = cap_rotation_buys(
+        ["SZ000001"], 0.0, {"SZ000001": {"close": 10.0}}, 300_000.0, 0.20,
+        {"active": False, "k": 0},
+    )
+    assert capped == []
+
+
+def test_an_exact_budget_ratio_is_not_lost_to_floating_point():
+    """floor(cap/target) must not drop a name when the ratio is integral.
+
+    At this size the ratio is exactly 3.0 under true division while Python's
+    floor-division operator returns 2.0 for the same pair, so a rewrite to
+    ``//`` would silently fund one name fewer than the budget allows.
+    """
+    nav = 1_000_000.0
+    target_value = nav * 0.95 / 6
+    prices = {f"S{i}": {"close": 1000.0} for i in range(6)}
+    capped, _, _, _ = cap_rotation_buys(
+        list(prices), target_value, prices, nav, 0.475, {"active": False, "k": 0},
+    )
+    assert len(capped) == 3, f"expected three funded names, got {len(capped)}"
+
+
+def test_a_budget_below_one_lot_sends_nothing(prices_5):
+    """Below a single lot there is no order to send; that is a no-op, not a bug."""
     buy_syms = ["SZ000001", "SZ000005"]
-    target_value = 1000.0  # 2 * 1000 = 2000
+    target_value = 1000.0
     equity_nav = 300000.0
-    cap = 0.001  # 0.1% of 300K = 300; 2000 > 300 -> binding, factor = 0.15
-    ramp_state = {"active": False, "k": 0}
+    cap = 0.001              # 300 yuan, the cheapest lot here costs 1000
 
     capped, _, _, _ = cap_rotation_buys(
-        buy_syms, target_value, prices_5, equity_nav, cap, ramp_state,
+        buy_syms, target_value, prices_5, equity_nav, cap, {"active": False, "k": 0},
     )
-    # SZ000001: 1000*0.15 = 150 / 10.0 = 15 shares (< 100) -> skip
-    # SZ000005: 1000*0.15 = 150 / 50.0 = 3 shares (< 100) -> skip
-    assert len(capped) == 0
+
+    assert capped == []
 
 
 # -------------------------------------------------------------------
@@ -263,7 +355,10 @@ def test_book_b_independent(prices_5):
         buy_syms, target_value, prices_5, 600000.0, 0.20,
         {"active": False, "k": 0},
     )
-    assert len(cap_a) < len(cap_b) or len(cap_a) == 5  # A may bind, B doesn't
+    # A: 5 x 20,000 = 100,000 against a 60,000 budget funds three.
+    # B: 100,000 against 120,000 does not bind, so all five go.
+    assert len(cap_a) == 3, f"book A should fund three names, got {cap_a}"
+    assert len(cap_b) == 5, f"book B should be uncapped, got {cap_b}"
 
 
 # -------------------------------------------------------------------
@@ -350,11 +445,15 @@ class TestTurnoverCapIntegration:
             _step10_signal_generation(ctx)
 
         buy_calls = [c for c in insert_calls if c[1] == "buy"]
-        # Cap binds: quantities should be smaller than uncapped
+        # 300,000 * 0.20 = 60,000 of budget against a 19,000 target funds three
+        # positions, each at full size.  The old contract scaled all five down
+        # instead; that is what deleted buys once a scaled position fell below
+        # one lot, so the expectation changes with the contract.
+        assert len(buy_calls) == 3, f"expected three funded positions, got {buy_calls}"
         for sym, side, qty in buy_calls:
             price = prices[sym]["close"]
-            uncapped_qty = int(19000 / price // 100) * 100
-            assert qty < uncapped_qty, f"{sym}: capped {qty} should be < uncapped {uncapped_qty}"
+            full_qty = int(19000 / price // 100) * 100
+            assert qty == full_qty, f"{sym}: {qty} is not the full position {full_qty}"
 
     def test_cap_off_full_orders(self, turnover_conn, tmp_path):
         """Cap OFF: all buy orders inserted."""
@@ -555,21 +654,14 @@ class TestBookBCapIntegration:
         ).fetchall()
         book_conn.close()
 
-        assert len(orders) == 5, f"Expected 5 buy orders, got {len(orders)}"
-        # Fixture reality: the bootstrapped Book B DB has no record_run,
-        # so get_latest_positions resolves empty and book NAV = cash only
-        # (90,000). Uncapped target_value = 90,000*0.95/15 = 5,700 ->
-        # round_lots at prices 11..15 gives (500,400,400,400,300).
-        # The cap binds at 0.20*90,000 = 18,000 < 5*5,700 = 28,500,
-        # factor = 18,000/28,500 = 0.6316, scaled value 3,600 ->
-        # exact capped quantities (300,300,200,200,200). Asserting the
-        # exact values proves the cap call fired: without it the orders
-        # are the uncapped (500,400,400,400,300).
-        expected = {"SH600001": 300, "SH600002": 300, "SH600003": 200,
-                    "SH600004": 200, "SH600005": 200}
+        # Budget 18,000 against a 5,700 target funds three positions at full
+        # size.  The old contract scaled all five by 0.63 and kept five partial
+        # orders -- the shape that let a three-name book stop buying entirely.
+        assert len(orders) == 3, f"expected three funded positions, got {len(orders)}"
+        expected = {"SH600001": 500, "SH600002": 400, "SH600003": 400}
         for row in orders:
             sym = row["symbol"]
             assert row["target_qty"] == expected[sym], (
-                f"{sym}: expected capped qty {expected[sym]}, "
+                f"{sym}: expected full-size qty {expected[sym]}, "
                 f"got {row['target_qty']}"
             )
