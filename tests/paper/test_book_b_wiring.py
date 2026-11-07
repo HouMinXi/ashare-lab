@@ -29,6 +29,7 @@ from ashare_lab.paper.pipeline import (
     _run_book_b,
     _step12_book_b,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 
 @pytest.fixture(autouse=True)
@@ -47,60 +48,25 @@ def _clear_timing_cache():
 
 def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
     """Build a minimal DailyRunContext for _run_book_b wiring tests."""
-    from ashare_lab.paper.pipeline import DailyRunContext
-
-    ctx = DailyRunContext.__new__(DailyRunContext)
-    ctx.trade_date = trade_date
-    ctx.db_path = tmp_path / "paper.db"
-    ctx.paper_cfg = {
-        "initial_cash": book_a_nav,
-        "topk": 15,
-        "n_drop": 1,
-        "listing_min_days": 60,
-        "turnover_cap": None,
-    }
-    ctx.config = {
-        "cost_model": {"risk_degree": 0.95},
-        "universe": {
-            "listing_min_days": 60,
-            "min_avg_turnover_20d": 0.0,
-            "exclude_close_above_cny": 300.0,
+    return make_daily_ctx(
+        trade_date=trade_date, db_path=tmp_path / "paper.db", pred_path=pred_path,
+        paper_cfg={"initial_cash": book_a_nav, "topk": 15, "n_drop": 1,
+                   "listing_min_days": 60, "turnover_cap": None},
+        config={
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0,
+                         "exclude_close_above_cny": 300.0},
+            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
         },
-        "carry_days": 3,
-        "slippage": 0.001,
-        "volume_participation_pct": 0.05,
-    }
-    ctx.risk_result = MagicMock(
-        buying_halted=False,
-        forced_sells={},
-        blocked_industries=set(),
-        blocked_rebuys=set(),
-        topk_override=None,
-        cooldown_entries={},
+        # volume must be present and positive, otherwise settle_buy_orders
+        # reads volume=0.0, flags the symbol suspended, and carries every
+        # buy order instead of filling it.
+        prices={"SH600519": {"close": 180.0, "volume": 10_000_000.0}},
+        universe=["SH600519"],
+        market_data={"SH600519": {"close": 180.0, "listing_days": 100,
+                                  "avg_turnover_20d": 100_000_000.0}},
+        cash=book_a_nav, total_nav=book_a_nav, hedge_state=None,
     )
-    # volume must be present and positive, otherwise settle_buy_orders
-    # reads volume=0.0, flags the symbol suspended, and carries every
-    # buy order instead of filling it.
-    ctx.prices = {"SH600519": {"close": 180.0, "volume": 10_000_000.0}}
-    ctx.pred_path = pred_path
-    ctx.universe_symbols = ["SH600519"]
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-    ctx.market_data = {
-        "SH600519": {
-            "close": 180.0,
-            "listing_days": 100,
-            "avg_turnover_20d": 100_000_000.0,
-        },
-    }
-    ctx.industry_map = {}
-    ctx.benchmarks = {"csi1000": 1.0}
-    ctx.hedge_state = None
-    ctx.hedge_symbols = set()
-    ctx.total_nav = book_a_nav
-    ctx.current_positions = {}
-    ctx.cash = book_a_nav
-    return ctx
 
 
 def _init_prod_and_book_b_db(tmp_path, book_id="none", cash=1_000_000.0):

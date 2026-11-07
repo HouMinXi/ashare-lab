@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 
 from ashare_lab.config import PROJECT_ROOT
+from tests.paper.ctx_factory import make_daily_ctx
 
 # Deliberately not alphabetical, so a set that iterates in hash or insertion
 # order lands somewhere other than the sorted order this must produce.
@@ -39,11 +40,10 @@ SEEDS = ("1", "2", "3", "4", "5", "6")
 
 def _sells_inserted_by_book_a(root: Path) -> list[str]:
     """Run the real step 10 and return sell symbols in the order they landed."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from ashare_lab.paper.ledger import get_connection, init_schema
-    from ashare_lab.paper.pipeline import DailyRunContext, _step10_signal_generation
-    from ashare_lab.paper.risk import RiskCheckResult
+    from ashare_lab.paper.pipeline import _step10_signal_generation
 
     os.chdir(root)
     # A prediction path inside the sandbox: with None the step resolves the
@@ -67,33 +67,13 @@ def _sells_inserted_by_book_a(root: Path) -> list[str]:
     prices = {sym: {"close": 10.0, "change": 0.01, "volume": 1e6,
                     "factor": 1.0, "threshold": 0.099} for sym in SELLS}
 
-    ctx = DailyRunContext(
-        trade_date="2025-06-20", force=False, steps=None,
-        pred_path=pred, start_time=0.0, predictions_date_str="2025-06-20",
+    ctx = make_daily_ctx(
+        trade_date="2025-06-20", conn=conn, config=config, pred_path=pred,
+        prices=prices, positions={sym: {"qty": 100} for sym in SELLS},
+        cash=300_000.0, total_nav=300_000.0, buying_halted=True,
+        market_data={sym: {"close": 10.0, "listing_days": 999,
+                           "avg_turnover_20d": 1e9} for sym in SELLS},
     )
-    ctx.conn = conn
-    ctx.config = config
-    ctx.paper_cfg = config["paper"]
-    ctx.prices = prices
-    ctx.current_positions = {sym: {"qty": 100} for sym in SELLS}
-    ctx.cash = 300_000.0
-    ctx.total_nav = 300_000.0
-    ctx.risk_result = RiskCheckResult(
-        buying_halted=True, forced_sells={},
-        blocked_industries=set(), blocked_rebuys=set(),
-        topk_override=None, cooldown_entries={},
-        suspension_risk={}, shadow_log=None,
-    )
-    ctx.hedge_state = MagicMock(active=False)
-    ctx.hedge_symbols = set()
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-    ctx.industry_map = {}
-    ctx.benchmarks = {"csi1000": 1.0}
-    ctx.market_data = {
-        sym: {"close": 10.0, "listing_days": 999, "avg_turnover_20d": 1e9}
-        for sym in SELLS
-    }
 
     # Buying halted keeps this to the sell side; the sell list is fixed so the
     # only thing under test is the order the orders are inserted in.  Both
@@ -112,10 +92,10 @@ def _sells_inserted_by_book_a(root: Path) -> list[str]:
 
 def _sells_inserted_by_book_b(root: Path) -> list[str]:
     """Same, through the shadow book that feeds the G3 comparison."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from ashare_lab.paper.ledger import get_connection, init_schema
-    from ashare_lab.paper.pipeline import DailyRunContext, _run_book_b
+    from ashare_lab.paper.pipeline import _run_book_b
 
     os.chdir(root)
     prod = root / "paper.db"
@@ -132,37 +112,23 @@ def _sells_inserted_by_book_b(root: Path) -> list[str]:
     pred.parent.mkdir(parents=True, exist_ok=True)
     pred.touch()
 
-    ctx = DailyRunContext.__new__(DailyRunContext)
-    ctx.trade_date = "2026-08-15"
-    ctx.db_path = prod
-    ctx.paper_cfg = {"initial_cash": 1_000_000.0, "topk": 15, "n_drop": 1,
-                     "listing_min_days": 60, "turnover_cap": None}
-    ctx.config = {
-        "cost_model": {"risk_degree": 0.95},
-        "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0,
-                     "exclude_close_above_cny": 300.0},
-        "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
-    }
-    ctx.risk_result = MagicMock(
-        buying_halted=True, forced_sells={}, blocked_industries=set(),
-        blocked_rebuys=set(), topk_override=None, cooldown_entries={},
+    ctx = make_daily_ctx(
+        trade_date="2026-08-15", db_path=prod, pred_path=pred,
+        paper_cfg={"initial_cash": 1_000_000.0, "topk": 15, "n_drop": 1,
+                   "listing_min_days": 60, "turnover_cap": None},
+        config={
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0,
+                         "exclude_close_above_cny": 300.0},
+            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
+        },
+        prices={sym: {"close": 10.0, "volume": 10_000_000.0} for sym in SELLS},
+        universe=list(SELLS),
+        market_data={sym: {"close": 10.0, "listing_days": 100,
+                           "avg_turnover_20d": 1e8} for sym in SELLS},
+        cash=1_000_000.0, total_nav=1_000_000.0, buying_halted=True,
+        hedge_state=None,
     )
-    ctx.prices = {sym: {"close": 10.0, "volume": 10_000_000.0} for sym in SELLS}
-    ctx.pred_path = pred
-    ctx.universe_symbols = list(SELLS)
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-    ctx.market_data = {
-        sym: {"close": 10.0, "listing_days": 100, "avg_turnover_20d": 1e8}
-        for sym in SELLS
-    }
-    ctx.industry_map = {}
-    ctx.benchmarks = {"csi1000": 1.0}
-    ctx.hedge_state = None
-    ctx.hedge_symbols = set()
-    ctx.total_nav = 1_000_000.0
-    ctx.current_positions = {}
-    ctx.cash = 1_000_000.0
 
     # First run bootstraps the shadow book; the second is the one that inserts.
     # The multiplier is read through timing_multiplier_detail, not the

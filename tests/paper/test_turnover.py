@@ -25,6 +25,7 @@ from ashare_lab.paper.turnover import (
     reset_turnover_ramp,
     check_ramp_activation,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 
 # -------------------------------------------------------------------
@@ -298,51 +299,19 @@ def test_ramp_activation_empty_positions():
 
 def _make_ctx(conn, signals, prices, config, *, positions=None, tmp_path=None):
     """Build a minimal DailyRunContext for _step10 testing."""
-    from ashare_lab.paper.pipeline import DailyRunContext
-    from unittest.mock import MagicMock
-    from ashare_lab.paper.risk import RiskCheckResult
-
-    # Create dummy prediction file if tmp_path provided
     pred_path = None
     if tmp_path:
         pred_dir = tmp_path / "predictions"
         pred_dir.mkdir(exist_ok=True)
         pred_path = pred_dir / "2025-06-20.parquet"
         pred_path.touch()
-
-    ctx = DailyRunContext(
-        trade_date="2025-06-20", force=False, steps=None,
-        pred_path=pred_path, start_time=0.0, predictions_date_str="2025-06-20",
+    # 999 days and 1e9 turnover keep every symbol past the universe filters
+    return make_daily_ctx(
+        conn=conn, config=config, pred_path=pred_path, prices=prices,
+        positions=positions, signals=signals,
+        market_data={sym: {"close": p["close"], "listing_days": 999,
+                           "avg_turnover_20d": 1e9} for sym, p in prices.items()},
     )
-    ctx.conn = conn
-    ctx.config = config
-    ctx.paper_cfg = config["paper"]
-    ctx.prices = prices
-    ctx.current_positions = positions or {}
-    ctx.cash = 300_000.0
-    ctx.total_nav = 300_000.0
-    ctx.signals_raw = signals
-    ctx.risk_result = RiskCheckResult(
-        buying_halted=False, forced_sells={},
-        blocked_industries=set(), blocked_rebuys=set(),
-        topk_override=None, cooldown_entries={},
-        suspension_risk={}, shadow_log=None,
-    )
-    ctx.hedge_state = MagicMock(active=False)
-    ctx.hedge_symbols = set()
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-
-    # Build market_data from prices for filter_candidates
-    ctx.market_data = {}
-    for sym, pdata in prices.items():
-        ctx.market_data[sym] = {
-            "close": pdata["close"],
-            "listing_days": 999,  # pass listing_min_days
-            "avg_turnover_20d": 1e9,  # pass liquidity filter
-        }
-
-    return ctx
 
 
 class TestTurnoverCapIntegration:

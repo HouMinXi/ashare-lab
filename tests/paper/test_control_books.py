@@ -26,6 +26,7 @@ from ashare_lab.paper.pipeline import (
     _write_abc_artifact,
     _step12_book_b,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 
 # -- timing_multiplier -------------------------------------------------------
@@ -329,41 +330,25 @@ class TestRunBookBPhase1Phase2:
 
     def _make_ctx(self, tmp_path, trade_date, pred_path):
         """Build a minimal DailyRunContext for _run_book_b."""
-        from ashare_lab.paper.pipeline import DailyRunContext
-
-        ctx = DailyRunContext.__new__(DailyRunContext)
-        ctx.trade_date = trade_date
-        ctx.db_path = tmp_path / "paper.db"
-        ctx.paper_cfg = {
-            "initial_cash": 300000.0, "topk": 15, "n_drop": 1,
-            "listing_min_days": 60,
-        }
-        ctx.config = {
-            "cost_model": {"risk_degree": 0.95},
-            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0, "exclude_close_above_cny": 300.0},
-            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
-        }
-        ctx.risk_result = MagicMock(
-            buying_halted=False, forced_sells={},
-            blocked_industries=set(), blocked_rebuys=set(),
-            topk_override=None, cooldown_entries={},
+        return make_daily_ctx(
+            trade_date=trade_date, db_path=tmp_path / "paper.db",
+            pred_path=pred_path,
+            paper_cfg={"initial_cash": 300000.0, "topk": 15, "n_drop": 1,
+                       "listing_min_days": 60},
+            config={
+                "cost_model": {"risk_degree": 0.95},
+                "universe": {"listing_min_days": 60,
+                             "min_avg_turnover_20d": 0.0,
+                             "exclude_close_above_cny": 300.0},
+                "carry_days": 3, "slippage": 0.001,
+                "volume_participation_pct": 0.05,
+            },
+            prices={"SH600519": {"close": 180.0}},
+            universe=["SH600519"],
+            market_data={"SH600519": {"close": 180.0, "listing_days": 100,
+                                      "avg_turnover_20d": 100_000_000.0}},
+            cash=300000.0, total_nav=300000.0, hedge_state=None,
         )
-        ctx.prices = {"SH600519": {"close": 180.0}}
-        ctx.pred_path = pred_path
-        ctx.universe_symbols = ["SH600519"]
-        ctx.ipo_listing_syms = set()
-        ctx.st_names = set()
-        ctx.market_data = {
-            "SH600519": {"close": 180.0, "listing_days": 100, "avg_turnover_20d": 100_000_000.0},
-        }
-        ctx.industry_map = {}
-        ctx.benchmarks = {"csi1000": 1.0}
-        ctx.hedge_state = None
-        ctx.hedge_symbols = set()
-        ctx.total_nav = 300000.0
-        ctx.current_positions = {}
-        ctx.cash = 300000.0
-        return ctx
 
     def test_phase1_settles_yesterday_phase2_generates_today(self, tmp_path):
         """_run_book_b Phase 1 settles d1 orders, Phase 2 inserts d2 orders.
