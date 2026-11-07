@@ -117,6 +117,12 @@ sync_code_to_gpu() {
     rm -rf "$STAGING"
     mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
     cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
+    # The retrain runs on this host too, and it imports train.py and the window
+    # helper train.py exports.  Leaving them out pinned the GPU at whatever
+    # version was deployed by hand: the 2026-11 retrain failed on a train.py
+    # that predated --serve-now by three months.
+    cp "$REPO/ashare_lab/research/train.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/smoke_test.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/model_meta.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
     # matrix_runner and matrix configs may not exist on fresh deploys.
