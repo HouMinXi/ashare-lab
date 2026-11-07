@@ -283,6 +283,21 @@ else
             log "latest.pt -> $(basename "$LATEST") (from version-sorted fallback, no meta.json)"
         fi
     fi
+
+    # The GPU host runs the nightly prediction and loads latest.pt for any date
+    # past the last window. On Windows that path is a real copy, not the symlink
+    # used here, so relinking only this side leaves the inference host on the
+    # previous model: the 2026-11-07 retrain deployed w12 and the GPU kept
+    # serving w115 until the copy was made by hand.
+    DEPLOYED_MODEL=$(basename "$(readlink -f "$PROJECT_DIR/models/latest.pt" 2>/dev/null)" 2>/dev/null || true)
+    if [ -n "${DEPLOYED_MODEL:-}" ] && [ "$DEPLOYED_MODEL" != "latest.pt" ]; then
+        if ssh -o ConnectTimeout=5 "$GPU_HOST" \
+            "cd /d $GPU_REPO/models && copy /Y $DEPLOYED_MODEL latest.pt >nul" 2>/dev/null; then
+            log "GPU latest.pt -> $DEPLOYED_MODEL"
+        else
+            log "WARNING: could not point the GPU latest.pt at $DEPLOYED_MODEL; predictions may use the previous model"
+        fi
+    fi
 fi
 
 # --- Step 6: Restart llama-server (always, even if shelved) ---

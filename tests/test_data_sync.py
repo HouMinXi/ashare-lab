@@ -739,3 +739,31 @@ class TestSyncFailureAlerts:
             capture_output=True, text=True, timeout=10,
         )
         assert "DETECTED" in r.stdout, r.stdout
+
+
+class TestRetrainPointsTheGpuAtItsOwnModel:
+    """The GPU host must load the model this run deployed.
+
+    It runs the nightly prediction and, past the last window, resolves
+    latest.pt. On Windows that file is a real copy rather than the symlink W1
+    uses, so a retrain that only relinks on W1 leaves the inference host on the
+    previous model -- which is what happened when w12 deployed and the GPU kept
+    serving w115.
+    """
+
+    RETRAIN = Path(__file__).resolve().parents[1] / "scripts" / "ashare-retrain.sh"
+
+    def test_the_gpu_copy_of_latest_is_updated(self):
+        src = self.RETRAIN.read_text()
+        assert "copy /Y $DEPLOYED_MODEL latest.pt" in src
+        assert "GPU latest.pt ->" in src
+
+    def test_the_relink_sits_in_the_deploying_branch(self):
+        src = self.RETRAIN.read_text()
+        skip_at = src.index('log "Shelved model: skipping Step 4')
+        relink_at = src.index("copy /Y $DEPLOYED_MODEL latest.pt")
+        restart_at = src.index("# --- Step 6: Restart llama-server")
+        assert skip_at < relink_at < restart_at, (
+            "a shelved model must not be pushed to the GPU, and the copy has to "
+            "happen before the server restart"
+        )
