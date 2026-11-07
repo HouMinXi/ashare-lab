@@ -104,21 +104,21 @@ log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 # window needs --serve-now <step> to reach.
 EXPECTED_MODEL=$(read_expected_live_model)
 EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
+# Always retrain the freshest window.  get_all_windows() stops at the last
+# window whose test period has started, so its length is that window's step;
+# --force alone would walk the whole history, which is hours of GPU time for a
+# cadence refresh that only needs the newest slice.
 TRAIN_ARGS="--force"
-if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
-    # get_all_windows() stops at the last window whose test period has
-    # started, so its length is the step of the freshest trainable window.
-    SERVE_NOW_STEP=$(PYTHONPATH="$PROJECT_DIR" python3 -c '
+SERVE_NOW_STEP=$(PYTHONPATH="$PROJECT_DIR" python3 -c '
 from ashare_lab.research.smoke_test import get_all_windows
 print(len(get_all_windows()))
 ' 2>/dev/null || true)
-    if [ -z "$SERVE_NOW_STEP" ]; then
-        log "serve-now live model ${EXPECTED_MODEL}: cannot derive step; aborting rather than running --force over the walk-forward set"
-        exit 1
-    fi
-    log "serve-now live model ${EXPECTED_MODEL}: training step ${SERVE_NOW_STEP} instead of --force all-windows"
-    TRAIN_ARGS="--serve-now $SERVE_NOW_STEP --force"
+if [ -z "$SERVE_NOW_STEP" ]; then
+    log "cannot derive the newest window step; aborting rather than running --force over the walk-forward set"
+    exit 1
 fi
+log "training window step ${SERVE_NOW_STEP} (live model ${EXPECTED_MODEL:-unknown})"
+TRAIN_ARGS="--serve-now $SERVE_NOW_STEP --force"
 
 # --- Step 1: Wake GPU ---
 # Same sequence as data-update and pipeline. The old inline loops logged

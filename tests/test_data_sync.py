@@ -432,9 +432,16 @@ class TestGpuLastConsumer:
 
 
 class TestRetrainSkipsServeNowLive:
-    """A serve-now live model (w115) must be retrained on its own window,
-    never by --force over the walk-forward set, which would write w11.pt
-    and displace it."""
+    """The cadence retrain trains the freshest window, never --force over the
+    whole walk-forward set.
+
+    The rule used to depend on the live model's number (>= 100 meant it sat
+    outside the walk-forward range).  Once the live model became w12 -- inside
+    the range but still newest -- that gate would have switched every retrain
+    to --force, which walks eleven windows for a refresh that needs one.  The
+    step is now always derived, and the deploy gate compares train_date, so the
+    model's name no longer decides anything.
+    """
 
     RETRAIN = Path(SCRIPT).resolve().parent / "ashare-retrain.sh"
 
@@ -452,11 +459,19 @@ class TestRetrainSkipsServeNowLive:
     def test_serve_now_guard_before_train(self):
         src = self.RETRAIN.read_text()
         train_at = src.index("py -m ashare_lab.research.train $TRAIN_ARGS")
-        comment_at = src.index("Serve-now live models")
+        guard_at = src.index("cannot derive the newest window step")
+        assert guard_at < train_at, "the abort must precede the training call"
+        # The deploy gate still branches on -ge 100 to recognise an out-of-band
+        # serve-now model whose number cannot be compared numerically; that is
+        # a different question. Only the block that chooses the training shape
+        # must be free of the model-name test.
+        shape = src[src.index("# Always retrain the freshest window"):train_at]
+        assert "-ge 100" not in shape, (
+            "the training shape still depends on the model name; w12 would "
+            "have flipped every retrain to --force over the whole history"
+        )
+        assert "--serve-now $SERVE_NOW_STEP --force" in shape
         fn_at = src.index("read_expected_live_model()")
-        assert fn_at < comment_at < train_at
-        assert "-ge 100" in src
-        assert "--serve-now $SERVE_NOW_STEP --force" in src
         fn_end = src.index("\n}", fn_at) + 2
         fn = src[fn_at:fn_end]
         assert "awk" in fn
