@@ -15,6 +15,13 @@ TODAY=$(date +%Y-%m-%d)
 IC_THRESHOLD=0.02
 CONSECUTIVE_DAYS=3
 
+# --force runs the retrain even when the IC gate would decline, for a
+# deliberate out-of-band training run.  It does not skip the deploy gate.
+GATE_BYPASS=0
+if [ "${1:-}" = "--force" ]; then
+    GATE_BYPASS=1
+fi
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
 
@@ -78,9 +85,13 @@ done < "$IC_HISTORY"
 
 log "IC gate: $low_count consecutive days below $IC_THRESHOLD (need $CONSECUTIVE_DAYS)"
 
-if [ "$low_count" -lt "$CONSECUTIVE_DAYS" ]; then
+if [ "$low_count" -lt "$CONSECUTIVE_DAYS" ] && [ "$GATE_BYPASS" -eq 0 ]; then
     log "IC gate not triggered, no retrain needed"
     exit 0
+fi
+
+if [ "$GATE_BYPASS" -eq 1 ]; then
+    log "IC gate bypassed by --force; proceeding with retrain"
 fi
 
 log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
@@ -116,6 +127,11 @@ fi
 # from whatever models were already on disk.
 # shellcheck source=scripts/lib/gpu-wake.sh
 source "$PROJECT_DIR/scripts/lib/gpu-wake.sh"
+# The library carries the address without a user, and sourcing it replaces the
+# admin@ host this script set above.  Without this reassembly wake_gpu polls
+# ssh as "<ip>@<ip>" until its budget runs out and every later ssh loses the
+# user too.
+GPU_HOST="${GPU_USER}@${GPU_HOST}"
 log "Waking GPU..."
 if ! wake_gpu "${GPU_HOST#*@}" "$WOL_MAC" "${GPU_HOST%%@*}" 300; then
     log "GPU not reachable, aborting retrain"
@@ -140,7 +156,7 @@ ssh -o ConnectTimeout=5 "$GPU_HOST" "del H:\\ashare-lab\\models\\meta.json 2>NUL
 log "Starting training..."
 PT_OK=0
 TRAIN_RC=0
-if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd $GPU_REPO && py -m ashare_lab.research.train $TRAIN_ARGS" >> "$LOG_FILE" 2>&1; then
+if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd /d $GPU_REPO && py -m ashare_lab.research.train $TRAIN_ARGS" >> "$LOG_FILE" 2>&1; then
     :
 else
     TRAIN_RC=$?
@@ -154,7 +170,7 @@ EXPECTED_MODEL=""
 
 # Read new model name from gpu-side meta.json (parse remotely, don't depend on scp)
 NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
-    "cd $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['model_file'])\"" 2>/dev/null || true)
+    "cd /d $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['model_file'])\"" 2>/dev/null || true)
 
 # Read expected_live_model from baseline config
 EXPECTED_MODEL=$(read_expected_live_model)
@@ -170,7 +186,7 @@ LIVE_TRAIN_DATE=""
 if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
     SERVE_NOW_LIVE=1
     NEW_TRAIN_DATE=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
-        "cd $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['train_date'])\"" 2>/dev/null || true)
+        "cd /d $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['train_date'])\"" 2>/dev/null || true)
     if [ -f "$PROJECT_DIR/models/meta.json" ]; then
         LIVE_TRAIN_DATE=$(META_PATH="$PROJECT_DIR/models/meta.json" \
         PYTHONPATH="$PROJECT_DIR" python3 -c '
