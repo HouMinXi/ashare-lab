@@ -15,6 +15,31 @@ import pytest
 from ashare_lab.paper.ledger import get_connection, init_schema
 
 
+# -- Keep the suite out of the checkout's predictions directory ------------
+
+@pytest.fixture(autouse=True)
+def _no_live_predictions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point PREDICTIONS_DIR at a per-test directory.
+
+    Several steps write a .meta.json sidecar beside the prediction they are
+    handed, and when a test hands them none they fall back to the module-level
+    PREDICTIONS_DIR, which is the checkout's own directory. Running the suite
+    from a worktree reaches the same place through its symlink, so a test that
+    only exercises a settlement path still rewrote live sidecars and passed:
+    one run replaced a real lagged-IC note with `{}`. Tests that build their
+    own predictions directory patch this themselves and are unaffected.
+    """
+
+    sandbox = tmp_path / "predictions-sandbox"
+    sandbox.mkdir()
+    for module in (
+        "ashare_lab.paper.pipeline",
+        "ashare_lab.paper.signal",
+        "ashare_lab.paper.signal_quality",
+    ):
+        monkeypatch.setattr(f"{module}.PREDICTIONS_DIR", sandbox, raising=False)
+
+
 # -- Database fixture (real temp file, not :memory:) -----------------------
 
 @pytest.fixture()
