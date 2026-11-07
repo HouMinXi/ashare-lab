@@ -34,6 +34,7 @@ def make_daily_ctx(
     positions: dict | None = None,
     cash: float = 300_000.0,
     total_nav: float | None = None,
+    force: bool = False,
     buying_halted: bool = False,
     forced_sells: dict | None = None,
     universe: list | None = None,
@@ -43,7 +44,7 @@ def make_daily_ctx(
     hedge_symbols: set | None = None,
 ):
     ctx = DailyRunContext(
-        trade_date=trade_date, force=False, steps=None,
+        trade_date=trade_date, force=force, steps=None,
         pred_path=pred_path, start_time=0.0, predictions_date_str=trade_date,
     )
     if conn is not None:

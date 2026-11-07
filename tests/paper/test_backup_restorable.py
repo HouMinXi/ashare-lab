@@ -25,10 +25,8 @@ from pathlib import Path
 import pytest
 
 from ashare_lab.paper.ledger import get_connection, init_schema, record_run
-from ashare_lab.paper.pipeline import (
-    DailyRunContext,
-    _step12_backup_and_finalize,
-)
+from tests.paper.ctx_factory import make_daily_ctx
+from ashare_lab.paper.pipeline import DailyRunContext, _step12_backup_and_finalize
 
 TRADE_DATE = "2026-10-22"
 PREVIOUS_DATE = "2026-10-21"
@@ -59,12 +57,10 @@ def _ctx(tmp_path: Path) -> DailyRunContext:
     record_run(conn, PREVIOUS_DATE, "settled")
     conn.commit()
 
-    ctx = DailyRunContext.__new__(DailyRunContext)
-    ctx.conn = conn
-    ctx.db_path = db_path
-    ctx.trade_date = TRADE_DATE
-    ctx.paper_cfg = {"backup_retention_days": 7}
-    return ctx
+    return make_daily_ctx(
+        TRADE_DATE, conn=conn, db_path=db_path,
+        paper_cfg={"backup_retention_days": 7},
+    )
 
 
 @pytest.fixture(autouse=True)
