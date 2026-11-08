@@ -25,6 +25,9 @@ from pathlib import Path
 WINDOW = 60
 BANDWIDTH = 20
 ALERT_T = -2.0
+# A t-statistic over a few sessions is arithmetic, not evidence: the
+# series correlates at 0.74, so twenty sessions is already generous.
+MIN_OBSERVATIONS = 20
 
 
 def load_series(path: Path) -> list[tuple[str, float]]:
@@ -132,6 +135,8 @@ def should_alert(stats: dict, threshold: float = ALERT_T) -> bool:
     mean = stats.get("mean")
     t_hac = stats.get("t_hac")
     if mean is None or t_hac is None:
+        return False
+    if stats.get("n", 0) < MIN_OBSERVATIONS:
         return False
     return mean < 0 and t_hac < threshold
 

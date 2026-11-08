@@ -8,7 +8,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import math
 import os
 import re
 import subprocess
@@ -22,6 +21,7 @@ import pandas as pd
 
 from ashare_lab.bridge import send_bridge_alert
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT
+from ashare_lab.paper import ic_monitor
 from ashare_lab.data.calendar import previous_trading_day
 
 if TYPE_CHECKING:
@@ -31,12 +31,14 @@ log = logging.getLogger(__name__)
 
 # Frozen thresholds (10-CONTEXT.md)
 _PSI_THRESHOLD = 0.25
-_IC_THRESHOLD = 0.01
 _REFERENCE_DAYS = 60
 _N_BUCKETS = 10
-_ROLLING_WINDOW = 20
 _MIN_REFERENCE_FILES = 20
 _MIN_INSTRUMENTS = 50
+
+# The pipeline appends one IC per settlement; the monitor reads that series so
+# the alert, the report and any later analysis all quote the same numbers.
+IC_HISTORY_PATH = PROJECT_ROOT / "data" / "ic_history.tsv"
 
 
 # ---------------------------------------------------------------------------
@@ -312,34 +314,28 @@ def lagged_ic_for_date(
     return ic, len(aligned_df)
 
 
-def rolling_lagged_ic(
-    predictions_dir: Path,
-    end_date: str,
-    window: int = _ROLLING_WINDOW,
-) -> tuple[float | None, int]:
-    """Compute rolling mean of lagged IC from sidecar files."""
-    values = []
-    for f in predictions_dir.glob("*.meta.json"):
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", f.stem)
-        if not m:
-            continue
-        date = m.group(1)
-        if date > end_date:
-            continue
-        try:
-            meta = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            log.warning("corrupt sidecar skipped: %s", f)
-            continue
-        val = meta.get("lagged_ic_t5")
-        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
-            values.append((date, val))
-    values.sort(key=lambda x: x[0], reverse=True)
-    values = values[:window]
-    if len(values) < window:
-        return None, len(values)
-    mean = sum(v for _, v in values) / len(values)
-    return mean, len(values)
+def _ic_alert_due(state_dir: Path, trade_date: str, min_days: int = 7) -> bool:
+    """At most one push a week while the condition holds.
+
+    The monitor's window is 60 sessions, so an alert state lasts weeks. Pushing
+    every day would train the reader to ignore it, which is how a monitor dies.
+    """
+    stamp = Path(state_dir) / ".ic_alert_stamp"
+    try:
+        last = stamp.read_text().strip()
+        if last and (
+            dt.date.fromisoformat(trade_date) - dt.date.fromisoformat(last)
+        ).days < min_days:
+            return False
+    except (OSError, ValueError):
+        pass
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(trade_date)
+    except OSError:
+        # A read-only data directory must not turn a monitor into a crash.
+        pass
+    return True
 
 
 def signal_quality_ic_step(ctx: DailyRunContext) -> None:
@@ -410,19 +406,26 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
                 {"lagged_ic_t5": None, "lagged_ic_error": f"{type(exc).__name__}: {exc}"},
                 clear=("lagged_ic_t5_n", "lagged_ic_t5_reason"),
             )
+    # One IC voice for the whole system. The old tripwire compared a 20-day
+    # mean against 0.01: the same statistic with a shorter window, no
+    # significance test, and an answer that could disagree with the report's.
     try:
-        mean, n = rolling_lagged_ic(predictions_dir, trade_date)
+        stats = ic_monitor.summarize(ic_monitor.load_series(IC_HISTORY_PATH))
     except Exception as exc:
-        log.error("rolling_lagged_ic failed: %s", exc, exc_info=True)
+        log.error("IC monitor failed: %s", exc, exc_info=True)
         return
-    if n >= _ROLLING_WINDOW and mean is not None and mean < _IC_THRESHOLD:
+
+    if stats.get("alert"):
         if dry_run:
             log.warning("dry-run: alert suppressed")
-        else:
+        elif _ic_alert_due(IC_HISTORY_PATH.parent, trade_date):
             try:
                 if not send_bridge_alert(
                     title="ashare SIG: lagged IC",
-                    body=f"20d rolling lagged T+5 IC {mean:.4f} < {_IC_THRESHOLD} as of {trade_date} (n={_ROLLING_WINDOW}). Ranking-power decay tripwire.",
+                    body=(
+                        f"{ic_monitor.format_line(stats)} as of {trade_date}. "
+                        "Sustained negative edge; judge the signal before trusting it."
+                    ),
                     timeout=10,
                 ):
                     log.error("lagged IC alert send failed (returned False)")

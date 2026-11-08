@@ -25,7 +25,7 @@ def predictions_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(sq, "previous_trading_day", lambda day: day)
     monkeypatch.setattr(sq, "compute_forward_returns", lambda *a, **k: {})
     monkeypatch.setattr(sq, "lagged_ic_for_date", lambda *a, **k: (0.123, 999))
-    monkeypatch.setattr(sq, "rolling_lagged_ic", lambda *a, **k: (None, 0))
+    monkeypatch.setattr(sq, "IC_HISTORY_PATH", tmp_path / "ic_history.tsv")
     monkeypatch.delenv("ASHARE_USE_STALE", raising=False)
     return tmp_path
 

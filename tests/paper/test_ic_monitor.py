@@ -125,10 +125,16 @@ def test_a_positive_edge_never_alerts_however_strong():
 
 
 def test_should_alert_needs_both_conditions():
-    assert should_alert({"mean": -0.05, "t_hac": -3.0}) is True
-    assert should_alert({"mean": -0.05, "t_hac": -1.0}) is False
-    assert should_alert({"mean": 0.05, "t_hac": 3.0}) is False
-    assert should_alert({"mean": None, "t_hac": -3.0}) is False
+    enough = {"n": 60, "mean": -0.05, "t_hac": -3.0}
+    assert should_alert(enough) is True
+    assert should_alert({**enough, "t_hac": -1.0}) is False
+    assert should_alert({**enough, "mean": 0.05}) is False
+    assert should_alert({**enough, "mean": None}) is False
+
+
+def test_should_alert_ignores_a_handful_of_sessions():
+    """A large t over five correlated days is arithmetic, not evidence."""
+    assert should_alert({"n": 5, "mean": -0.05, "t_hac": -9.0}) is False
 
 
 def test_format_line_is_empty_without_history():
