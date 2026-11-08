@@ -146,12 +146,26 @@ print(raw.get("train_date", ""))
 ' 2>/dev/null || true
 }
 
-# The model this run produced: newest walk-forward checkpoint on the GPU host.
-NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" "dir /b $GPU_REPO\\models\\w*.pt" 2>/dev/null \
-    | tr -d '\r' | awk -F'\\' '{print $NF}' | grep -E '^w[0-9]+\.pt$' | sort -V | tail -1 || true)
+# The model this run produced: newest walk-forward checkpoint on the GPU host,
+# ordered by modification time. Version sort is wrong here: it ranks w115.pt
+# (trained 2026-01-23) above w12.pt (2026-06-30), so the gate compared this run
+# against a model from another year and shelved every retrain.
+NEW_MODEL=$(ssh -o ConnectTimeout=10 "$GPU_HOST" "dir /b /o-d $GPU_REPO\\models\\w*.pt" 2>/dev/null \
+    | tr -d '\r' | awk -F'\\' '{print $NF}' | grep -E '^w[0-9]+\.pt$' | head -1 || true)
 
-# The model it would replace: newest walk-forward checkpoint already on W1.
-CUR_MODEL=$(for _f in "$PROJECT_DIR"/models/w[0-9]*.pt; do [ -e "$_f" ] && basename "$_f"; done | sort -V | tail -1 || true)
+# The model it would replace: the walk-forward checkpoint on W1 with the latest
+# train_date. Neither version sort nor modification time works here -- version
+# sort ranks w115.pt (2026-01-23) above w12.pt, and a copy leaves w9.pt newer on
+# disk than w12.pt. The train date is what the gate compares, so it decides which
+# file is the incumbent. A checkpoint with no readable date is not an incumbent.
+CUR_MODEL=$(
+    for _f in "$PROJECT_DIR"/models/w[0-9]*.pt; do
+        [ -e "$_f" ] || continue
+        _name=$(basename "$_f")
+        _date=$(_wf_train_date "$PROJECT_DIR/models" "$_name")
+        [ -n "$_date" ] && printf '%s\t%s\n' "$_date" "$_name"
+    done | sort | tail -1 | cut -f2
+)
 
 NEW_TRAIN_DATE=""
 LIVE_TRAIN_DATE=""

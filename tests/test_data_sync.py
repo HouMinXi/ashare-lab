@@ -839,3 +839,64 @@ class TestRetrainRunsOnACalendar:
         script = Path("scripts/ashare-retrain.sh").read_text()
 
         assert "Weekly" in script.splitlines()[1] or "weekly" in script.splitlines()[1]
+
+
+class TestRetrainGatePicksTheNewestByTrainDate:
+    """The incumbent must be chosen by train_date, not by name or file time.
+
+    Version sort ranks w115.pt (trained 2026-01-23) above w12.pt (2026-06-30),
+    and a copy leaves w9.pt newer on disk than w12.pt. Both mistakes make the
+    gate compare this run against a model from another year and shelve it --
+    which is what happened on 2026-11-08, twice, with exit code 0 both times.
+    """
+
+    RETRAIN = Path(SCRIPT).resolve().parent / "ashare-retrain.sh"
+
+    def _run_selection(self, tmp_path, files):
+        import json
+        import os
+        import re
+        import subprocess
+
+        text = self.RETRAIN.read_text()
+        fn = re.search(r"_wf_train_date\(\) \{.*?\n\}", text, re.S)
+        block = re.search(r"CUR_MODEL=\$\(.*?\n\)", text, re.S)
+        assert fn and block
+
+        models = tmp_path / "models"
+        models.mkdir()
+        for name, (train_date, mtime) in files.items():
+            (models / name).write_bytes(b"x")
+            os.utime(models / name, (mtime, mtime))
+            if train_date:
+                (models / f"{name[:-3]}.meta.json").write_text(
+                    json.dumps({"model_file": name, "train_date": train_date})
+                )
+
+        harness = tmp_path / "sel.sh"
+        harness.write_text(
+            "#!/bin/bash\n"
+            f"PROJECT_DIR={tmp_path}\n"
+            f"{fn.group(0)}\n{block.group(0)}\n"
+            'echo "CUR_MODEL=$CUR_MODEL"\n'
+        )
+        out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+        return out.stdout.strip().split("=", 1)[1]
+
+    def test_a_bigger_number_with_an_older_date_is_not_the_incumbent(self, tmp_path):
+        chosen = self._run_selection(
+            tmp_path,
+            {
+                "w115.pt": ("2026-01-23", 1_700_000_000),
+                "w12.pt": ("2026-06-30", 1_600_000_000),
+                "w9.pt": ("2026-03-31", 1_800_000_000),
+            },
+        )
+        assert chosen == "w12.pt", f"picked {chosen}: the gate would shelve every run"
+
+    def test_a_checkpoint_without_a_date_is_not_the_incumbent(self, tmp_path):
+        chosen = self._run_selection(
+            tmp_path,
+            {"w115.pt": ("", 1_800_000_000), "w12.pt": ("2026-06-30", 1_700_000_000)},
+        )
+        assert chosen == "w12.pt"
