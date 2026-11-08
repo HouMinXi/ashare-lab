@@ -228,18 +228,18 @@ def populated_db(db_conn: sqlite3.Connection, paper_config: dict) -> sqlite3.Con
     from ashare_lab.paper.ledger import (
         record_nav, insert_trade, insert_order, snapshot_positions, set_cooldown
     )
-    
+
     # First day NAV (for cumulative return base)
     record_nav(db_conn, "2024-12-30", 300_000.0, 0.0, 300_000.0, None, None, None, None)
-    
+
     # Previous day NAV
     record_nav(db_conn, "2025-01-05", 150_000.0, 150_000.0, 300_000.0, None, None, 3000.0, 5000.0)
-    
+
     # Current day NAV (simulating daily loss and drawdown)
     # daily_loss_pct threshold is 0.02, we'll set it to 3% drop
     total_nav = 300_000.0 * 0.97
     record_nav(db_conn, "2025-01-06", 50_000.0, total_nav - 50_000.0, total_nav, None, None, 2900.0, 4800.0)
-    
+
     # To test regime check, insert 10 older nav rows
     base_date = 15
     for i in range(10):
@@ -258,7 +258,7 @@ def populated_db(db_conn: sqlite3.Connection, paper_config: dict) -> sqlite3.Con
 
     # Pending orders for tomorrow (trade_date='2025-01-07', created='2025-01-06')
     insert_order(db_conn, "2025-01-07", "SZ000002", "sell", 500, None, "pending", 0, "2025-01-06")
-    
+
     # Cooldown
     set_cooldown(db_conn, "SZ000003", "2025-01-10", 15.0)
 

@@ -159,14 +159,14 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
             n_predictions (int): number of predictions after price filter
             ok (bool): rank_ic is finite and non-NaN
     """
-    import qlib  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
-    from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
-    from qlib.data.dataset import DatasetH  # noqa: PLC0415
-    from scipy.stats import spearmanr  # noqa: PLC0415
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.data.dataset import DatasetH
+    from scipy.stats import spearmanr
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
     if provider_uri is None:
         provider_uri = DEFAULT_PROVIDER_URI

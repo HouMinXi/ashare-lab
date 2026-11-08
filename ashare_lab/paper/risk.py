@@ -253,7 +253,7 @@ def check_prediction_staleness(
     """
     age_days = 0
     try:
-        from datetime import date as _date  # noqa: PLC0415
+        from datetime import date as _date
         td = _date.fromisoformat(trade_date)
         pd = _date.fromisoformat(pred_date)
         trading_days = trading_days_between(pd, td)
@@ -262,7 +262,7 @@ def check_prediction_staleness(
         age_days = max(0, len(trading_days) - 1)
     except Exception:
         # Conservative fallback: calendar days
-        from datetime import date as _date  # noqa: PLC0415
+        from datetime import date as _date
         td = _date.fromisoformat(trade_date)
         pd = _date.fromisoformat(pred_date)
         cal_days = (td - pd).days

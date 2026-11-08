@@ -232,8 +232,10 @@ def _get_today(ContextInfo):
     """Get today's date from QMT framework."""
     try:
         timetag = ContextInfo.get_bar_timetag(ContextInfo.barpos)
-        # timetag_to_datetime is injected by QMT framework
-        dt_str = timetag_to_datetime(timetag, '%Y-%m-%d')
+        # timetag_to_datetime is injected into the strategy's globals by the
+        # QMT runtime; it does not exist outside the client, so the import
+        # would fail everywhere the module is merely read.
+        dt_str = timetag_to_datetime(timetag, '%Y-%m-%d')  # noqa: F821
         return dt_str
     except Exception:
         # Fallback to system date (may differ on weekends/holidays)

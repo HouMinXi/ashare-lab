@@ -67,7 +67,7 @@ def gather_report_data(
     ).fetchone()
     if not row_today:
         raise ValueError(f"No NAV data for {trade_date}")
-    
+
     total_nav = float(row_today["total_nav"])
     cash = float(row_today["cash"])
     today_bench = row_today["benchmark_csi1000"]
@@ -85,17 +85,17 @@ def gather_report_data(
         "SELECT total_nav, benchmark_csi1000 FROM nav WHERE trade_date < ? ORDER BY trade_date DESC LIMIT 1",
         (trade_date,)
     ).fetchone()
-    
+
     prev_nav = float(row_prev["total_nav"]) if row_prev else total_nav
     daily_return_pct = (total_nav - prev_nav) / prev_nav * 100.0 if prev_nav > 0 else 0.0
     daily_pnl = total_nav - prev_nav
-    
+
     prev_bench = row_prev["benchmark_csi1000"] if row_prev else None
     if prev_bench is not None and today_bench is not None and float(prev_bench) > 0:
         benchmark_return_pct = (today_bench - float(prev_bench)) / float(prev_bench) * 100.0
     else:
         benchmark_return_pct = 0.0
-        
+
     cash_ratio = cash / total_nav * 100.0 if total_nav > 0 else 100.0
 
     # max drawdown
@@ -211,7 +211,7 @@ def gather_report_data(
             "side": r["side"],
             "qty": int(r["target_qty"]),
         })
-        
+
     # Sell order count (all sells, not just forced)
     sell_order_count = conn.execute(
         "SELECT COUNT(*) FROM orders WHERE created_run_date = ? AND side = 'sell'",
@@ -220,7 +220,7 @@ def gather_report_data(
 
     # Cooldown count
     cooldown_count = conn.execute("SELECT COUNT(*) FROM cooldowns").fetchone()[0]
-    
+
     # Risk state (from state machine, not recomputed)
     row_state = conn.execute("SELECT value FROM paper_state WHERE key = 'risk_state'").fetchone()
     risk_state_str = row_state["value"] if row_state else "normal"
@@ -505,13 +505,13 @@ def _get_secret(key: str) -> str:
 def split_report_text(text: str, max_length: int = 4000) -> list[str]:
     if len(text) <= max_length:
         return [text]
-        
+
     chunks = []
     paras = text.split("\n\n")
     current = []
     curr_len = 0
     buf_sep = "\n\n"
-    
+
     for p in paras:
         plen = len(p)
         if curr_len + plen + 2 > max_length and current:
@@ -519,7 +519,7 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
             current = []
             curr_len = 0
             buf_sep = "\n\n"
-            
+
         if plen > max_length:
             buf_sep = "\n"
             lines = p.split("\n")
@@ -544,10 +544,10 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
         else:
             current.append(p)
             curr_len += plen + 2
-            
+
     if current:
         chunks.append(buf_sep.join(current))
-        
+
     return chunks
 
 
@@ -571,7 +571,7 @@ def _ilink_headers(token: str, body: str) -> dict[str, str]:
 async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout: int = 15) -> dict:
     import uuid
     import aiohttp
-    
+
     payload = {
         "msg": {
             "from_user_id": "",
@@ -590,10 +590,10 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
             "channel_version": CHANNEL_VERSION
         }
     }
-    
+
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     headers = _ilink_headers(token, body)
-    
+
     async with session.post(
         f"{ILINK_BASE_URL}/{EP_SEND_MESSAGE}",
         data=body.encode("utf-8"),
@@ -776,7 +776,7 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
 
 def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, report_text: str) -> bool:
     """Send report chunks via alert-bridge. Returns True if all chunks sent."""
-    from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+    from ashare_lab.bridge import send_bridge_alert
 
     title_base = f"A股日报 {trade_date}"
     for i, chunk in enumerate(chunks):

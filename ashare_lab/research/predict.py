@@ -47,12 +47,12 @@ def _send_alert(text: str) -> None:
     set only after a successful send).  Transport and token resolution
     live in ashare_lab.bridge.
     """
-    global _ALERT_SENT_THIS_RUN  # noqa: PLW0603
+    global _ALERT_SENT_THIS_RUN
     if _ALERT_SENT_THIS_RUN:
         return
 
     try:
-        from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+        from ashare_lab.bridge import send_bridge_alert
     except Exception:
         # gpu-win receives a selective file sync; a missing bridge module
         # must never break prediction (alerting is advisory by design).
@@ -107,7 +107,7 @@ def check_score_diversity(
         Requires 2 consecutive failures OR 1 failure + Tier 1 same day.
         Skip if < 5 days of history (cold start).
     """
-    import numpy as np  # noqa: PLC0415
+    import numpy as np
 
     result = DiversityResult()
     n = len(scores)
@@ -142,7 +142,7 @@ def check_score_diversity(
     # -- Tier 2 metrics --
     # Kurtosis (Fisher/excess): -1.2 for uniform, 0 for normal, >0 for heavy tails
     try:
-        from scipy.stats import kurtosis as sp_kurtosis  # noqa: PLC0415
+        from scipy.stats import kurtosis as sp_kurtosis
         kurt = float(sp_kurtosis(scores, fisher=True))
         if not np.isfinite(kurt):
             kurt = 0.0
@@ -346,7 +346,7 @@ def _resolve_model_path(
     # day, so "past every window" never holds for a production date: the live
     # artifact would never be selected. Choose it explicitly for the day being
     # predicted, and leave historical dates on their window models.
-    from ashare_lab.research.smoke_test import (  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import (
         get_live_window,
         latest_trading_day,
     )
@@ -479,20 +479,20 @@ def predict_for_date(
         FileNotFoundError: the resolved model .pt does not exist (models
             are gitignored; train on the GPU host or sync them).
     """
-    import numpy as np  # noqa: PLC0415
-    import pandas as pd  # noqa: PLC0415
-    import torch  # noqa: PLC0415
-    import qlib  # noqa: PLC0415
-    from qlib.config import C as _QlibC  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
-    from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
+    import numpy as np
+    import pandas as pd
+    import torch
+    import qlib
+    from qlib.config import C as _QlibC
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158
+    from qlib.contrib.data.dataset import MTSDatasetH
 
-    from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config  # noqa: PLC0415
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
-    from ashare_lab.research.blend import blend_tra_ntra  # noqa: PLC0415
-    from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
-    from ashare_lab.research.train import ALPHA158_WARMUP_START  # noqa: PLC0415
+    from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+    from ashare_lab.research.blend import blend_tra_ntra
+    from ashare_lab.research.smoke_test import get_all_windows
+    from ashare_lab.research.train import ALPHA158_WARMUP_START
 
     # -- 1. Window selection (resolves both window dict and model path) ----
     model_path, window = _resolve_model_path(
@@ -501,7 +501,7 @@ def predict_for_date(
     window_id = window["window_id"]
 
     # -- Model freshness check (meta.json preferred, mtime fallback) --
-    from ashare_lab.research.model_meta import read_model_meta  # noqa: PLC0415
+    from ashare_lab.research.model_meta import read_model_meta
 
     model_meta, meta_reason = read_model_meta(model_path)
     # fixed +08:00 offset, no tzdata dependency (works on hosts without IANA data)

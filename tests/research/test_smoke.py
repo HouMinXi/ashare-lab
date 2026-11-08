@@ -54,7 +54,7 @@ def test_step0_test_span() -> None:
 
 def test_step5_test_end_clamped() -> None:
     """W6 (step=5) test_end must not exceed latest_trading_day()."""
-    from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
+    from ashare_lab.data.calendar import latest_trading_day
 
     w = get_window(5)
     test_end = dt.date.fromisoformat(w["test_end"])
@@ -84,7 +84,7 @@ def test_is_complete_false_for_short_window() -> None:
     We mock latest_trading_day to a date only 30 days after test_start
     for step 9, ensuring test span < 170 days.
     """
-    from ashare_lab.research import smoke_test as st  # noqa: PLC0415
+    from ashare_lab.research import smoke_test as st
 
     # W10 (step=9) test_start is 2026-01-01 (unclamped test_end 2026-06-30).
     # Mock latest_trading_day to return 2026-03-01 (59 calendar days after

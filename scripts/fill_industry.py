@@ -1,7 +1,11 @@
 """Pre-populate baostock industry cache. Checkpoint-based: processes up to
 BATCH_SIZE symbols per run, saves progress, exits. Timer reruns until done.
 SIGALRM per-query timeout prevents baostock server hangs."""
-import baostock as bs, csv, time, signal, sys
+import baostock as bs
+import csv
+import time
+import signal
+import sys
 from pathlib import Path
 
 CACHE_FILE = Path("/home/houminxi/code/ashare-lab/data/baostock_cache/industry.csv")

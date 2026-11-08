@@ -1180,7 +1180,7 @@ def _golden_period() -> str:
     A host west of Shanghai turns the month over later than the exchange, which
     would file the first session of a month under the previous month.
     """
-    from ashare_lab.data.calendar import market_today  # noqa: PLC0415
+    from ashare_lab.data.calendar import market_today
 
     return market_today().strftime("%Y-%m")
 

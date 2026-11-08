@@ -55,7 +55,7 @@ def _fetch_baostock_raw(
 ) -> pd.DataFrame | None:
     # F5 fix: guard lazy import with try-except
     try:
-        import baostock as bs  # noqa: PLC0415 -- lazy to avoid import-time TCP hang
+        import baostock as bs
     except ImportError:
         log.warning("baostock not installed, skipping validation for %s", symbol)
         return None

@@ -217,7 +217,7 @@ def _fetch_all(
         RuntimeError: baostock login fails.
     """
     try:
-        import baostock as bs  # noqa: PLC0415
+        import baostock as bs
     except ImportError as exc:
         raise ImportError(
             "baostock is not installed; add it via: uv add baostock"
@@ -637,7 +637,7 @@ def gap_fill(
         RuntimeError: no instruments found, baostock login fails, or
                       dump_bin update fails.
     """
-    from ashare_lab.config import load_config  # noqa: PLC0415
+    from ashare_lab.config import load_config
 
     cfg = load_config()
     session_refresh_n: int = int(
@@ -710,7 +710,7 @@ def backfill_missing_dates(
 
     Returns the dates that were filled.
     """
-    from ashare_lab.data.fetcher import fetch_today_data  # noqa: PLC0415
+    from ashare_lab.data.fetcher import fetch_today_data
 
     missing = find_missing_dates(start.isoformat(), end.isoformat(), provider_uri)
     filled: list[str] = []

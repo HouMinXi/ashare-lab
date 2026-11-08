@@ -344,7 +344,7 @@ def test_fetch_hedge_prices_writes_close(monkeypatch):
     ctx = _MockCtx()
 
     def _fake_spot():
-        import pandas as pd  # noqa: PLC0415
+        import pandas as pd
         return pd.DataFrame({
             "代码": ["511260", "518880"],
             "最新价": [10.5, 20.0],

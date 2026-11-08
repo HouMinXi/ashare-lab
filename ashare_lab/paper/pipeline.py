@@ -311,7 +311,7 @@ def _fetch_ipo_calendar(listing_date: str) -> list[dict]:
     becomes a no-op).
     """
     try:
-        import requests  # noqa: PLC0415
+        import requests
     except ImportError:
         logger.warning("requests not installed, IPO calendar unavailable")
         return []
@@ -513,8 +513,8 @@ def _step1_init(ctx: DailyRunContext) -> None:
     ctx.conn = get_connection(ctx.db_path)
     init_schema(ctx.conn)
     try:
-        import qlib  # noqa: PLC0415
-        from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+        import qlib
+        from ashare_lab.data.update import DEFAULT_PROVIDER_URI
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
     except Exception:
         pass  # qlib not installed or already initialized
@@ -571,8 +571,8 @@ def _try_baostock_fallback(ctx: DailyRunContext, chenditc_exc: Exception) -> int
     Returns 0 on success, 1 on stale (no gap), 2 on failure.
     """
     try:
-        from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
-        from ashare_lab.data.calendar import previous_trading_day  # noqa: PLC0415
+        from ashare_lab.data.fallback import gap_fill
+        from ashare_lab.data.calendar import previous_trading_day
         start_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
         rc = gap_fill(start_date, ctx.trade_date)
         if rc == 0:
@@ -605,7 +605,7 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
 
     # If fetch-today already populated qlib data for this trade_date,
     # skip the chenditc refresh entirely.
-    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI, daily_refresh  # noqa: PLC0415
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI, daily_refresh
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     if cal_last and cal_last >= ctx.trade_date:
         logger.info("qlib data already covers %s (cal=%s), skipping chenditc", ctx.trade_date, cal_last)
@@ -634,8 +634,8 @@ def _gate_data_completeness(ctx: DailyRunContext) -> None:
     ).fetchone()[0]
     if last_run is None or last_run >= ctx.trade_date:
         return  # first run or backfill
-    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI  # noqa: PLC0415
-    from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI
+    from ashare_lab.data.calendar import trading_days_between
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     expected = trading_days_between(
         dt.date.fromisoformat(last_run) + dt.timedelta(days=1),
@@ -662,7 +662,7 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
     }
 
     # Load persistent risk state (state machine)
-    from ashare_lab.paper.risk_state import (  # noqa: PLC0415
+    from ashare_lab.paper.risk_state import (
         RiskState,
         ensure_shadow_log_table,
         load_risk_state,
@@ -708,7 +708,7 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
 def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
     """Fetch universe, prices, benchmarks, industry map.  Return 2 on qlib import failure."""
     try:
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
     except ImportError as exc:
         logger.error("qlib not available, cannot run pipeline")
         record_run(ctx.conn, ctx.trade_date, "error")
@@ -755,7 +755,7 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
 
     # 5c. ST names -- always runs (local CSV cache, no network).
     # ST status determines limit threshold (5% vs 10%) used by settle_day.
-    from ashare_lab.data.validator import _ST_PATTERN  # noqa: PLC0415
+    from ashare_lab.data.validator import _ST_PATTERN
     st_cached = _load_st_cache(ctx.trade_date, ctx.fetch_symbols)
     if st_cached is not None:
         ctx.st_names = st_cached
@@ -993,7 +993,7 @@ print(json.dumps(result))
         return -1
 
     # 5g-0. build suffix -> symbol reverse-lookup (O(1) matching, no nested loop)
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
     suffix_to_sym = {}
     for sym in priced_symbols:
         suffix = sym[-6:] if len(sym) > 6 else sym
@@ -1096,7 +1096,7 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
     """Halt if prices look like normalized (qlib $close) or wrong-year data."""
     if ctx.steps == {"signal"}:
         return
-    import math  # noqa: PLC0415
+    import math
     suspicious = 0
     for sym, pdata in ctx.prices.items():
         close = pdata.get("close")
@@ -1343,7 +1343,7 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
 
     # Persist shadow log if present
     if ctx.risk_result.shadow_log is not None:
-        from ashare_lab.paper.risk_state import log_shadow_transition  # noqa: PLC0415
+        from ashare_lab.paper.risk_state import log_shadow_transition
         log_shadow_transition(
             ctx.conn, ctx.trade_date,
             ctx.risk_result.shadow_log.get("old_flags", {}),
@@ -1353,7 +1353,7 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
 
     # Persist new risk state (F1: save every run, both modes)
     if ctx.risk_result.shadow_log is not None and "new_state" in ctx.risk_result.shadow_log:
-        from ashare_lab.paper.risk_state import RiskState, save_risk_state  # noqa: PLC0415
+        from ashare_lab.paper.risk_state import RiskState, save_risk_state
         new_state = RiskState(ctx.risk_result.shadow_log["new_state"])
         new_lockdown = ctx.risk_result.shadow_log.get("new_lockdown_enter_date")
         ctx.risk_state = new_state
@@ -1494,7 +1494,7 @@ def timing_multiplier_detail(
             logger.warning("[timing] No CSI1000 data for %s, m=1.0", trade_date)
             return 1.0, "no_index_data"
 
-        from ashare_lab.research.timing_nulls import (  # noqa: PLC0415
+        from ashare_lab.research.timing_nulls import (
             ma_trend_multiplier,
             vol_percentile_multiplier,
             drawdown_state_multiplier,
@@ -1542,7 +1542,7 @@ def _fetch_csi1000_closes_for_timing(trade_date: str):
     The result is memoized per trade_date for the process lifetime so
     that multiple Book B ledgers share a single fetch.
     """
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
 
     cache = getattr(_fetch_csi1000_closes_for_timing, "_cache", None)
     if cache is None:
@@ -1655,7 +1655,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             # predictions are unaffected, but we log and flag it for
             # the report.
             ic_val = meta.get("ic")
-            import math as _math  # noqa: PLC0415
+            import math as _math
             if ic_val is None or (isinstance(ic_val, float) and _math.isnan(ic_val)):
                 logger.warning(
                     "Pipeline: model IC is unavailable (nan) for %s. "
@@ -1871,7 +1871,7 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
         if pos.get("buy_date", "") == ctx.trade_date:
             continue
         try:
-            from qlib.data import D as D_ipo  # noqa: PLC0415
+            from qlib.data import D as D_ipo
             chg_df = D_ipo.features(
                 instruments=[sym], fields=["$change"],
                 start_time=pos["buy_date"], end_time=ctx.trade_date,
@@ -2061,15 +2061,15 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # Day 0 bootstrap: copy production DB
         _bootstrap_book_b(ctx.db_path, book_b_path)
 
-    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_connection
     book_conn = get_connection(book_b_path)
     try:
         # Load Book B state
-        from ashare_lab.paper.ledger import (  # noqa: PLC0415
+        from ashare_lab.paper.ledger import (
             get_latest_positions, get_latest_cash, get_cooldowns,
             delete_expired_cooldowns, get_positions_for_date, record_run,
         )
-        from ashare_lab.paper.risk import manage_trailing_cooldown  # noqa: PLC0415
+        from ashare_lab.paper.risk import manage_trailing_cooldown
         book_positions = get_latest_positions(book_conn)
         book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
         book_cooldown = get_cooldowns(book_conn)
@@ -2079,7 +2079,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # PHASE 1: Settle yesterday's Book B orders (T+1)
         # Must happen BEFORE computing NAV/signals/target_value,
         # mirroring Book A's flow: _step8_settle -> _step10_signals.
-        from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
+        from ashare_lab.paper.engine import round_lots, settle_day
 
         # ORDER BY id for the same reason as the main book: settlement
         # walks this list and spends cash as it goes
@@ -2111,7 +2111,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         ) + book_cash
 
         # Generate Book B orders (same signals, m-scaled target)
-        from ashare_lab.paper.signal import (  # noqa: PLC0415
+        from ashare_lab.paper.signal import (
             generate_signals, filter_candidates, topk_dropout_orders,
         )
 
@@ -2260,10 +2260,10 @@ def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
     carry rows keep their original trade_date, which is already <= today,
     so a date filter would miss them.
     """
-    import shutil  # noqa: PLC0415
+    import shutil
     shutil.copy2(prod_db_path, book_b_path)
 
-    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_connection
     conn = get_connection(book_b_path)
     try:
         conn.execute(
@@ -2293,7 +2293,7 @@ def _write_abc_artifact(
     what a clean day writes, so the omission has to fail at the call site
     rather than wait for a test to notice.
     """
-    from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash
 
     # Book A NAV (from production)
     nav_a = ctx.total_nav
@@ -2418,7 +2418,7 @@ def _step15_graduation(ctx: DailyRunContext) -> None:
     if stale_flag == "1":
         return
     try:
-        from ashare_lab.paper.graduation import check_graduation, notify_graduation  # noqa: PLC0415
+        from ashare_lab.paper.graduation import check_graduation, notify_graduation
         passed, stats = check_graduation(ctx.conn)
         logger.info(
             "Graduation gate: passed=%s rate=%.1f%% days_remaining=%d",
@@ -2656,7 +2656,7 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
         return
 
     ic_val = meta.get("lagged_ic_t5")
-    import math as _math  # noqa: PLC0415
+    import math as _math
     if ic_val is None:
         logger.debug("IC history: lagged_ic_t5 missing for %s", t5_date)
         return
@@ -2735,7 +2735,7 @@ def _status_gaps(conn: sqlite3.Connection) -> list[dict]:
         ).fetchone()
         if not settled_range or not settled_range[0] or not settled_range[1]:
             return []
-        from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
+        from ashare_lab.data.calendar import trading_days_between
         days = [
             day.isoformat()
             for day in trading_days_between(

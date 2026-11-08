@@ -29,6 +29,30 @@ ashare-baseline = "ashare_lab.research.report:main"
 [tool.setuptools.packages.find]
 include = ["ashare_lab*"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# The gate covers what the tree is already clean at: real errors, undefined
+# names, whitespace, and stale `# noqa` comments. Import order (I) is left out
+# on purpose -- it would rewrite nearly every file in one blind commit, and it
+# is churn rather than correctness. Apply it to a file when that file is being
+# edited anyway.
+select = ["E4", "E7", "E9", "F", "W", "RUF100"]
+
+[tool.ruff.lint.per-file-ignores]
+# These set environment or sys.path before importing the package, which is the
+# point of the late import, not an oversight.
+"ashare_lab/cli.py" = ["E402"]
+"ashare_lab/data/validator.py" = ["E402"]
+"ashare_lab/paper/backup_job.py" = ["E402"]
+"ashare_lab/research/analyze_matrix.py" = ["E402"]
+"scripts/fill_industry.py" = ["E402"]
+# QMT strategy scripts only import after the client hands them a context.
+"scripts/qmt/test_qmt_connect.py" = ["E402"]
+"scripts/qmt/test_userdata_connect.py" = ["E402"]
+
 [tool.pytest.ini_options]
 # The sentiment smoke tests reach the network and the LLM, so they stay
 # out of the default run; select them with `pytest -m integration`.

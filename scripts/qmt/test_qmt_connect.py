@@ -1,4 +1,5 @@
-import sys, os
+import sys
+import os
 # Add QMT's xtquant to path
 qmt_root = r"H:\国金证券QMT量化终端"
 xt_path = os.path.join(qmt_root, "bin.x64", "Lib", "site-packages")
@@ -16,7 +17,7 @@ print(f"session_id: {session_id}")
 
 # Create trader
 t = xttrader.XtQuantTrader(mini_path, session_id)
-print(f"XtQuantTrader created")
+print("XtQuantTrader created")
 
 # Try connect
 result = t.connect()
@@ -56,5 +57,5 @@ else:
 try:
     t.disconnect()
     print("Disconnected")
-except:
+except Exception:
     pass

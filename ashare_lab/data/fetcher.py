@@ -132,7 +132,7 @@ def fetch_cross_validation_sample(
         Empty dict if akshare unavailable or all symbols fail.
     """
     try:
-        import akshare as ak  # noqa: PLC0415
+        import akshare as ak
     except ImportError:
         log.warning("akshare not available, skipping cross-validation")
         return {}

@@ -28,7 +28,7 @@ def _nvidia_smi_mem() -> int | None:
     Respects CUDA_VISIBLE_DEVICES: when set, queries the corresponding
     physical GPU instead of always reading GPU 0.
     """
-    import subprocess  # noqa: PLC0415
+    import subprocess
 
     try:
         cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
@@ -75,7 +75,7 @@ def apply_price_filter(
     Returns:
         Filtered Series with the same MultiIndex structure as pred.
     """
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.data import D
 
     if pred.empty:
         log.debug("price filter: empty pred; returning as-is")
@@ -184,14 +184,14 @@ def train_window(
     # so the file store remains usable until a tracking backend migration is done.
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
-    import qlib  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
-    from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
-    from qlib.data.dataset import DatasetH, TSDatasetH  # noqa: PLC0415
-    from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158, Alpha360
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.data.dataset import DatasetH, TSDatasetH
+    from qlib.contrib.data.dataset import MTSDatasetH
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
     window_id = window["window_id"]
 
@@ -218,14 +218,14 @@ def train_window(
     # qlib.init() must only be called once per process; subsequent calls while
     # a QlibRecorder is active raise RecorderInitializationError.  Guard here
     # so walk-forward windows W2..W6 don't re-initialize.
-    from qlib.config import C as _QlibC  # noqa: PLC0415
+    from qlib.config import C as _QlibC
 
     if not getattr(_QlibC, "registered", False):
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
     # Select data handler from config (alpha158 or alpha360).
     cfg_handler = load_config().get("model", {}).get("handler", "alpha158").lower()
-    HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158  # noqa: N806
+    HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158
     log.info("W%s: handler=%s", window_id, cfg_handler)
 
     cfg_model = load_config().get("model", {})
@@ -303,7 +303,7 @@ def train_window(
     # KeyError: 'MSE' on the empty metrics frame after all epochs finish.
     true_test_start = window["test_start"]
     if _seq_len > 0:
-        from qlib.data import D as _D  # noqa: PLC0415
+        from qlib.data import D as _D
 
         _cal = _D.calendar(
             start_time=ALPHA158_WARMUP_START,
@@ -382,7 +382,7 @@ def train_window(
         # ponytail: pin_memory on MTSDatasetH iter; upgrade to DataLoader if
         # profiling shows host-to-device transfer is still the bottleneck.
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             if _torch.cuda.is_available():
                 _orig_iter = dataset.__class__.__iter__
@@ -412,10 +412,10 @@ def train_window(
         d_feat = cfg_model.get("d_feat", 360)
         if cfg_handler == "alpha360":
             # Flat variant: takes (N, 360) and reshapes to (N, 60, 6) internally.
-            from qlib.contrib.model.pytorch_alstm import ALSTM  # noqa: PLC0415
+            from qlib.contrib.model.pytorch_alstm import ALSTM
         else:
             # TS variant: takes TSDatasetH output directly.
-            from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
+            from qlib.contrib.model.pytorch_alstm_ts import ALSTM
         log.info("W%s: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
         model = ALSTM(
             d_feat=d_feat,
@@ -430,9 +430,9 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_alstm = None
-        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
+        import torch
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             _original_fit_alstm = model.fit
 
@@ -462,7 +462,7 @@ def train_window(
         # TRAModel: Temporal Routing Adaptor (KDD 2021).
         # GPU device is auto-detected via torch.cuda.is_available() at module level;
         # no explicit GPU parameter in TRAModel constructor.
-        from qlib.contrib.model.pytorch_tra import TRAModel  # noqa: PLC0415
+        from qlib.contrib.model.pytorch_tra import TRAModel
 
         backbone_cfg: dict = dict(cfg_model.get("backbone", {}))
         # routing_cfg is already validated and fetched in the MTSDatasetH block above;
@@ -487,9 +487,9 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_tra = None
-        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
+        import torch
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             # bf16 tensor .numpy() crashes -- no numpy bf16 dtype.
             # Cast to fp32 before the original assign_data writes back.
@@ -527,9 +527,9 @@ def train_window(
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "densemble":
-        from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415
+        from qlib.contrib.model.double_ensemble import DEnsembleModel
 
-        import numpy as np  # noqa: PLC0415
+        import numpy as np
 
         # DEnsembleModel has no seed param; best-effort via global np.random.seed.
         # Safe only under subprocess isolation (one train_window call per process).
@@ -581,7 +581,7 @@ def train_window(
     models_dir = exp_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
     if model_type in ("alstm", "tra"):
-        import torch  # noqa: PLC0415
+        import torch
 
         model_path = models_dir / f"w{window_id}.pt"
         torch.save(model, str(model_path))
@@ -592,7 +592,7 @@ def train_window(
 
     # Write model metadata for staleness gate (10-03)
     try:
-        from ashare_lab.research.model_meta import write_model_meta  # noqa: PLC0415
+        from ashare_lab.research.model_meta import write_model_meta
 
         write_model_meta(model_path, window["train_end"], f"w{window_id}")
     except Exception as exc:
@@ -635,7 +635,7 @@ def train_window(
             # Fetch raw labels from the underlying handler; Spearman rank-IC
             # is scale-invariant so raw (unprocessed) labels give identical
             # IC to z-score normalised learn-set labels.
-            from qlib.data.dataset.handler import DataHandlerLP  # noqa: PLC0415
+            from qlib.data.dataset.handler import DataHandlerLP
 
             raw = handler.fetch(col_set="label", data_key=DataHandlerLP.DK_R)
             # Handler MultiIndex order may be (instrument, datetime);
@@ -659,7 +659,7 @@ if __name__ == "__main__":
     import sys
 
     # Deferred import to avoid circular dependency (smoke_test imports train)
-    from ashare_lab.research.smoke_test import (  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import (
         get_all_windows,
         get_live_window,
         get_window,

@@ -697,9 +697,9 @@ class TestIntegrationSmoke:
         if cls._qlib_ready:
             return
         try:
-            import qlib  # noqa: PLC0415
-            from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
-            from qlib.config import REG_CN  # noqa: PLC0415
+            import qlib
+            from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+            from qlib.config import REG_CN
         except ImportError:
             pytest.skip("qlib not installed")
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
@@ -712,7 +712,7 @@ class TestIntegrationSmoke:
     ) -> None:
         """Replay 5 consecutive trading days with real qlib prices."""
         self._ensure_qlib()
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
 
         # Verify qlib has price data for the pinned range
         dates = [
@@ -771,7 +771,7 @@ class TestIntegrationSmoke:
     ) -> None:
         """After 5-day replay, re-running each date returns 0 (skip)."""
         self._ensure_qlib()
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
 
         try:
             test_data = D.features(
@@ -827,13 +827,13 @@ class TestRealPredictionReplay:
         if cls._qlib_ready:
             return
         try:
-            import qlib  # noqa: PLC0415
-            from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
-            from qlib.config import REG_CN  # noqa: PLC0415
+            import qlib
+            from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+            from qlib.config import REG_CN
         except ImportError:
             pytest.skip("qlib not installed")
 
-        from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR  # noqa: PLC0415
+        from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR
 
         if not (MODELS_DIR / "w1.pt").exists():
             pytest.skip("canonical models not staged (models/w1.pt absent)")
@@ -850,9 +850,9 @@ class TestRealPredictionReplay:
         """Replay 5 W1 trading days with real 60/40 blend predictions."""
         self._ensure_prerequisites()
 
-        from ashare_lab.config import PROJECT_ROOT, load_config  # noqa: PLC0415
-        from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.config import PROJECT_ROOT, load_config
+        from ashare_lab.paper.ledger import get_connection
+        from ashare_lab.paper.pipeline import run_daily
 
         config = load_config()
         db_path = PROJECT_ROOT / config["paper"]["db_path"]
@@ -913,9 +913,9 @@ class TestRealPredictionReplay:
         """Re-running settled dates returns 0 without side effects."""
         self._ensure_prerequisites()
 
-        from ashare_lab.config import PROJECT_ROOT, load_config  # noqa: PLC0415
-        from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.config import PROJECT_ROOT, load_config
+        from ashare_lab.paper.ledger import get_connection
+        from ashare_lab.paper.pipeline import run_daily
 
         config = load_config()
         db_path = PROJECT_ROOT / config["paper"]["db_path"]
@@ -949,11 +949,11 @@ class TestRealPredictionReplay:
         """
         self._ensure_prerequisites()
 
-        import shutil  # noqa: PLC0415
+        import shutil
 
-        import pandas as pd  # noqa: PLC0415
+        import pandas as pd
 
-        from ashare_lab.config import PREDICTIONS_DIR  # noqa: PLC0415
+        from ashare_lab.config import PREDICTIONS_DIR
 
         target = PREDICTIONS_DIR / "2021-07-01.parquet"
         backup = PREDICTIONS_DIR / "2021-07-01.parquet.bak"

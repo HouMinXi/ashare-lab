@@ -126,8 +126,8 @@ def evaluate_state(
 
     if current_state == RiskState.LIQUIDATED:
         # Check lockdown exit: days elapsed AND dd < reentry
-        from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
-        import datetime as dt  # noqa: PLC0415
+        from ashare_lab.data.calendar import trading_days_between
+        import datetime as dt
 
         if lockdown_enter_date:
             elapsed = len(

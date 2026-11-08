@@ -48,19 +48,19 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch_today(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
-    from ashare_lab.data.calendar import (  # noqa: PLC0415
+    import datetime as dt
+    from ashare_lab.data.calendar import (
         is_trading_day,
         latest_trading_day,
         market_today,
     )
-    from ashare_lab.data.fetcher import (  # noqa: PLC0415
+    from ashare_lab.data.fetcher import (
         fetch_today_data,
         fetch_cross_validation_sample,
         refresh_stock_names_cache,
         CSI1000_SAMPLE_SYMBOLS,
     )
-    from ashare_lab.data.validator import validate_daily_data  # noqa: PLC0415
+    from ashare_lab.data.validator import validate_daily_data
 
     today = market_today()
     if not is_trading_day(today):
@@ -113,7 +113,7 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
     # so fill anything missing behind the day just written. A backfill
     # failure must not fail the day that already landed.
     try:
-        from ashare_lab.data.fallback import (  # noqa: PLC0415
+        from ashare_lab.data.fallback import (
             _calendar_dates,
             backfill_missing_dates,
         )
@@ -133,7 +133,7 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
     # gets no error, just an older last date. Refresh them separately so a
     # failure here leaves the gap backfill above intact.
     try:
-        from ashare_lab.data.fallback import (  # noqa: PLC0415
+        from ashare_lab.data.fallback import (
             backfill_stale_indexes,
         )
 
@@ -146,13 +146,13 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
 
 
 def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
-    import json as _json  # noqa: PLC0415
-    from ashare_lab.data.calendar import (  # noqa: PLC0415
+    import json as _json
+    from ashare_lab.data.calendar import (
         is_trading_day,
         latest_trading_day,
         market_today,
     )
-    from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS  # noqa: PLC0415
+    from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS
 
     today = market_today()
     if not is_trading_day(today):
@@ -162,9 +162,9 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
     trade_date = str(latest_trading_day(today))
 
     try:
-        import qlib  # noqa: PLC0415
+        import qlib
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
         df = D.features(
             instruments=CSI1000_SAMPLE_SYMBOLS,
             fields=["$close"],
@@ -189,8 +189,8 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_chenditc_diff(args: argparse.Namespace) -> int:
-    import json as _json  # noqa: PLC0415
-    from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
+    import json as _json
+    from ashare_lab.data.calendar import latest_trading_day
 
     trade_date = str(latest_trading_day())
     snap_path = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
@@ -205,9 +205,9 @@ def cmd_chenditc_diff(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        import qlib  # noqa: PLC0415
+        import qlib
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
         symbols = list(snapshot.keys())
         df = D.features(
             instruments=symbols,
@@ -274,7 +274,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_paper_settle(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily
         return run_daily(
             trade_date=getattr(args, "date", None),
             force=getattr(args, "force", False),
@@ -287,7 +287,7 @@ def cmd_paper_settle(args: argparse.Namespace) -> int:
 
 def cmd_paper_signal(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily
         return run_daily(
             trade_date=getattr(args, "date", None),
             force=False,
@@ -300,8 +300,8 @@ def cmd_paper_signal(args: argparse.Namespace) -> int:
 
 def cmd_paper_run_all(args: argparse.Namespace) -> int:
     try:
-        from pathlib import Path  # noqa: PLC0415
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from pathlib import Path
+        from ashare_lab.paper.pipeline import run_daily
         pred = getattr(args, "pred_path", None)
         return run_daily(
             trade_date=getattr(args, "date", None),
@@ -315,7 +315,7 @@ def cmd_paper_run_all(args: argparse.Namespace) -> int:
 
 def cmd_paper_backfill(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_backfill  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_backfill
         return run_backfill(
             args.from_date,
             args.to_date,
@@ -328,7 +328,7 @@ def cmd_paper_backfill(args: argparse.Namespace) -> int:
 
 def cmd_paper_status(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import get_status  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import get_status
         status = get_status()
         print(json.dumps(status, indent=2))
         return 0
@@ -339,13 +339,13 @@ def cmd_paper_status(args: argparse.Namespace) -> int:
 
 def cmd_paper_report(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.report import generate_and_send_report  # noqa: PLC0415
+        from ashare_lab.paper.report import generate_and_send_report
         from ashare_lab.paper.ledger import get_connection
         from ashare_lab.config import load_config, PROJECT_ROOT
         config = load_config()
         db_path = PROJECT_ROOT / config["paper"]["db_path"]
         conn = get_connection(db_path)
-        
+
         trade_date = getattr(args, "date", None)
         if trade_date is None:
             latest_settled = conn.execute(
@@ -370,7 +370,7 @@ def cmd_paper_report(args: argparse.Namespace) -> int:
 
 def cmd_paper_sentiment(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.sentiment import run_sentiment_veto  # noqa: PLC0415
+        from ashare_lab.paper.sentiment import run_sentiment_veto
         from ashare_lab.paper.ledger import get_connection, init_schema
         from ashare_lab.paper.pipeline import _load_industry_cache
         from ashare_lab.config import load_config, PROJECT_ROOT

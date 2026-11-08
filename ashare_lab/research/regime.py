@@ -43,7 +43,7 @@ def compute_regime_signals(
                 missing or empty.
             date: The input date string.
     """
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.data import D
 
     try:
         features_df = D.features(
@@ -147,7 +147,7 @@ def calibrate_thresholds(
             cash_threshold: float, 10th percentile.
             calibration_end: str, the end_date used.
     """
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.data import D
 
     start_date = "2015-01-01"
 

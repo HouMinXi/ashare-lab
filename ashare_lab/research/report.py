@@ -119,7 +119,7 @@ def run_verdict_phase(
     # log+continue on their own.  ImportError is caught separately to allow
     # phased rollout where the supplementary module does not yet exist.
     try:
-        from ashare_lab.research.supplementary import run_all_supplementary  # noqa: PLC0415
+        from ashare_lab.research.supplementary import run_all_supplementary
     except ImportError as e:
         log.warning("supplementary module not available: %s", e)
     else:
@@ -155,7 +155,7 @@ def main() -> None:
     exp_dir: Path = make_exp_dir()
 
     # Deferred import: run_full_walk_forward requires qlib runtime.
-    from ashare_lab.research.rolling import run_full_walk_forward  # noqa: PLC0415
+    from ashare_lab.research.rolling import run_full_walk_forward
 
     window_results, failed_windows = run_full_walk_forward(exp_dir, n_drop, universe)
 

@@ -426,7 +426,7 @@ def _fetch_hedge_prices(ctx: "DailyRunContext", leg_symbols: list[str]) -> None:
     are skipped.  Missing prices are logged and left absent.
     """
     try:
-        import akshare as ak  # noqa: PLC0415
+        import akshare as ak
     except ImportError:
         logger.warning("akshare not installed, hedge prices unavailable")
         return
