@@ -879,7 +879,7 @@ class TestBackfillMissingDates:
 
         got: list[str] = []
 
-        def fake_fetch(trade_date: str) -> dict:
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
             got.append(trade_date)
             return {"sz000001": pd.DataFrame([{
                 "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
@@ -913,7 +913,7 @@ class TestBackfillMissingDates:
 
         from ashare_lab.data.fallback import backfill_missing_dates
 
-        def fake_fetch(trade_date: str) -> dict:
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
             if trade_date == '2024-03-04':
                 raise RuntimeError('token locked')
             return {'sz000001': pd.DataFrame([{
@@ -947,7 +947,7 @@ class TestBackfillMissingDates:
 
         from ashare_lab.data.fallback import backfill_missing_dates
 
-        def fake_fetch(trade_date: str) -> dict:
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
             return {"sz000001": pd.DataFrame([{
                 "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
                 "close": 1.0, "volume": 1.0, "factor": 1.0, "change": 0.0}])}

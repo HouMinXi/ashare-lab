@@ -716,7 +716,7 @@ def backfill_missing_dates(
     filled: list[str] = []
     for day in missing:
         try:
-            data = fetch_today_data(day)
+            data = fetch_today_data(day, provider_uri=provider_uri)
         except Exception as exc:
             log.warning("backfill %s: fetch failed: %s", day, exc)
             continue

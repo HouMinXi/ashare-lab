@@ -37,7 +37,7 @@ def test_tushare_code_to_qlib_bj():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_today_data_column_mapping():
+def test_fetch_today_data_column_mapping(tmp_path):
     """Tushare DataFrame maps to _CSV_COLUMNS with correct transforms."""
     from ashare_lab.data.fallback import _CSV_COLUMNS
     from ashare_lab.data.fetcher import fetch_today_data
@@ -81,7 +81,7 @@ def test_fetch_today_data_column_mapping():
         patch("ashare_lab.data.fetcher.ts") as mock_ts,
     ):
         mock_ts.pro_api.return_value = mock_pro
-        result = fetch_today_data("2026-06-26")
+        result = fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
     assert "sz000001" in result
     assert "sh600000" in result
@@ -94,7 +94,7 @@ def test_fetch_today_data_column_mapping():
     assert abs(df.iloc[0]["change"] - (-0.018234)) < 1e-6
 
 
-def test_fetch_today_data_compact_date_format():
+def test_fetch_today_data_compact_date_format(tmp_path):
     """Compact YYYYMMDD format is accepted and normalized to YYYY-MM-DD in output."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -123,13 +123,13 @@ def test_fetch_today_data_compact_date_format():
         patch("ashare_lab.data.fetcher.ts") as mock_ts,
     ):
         mock_ts.pro_api.return_value = mock_pro
-        result = fetch_today_data("20260626")
+        result = fetch_today_data("20260626", provider_uri=tmp_path)
 
     assert "sz000001" in result
     assert result["sz000001"].iloc[0]["date"] == "2026-06-26"
 
 
-def test_fetch_today_data_empty_raises():
+def test_fetch_today_data_empty_raises(tmp_path):
     """Empty tushare response raises RuntimeError."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -142,10 +142,10 @@ def test_fetch_today_data_empty_raises():
     ):
         mock_ts.pro_api.return_value = mock_pro
         with pytest.raises(RuntimeError, match="empty"):
-            fetch_today_data("2026-06-26")
+            fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
 
-def test_fetch_today_data_none_raises():
+def test_fetch_today_data_none_raises(tmp_path):
     """None tushare response raises RuntimeError."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -158,7 +158,7 @@ def test_fetch_today_data_none_raises():
     ):
         mock_ts.pro_api.return_value = mock_pro
         with pytest.raises(RuntimeError, match="empty"):
-            fetch_today_data("2026-06-26")
+            fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +321,9 @@ def _stub_fetch_today(monkeypatch, trade_date=None):
     return day
 
 
-def test_fetch_today_backfills_gaps_after_writing_today(monkeypatch):
-    """A gap behind the day just written gets filled, and a backfill
-    failure does not turn the day's success into a failure."""
+def test_fetch_today_fills_gaps_before_appending(monkeypatch):
+    """The hole is filled first: appending onto it would fold the gap into
+    the factor. A fill failure must not fail the day."""
     import datetime as dt
 
     from ashare_lab.cli import cmd_fetch_today
@@ -343,7 +343,7 @@ def test_fetch_today_backfills_gaps_after_writing_today(monkeypatch):
     rc = cmd_fetch_today(type('A', (), {})())
 
     assert rc == 0
-    assert seen['span'] == (dt.date(2024, 2, 27), dt.date(2024, 3, 5))
+    assert seen['span'] == (dt.date(2024, 2, 29), dt.date(2024, 3, 4))
 
 
 def test_fetch_today_refreshes_stale_indexes(monkeypatch):

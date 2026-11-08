@@ -47,6 +47,9 @@ def cmd_update(args: argparse.Namespace) -> int:
         return 2
 
 
+MAX_GAP_FILL_DAYS = 10
+
+
 def cmd_fetch_today(args: argparse.Namespace) -> int:
     import datetime as dt
     from ashare_lab.data.calendar import (
@@ -69,9 +72,35 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
 
     trade_date = str(latest_trading_day(today))
 
+    # Fill any hole behind today before appending: the factor carries the
+    # corporate action between two adjacent sessions, and a hole would fold the
+    # gap's return into it.
+    try:
+        from ashare_lab.data.fallback import _calendar_dates, backfill_missing_dates
+
+        have = _calendar_dates(DEFAULT_PROVIDER_URI)
+        behind = [d for d in have if d < trade_date]
+        if behind:
+            start = dt.date.fromisoformat(max(behind)) + dt.timedelta(days=1)
+            end = dt.date.fromisoformat(trade_date) - dt.timedelta(days=1)
+            # A store stale for months would otherwise pull every missing
+            # session on the critical path, one full-market call each.
+            if (end - start).days > MAX_GAP_FILL_DAYS:
+                log.warning(
+                    "store is %d days behind; filling at most %d and leaving the rest",
+                    (end - start).days, MAX_GAP_FILL_DAYS,
+                )
+                end = start + dt.timedelta(days=MAX_GAP_FILL_DAYS)
+            if start <= end:
+                filled = backfill_missing_dates(start, end)
+                if filled:
+                    log.info("filled %d session(s) before appending %s", len(filled), trade_date)
+    except Exception as exc:  # a gap fill must not block the day
+        log.warning("pre-append gap fill failed: %s", exc)
+
     try:
         tushare_data = fetch_today_data(trade_date)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         log.error("fetch_today_data failed: %s", exc)
         return 1
 
@@ -99,34 +128,22 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         for w in result.warnings:
             log.warning("validation: %s", w)
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp_csv_dir:
-            _write_csvs(tushare_data, Path(tmp_csv_dir))
-            _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
-    except Exception as exc:
-        log.error("write/dump failed: %s", exc)
-        return 1
+    if not tushare_data:
+        # Every symbol was already stored for this date: a re-run, not a failure.
+        log.info("fetch-today: %s already stored for every symbol, nothing to write", trade_date)
+    else:
+        try:
+            with tempfile.TemporaryDirectory() as tmp_csv_dir:
+                _write_csvs(tushare_data, Path(tmp_csv_dir))
+                _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
+        except (RuntimeError, ValueError) as exc:
+            log.error("write/dump failed: %s", exc)
+            return 1
+        except Exception as exc:
+            log.error("write/dump failed: %s", exc)
+            return 1
 
     log.info("fetch-today complete for %s (%d symbols)", trade_date, len(tushare_data))
-
-    # A day that failed to fetch leaves a hole the next run never revisits,
-    # so fill anything missing behind the day just written. A backfill
-    # failure must not fail the day that already landed.
-    try:
-        from ashare_lab.data.fallback import (
-            _calendar_dates,
-            backfill_missing_dates,
-        )
-        have = _calendar_dates(DEFAULT_PROVIDER_URI)
-        earlier = [d for d in have if d < trade_date]
-        start = (
-            dt.date.fromisoformat(max(earlier)) - dt.timedelta(days=1)
-            if earlier
-            else dt.date.fromisoformat(trade_date)
-        )
-        backfill_missing_dates(start, dt.date.fromisoformat(trade_date))
-    except Exception as exc:
-        log.warning("gap backfill failed (non-fatal): %s", exc)
 
     # The daily fetch covers stocks only, so every index keeps the tail it
     # had when the full package was last unpacked. A reader of a stale index
