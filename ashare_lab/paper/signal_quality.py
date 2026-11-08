@@ -314,28 +314,44 @@ def lagged_ic_for_date(
     return ic, len(aligned_df)
 
 
-def _ic_alert_due(state_dir: Path, trade_date: str, min_days: int = 7) -> bool:
-    """At most one push a week while the condition holds.
+# At most one push a week while the condition holds: the monitor's window
+# spans weeks, so a daily message would teach the reader to ignore it.
+_IC_ALERT_MIN_DAYS = 7
 
-    The monitor's window is 60 sessions, so an alert state lasts weeks. Pushing
-    every day would train the reader to ignore it, which is how a monitor dies.
+
+def _stamp_path(state_dir: Path) -> Path:
+    return Path(state_dir) / ".ic_alert_stamp"
+
+
+def _ic_alert_due(state_dir: Path, trade_date: str) -> bool:
+    """Whether this run should push. Reads the stamp, never writes it.
+
+    Writing here, before the caller has sent anything, meant one failed
+    delivery silenced the alert for a week -- the failure and the success
+    produced the same state.
     """
-    stamp = Path(state_dir) / ".ic_alert_stamp"
+    stamp = _stamp_path(state_dir)
     try:
         last = stamp.read_text().strip()
-        if last and (
-            dt.date.fromisoformat(trade_date) - dt.date.fromisoformat(last)
-        ).days < min_days:
-            return False
-    except (OSError, ValueError):
-        pass
+    except OSError:
+        return True
+    if not last:
+        return True
+    try:
+        return (dt.date.fromisoformat(trade_date) - dt.date.fromisoformat(last)).days >= _IC_ALERT_MIN_DAYS
+    except ValueError:
+        # A corrupt stamp must not mute the monitor.
+        return True
+
+
+def _mark_ic_alert_sent(state_dir: Path, trade_date: str) -> None:
+    stamp = _stamp_path(state_dir)
     try:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(trade_date)
     except OSError:
         # A read-only data directory must not turn a monitor into a crash.
         pass
-    return True
 
 
 def signal_quality_ic_step(ctx: DailyRunContext) -> None:
@@ -420,7 +436,7 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
             log.warning("dry-run: alert suppressed")
         elif _ic_alert_due(IC_HISTORY_PATH.parent, trade_date):
             try:
-                if not send_bridge_alert(
+                if send_bridge_alert(
                     title="ashare SIG: lagged IC",
                     body=(
                         f"{ic_monitor.format_line(stats)} as of {trade_date}. "
@@ -428,6 +444,8 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
                     ),
                     timeout=10,
                 ):
-                    log.error("lagged IC alert send failed (returned False)")
+                    _mark_ic_alert_sent(IC_HISTORY_PATH.parent, trade_date)
+                else:
+                    log.error("lagged IC alert send failed (returned False); will retry")
             except Exception as exc:
-                log.error("lagged IC alert send exception: %s", exc)
+                log.error("lagged IC alert send exception: %s; will retry", exc)

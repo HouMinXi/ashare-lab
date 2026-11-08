@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from pathlib import Path
 def load_window(conn: sqlite3.Connection, start: str, end: str) -> list[dict]:
     """NAV rows in [start, end], oldest first."""
     cursor = conn.execute(
-        "SELECT trade_date, cash, total_nav, benchmark_csi1000 FROM nav "
+        "SELECT trade_date, cash, hedge_value, total_nav, benchmark_csi1000 FROM nav "
         "WHERE trade_date >= ? AND trade_date <= ? ORDER BY trade_date",
         (start, end),
     )
@@ -31,7 +32,7 @@ def load_window(conn: sqlite3.Connection, start: str, end: str) -> list[dict]:
 
 
 def compute_attribution(rows: list[dict]) -> dict:
-    """Return the four numbers the comparison needs.
+    """Return the comparison: returns, exposure, and the two differences.
 
     Empty or single-row windows have no return to speak of, so the caller gets
     None rather than a zero that reads like a flat month.
@@ -51,11 +52,17 @@ def compute_attribution(rows: list[dict]) -> dict:
         return stats
 
     first, last = rows[0], rows[-1]
+    if not first["total_nav"]:
+        # A zero starting NAV makes every return infinite; say so instead of
+        # raising out of a reporting command.
+        return stats
     book_return = last["total_nav"] / first["total_nav"] - 1.0
     stats["book_return"] = book_return
 
+    # Net of the hedge leg: `total_nav - cash` is equity plus hedge, and the
+    # hedge sleeve is deliberately not stock exposure.
     exposures = [
-        (row["total_nav"] - row["cash"]) / row["total_nav"]
+        (row["total_nav"] - row["cash"] - (row.get("hedge_value") or 0.0)) / row["total_nav"]
         for row in rows
         if row["total_nav"]
     ]
@@ -108,8 +115,13 @@ def main(argv: list[str] | None = None) -> int:
     path = Path(args.db)
     if not path.exists():
         parser.error(f"no ledger at {path}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
+        parser.error("--since must look like 2026-08-11")
 
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # as_uri() percent-encodes '?', '#' and '%'. Interpolating the raw path let a
+    # name like live.db#snapshot drop the mode=ro parameter and open the file
+    # read-write.
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = load_window(conn, args.since, args.until)

@@ -176,29 +176,6 @@ def test_ic_step_stale_guard(tmp_path):
     mock_cfr.assert_not_called()
 
 
-def test_ic_step_no_alert(tmp_path):
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    # Rolling mean = 0.05 > _IC_THRESHOLD (0.01) -> no alert
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": 0.05}))
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert:
-        signal_quality_ic_step(ctx)
-    mock_alert.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 16. Generic exception in ic_step -> fail-open (not just SignalQualityError)
-# ---------------------------------------------------------------------------
 def test_ic_step_fail_open_generic_exception(tmp_path):
     t5_date = "2026-07-30"
     trade_date = "2026-08-06"

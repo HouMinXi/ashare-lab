@@ -132,34 +132,67 @@ log "probe repo=$repo last_success=$last_settled failed_units=$failed_units ic_l
 
 problems=""
 [ "$repo" != ok ] && problems+="- ashare-lab repo not found on the host"$'\n'
-[ -n "$failed_units" ] && [ "$failed_units" != 0 ] && problems+="- $failed_units ashare unit(s) in failed state"$'\n'
-[ -n "$recent_bad" ] && [ "$recent_bad" != 0 ] && problems+="- $recent_bad stale/error pipeline run(s) in the last 7 days"$'\n'
 
-# A run can report success while serving yesterday's predictions. That is the
-# shape the October outage took, so check freshness separately from status.
-[ "$latest_fresh" = 0 ] && problems+="- latest run did not use same-day predictions"$'\n'
+# An empty field means the probe could not answer, which is not the same as a
+# clean answer. A locked database or a renamed column produces empty values, and
+# a `-n` guard silently turns that into "healthy".
+if [ -z "$failed_units" ]; then
+  problems+="- unit state unknown (the probe returned no failed_units)"$'\n'
+elif [ "$failed_units" != 0 ]; then
+  problems+="- $failed_units ashare unit(s) in failed state"$'\n'
+fi
+
+if [ -z "$recent_bad" ]; then
+  problems+="- run history unknown (the probe returned no recent_bad)"$'\n'
+elif [ "$recent_bad" != 0 ]; then
+  problems+="- $recent_bad stale/error pipeline run(s) in the last 7 days"$'\n'
+fi
+
+# A run can report success while serving yesterday's predictions, so freshness
+# is checked separately from status.
+if [ -z "$latest_fresh" ]; then
+  problems+="- prediction freshness unknown (the probe returned no latest_fresh)"$'\n'
+elif [ "$latest_fresh" = 0 ]; then
+  problems+="- latest run did not use same-day predictions"$'\n'
+fi
+
+# Days between a date string and now, or the word "unknown" when the value does
+# not parse. Falling back to "now" made a corrupt date indistinguishable from a
+# fresh one.
+age_in_days() {
+  local value="$1" seconds
+  seconds=$(date -d "$value" +%s 2>/dev/null) || { echo unknown; return 0; }
+  echo $(( ( $(date +%s) - seconds ) / 86400 ))
+}
 
 # IC history stops updating whenever the pipeline falls back to stale
 # predictions. The retrain no longer keys on it -- the retrain is weekly -- but
 # the signal monitor reads this series, and a frozen series makes the monitor
 # look calm.
 if [ -n "$ic_last" ] && [ "$ic_last" != none ]; then
-  ic_age=$(( ( $(date +%s) - $(date -d "$ic_last" +%s 2>/dev/null || date +%s) ) / 86400 ))
-  # The IC series runs five trading days behind by construction: a score is
-  # only scored once five sessions of forward return exist, so on a Sunday the
-  # newest entry is ten calendar days old when everything is working. Ten days
-  # of slack covers the five sessions plus two weekends; a tighter bound alerts
-  # every weekend.
-  [ "$ic_age" -gt 10 ] && problems+="- IC history last updated ${ic_age} days ago ($ic_last); signal monitor is running on stale data"$'\n'
+  # The series runs five trading days behind by construction: a score is only
+  # judged once five sessions of forward return exist. Ten calendar days covers
+  # five sessions plus two weekends.
+  ic_age=$(age_in_days "$ic_last")
+  if [ "$ic_age" = unknown ]; then
+    problems+="- IC history date unreadable ($ic_last)"$'\n'
+  elif [ "$ic_age" -gt 10 ]; then
+    problems+="- IC history last updated ${ic_age} days ago ($ic_last); signal monitor is running on stale data"$'\n'
+  fi
 else
   problems+="- IC history unreadable or empty"$'\n'
 fi
 
-# A settled run that is several days old means the pipeline stopped producing,
-# which is exactly what nobody noticed for five days in October.
+# A settled run that is several days old means the pipeline stopped producing.
+# Six days leaves room for a long weekend plus one holiday; a longer break is
+# what the IC check above is for.
 if [ -n "$last_settled" ] && [ "$last_settled" != none ]; then
-  age_days=$(( ( $(date +%s) - $(date -d "$last_settled" +%s 2>/dev/null || date +%s) ) / 86400 ))
-  [ "$age_days" -gt 3 ] && problems+="- last successful run is ${age_days} days old ($last_settled)"$'\n'
+  age_days=$(age_in_days "$last_settled")
+  if [ "$age_days" = unknown ]; then
+    problems+="- last run date unreadable ($last_settled)"$'\n'
+  elif [ "$age_days" -gt 6 ]; then
+    problems+="- last successful run is ${age_days} days old ($last_settled)"$'\n'
+  fi
 else
   problems+="- no successful pipeline run found"$'\n'
 fi

@@ -1730,6 +1730,9 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
     if effective_topk <= 0:
         target_value = 0.0
         buy_syms = []
+        # place_buys receives this as an argument, so it is evaluated even when
+        # the branch above empties the list.
+        equity_nav = 0.0
     else:
         if ctx.hedge_state and ctx.hedge_state.active:
             equity_nav = ctx.total_nav * ctx.hedge_state.equity_target_pct
@@ -2108,6 +2111,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         if effective_topk <= 0:
             target_value = 0.0
             buy_syms = []
+            equity_nav = 0.0
         else:
             equity_nav = book_total_nav
             target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"] * m) / effective_topk
@@ -2624,7 +2628,7 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
         logger.info("IC history: recorded %s -> %s", t5_date, ic_str)
 
     entries.sort(key=lambda e: e[0])
-    entries = entries[-30:]
+    entries = entries[-60:]
 
     tmp_path = history_path.with_suffix(".tsv.tmp")
     with tmp_path.open("w") as f:

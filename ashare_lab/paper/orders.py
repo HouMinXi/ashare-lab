@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 def _valid_close(price) -> bool:
     """A close we can size an order from.
 
-    NaN counts as invalid: `not nan` and `nan <= 0` are both False, so a NaN
-    slipped through the older check and reached round_lots, which turned it into
-    a NaN quantity.
+    NaN counts as invalid: `not nan` and `nan <= 0` are both False, so the older
+    check let it through to round_lots, which raises on NaN and aborted that
+    book's placement for the day.
     """
     return isinstance(price, (int, float)) and math.isfinite(price) and price > 0
 
