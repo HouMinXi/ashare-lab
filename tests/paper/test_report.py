@@ -572,3 +572,23 @@ def test_generate_and_send_report_skipped_returns_zero(mock_bridge, db_conn, pap
     # Second call: dedup -> skipped -> rc=0
     rc2 = generate_and_send_report("2025-01-06", db_conn, cfg)
     assert rc2 == 0
+
+
+def test_the_ic_monitor_line_reaches_the_report(dummy_report_data):
+    """The monitor is only useful if a human actually sees it."""
+    from ashare_lab.paper.report import format_chinese_report
+
+    text = format_chinese_report(
+        dummy_report_data, ic_section="IC 60日: 均值 -0.0010 | ICIR -0.004 | t(NW) -0.02"
+    )
+
+    assert "IC 60日" in text
+    assert "t(NW) -0.02" in text
+
+
+def test_no_ic_monitor_line_without_history(dummy_report_data):
+    from ashare_lab.paper.report import format_chinese_report
+
+    text = format_chinese_report(dummy_report_data, ic_section=None)
+
+    assert "IC 60日" not in text

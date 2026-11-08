@@ -816,3 +816,26 @@ class TestRetrainTrainsTheLiveWindow:
         gate = src.index('if [ "$DEPLOY_SKIP" -eq 1 ]; then')
         gate_else = src.index("else", gate)
         assert gate_else < live_at < restart_at
+
+
+class TestRetrainRunsOnACalendar:
+    """The retrain is scheduled, not triggered by a single period's IC.
+
+    Over 30 sessions this book's daily IC has sd 0.23 with lag-1 correlation
+    0.74, so "three consecutive days below 0.02" measured the sign of a noisy
+    series. Fetching the value also removed the only consumer of
+    IC_HISTORY, which must not be resurrected as a gate by a later edit.
+    """
+
+    def test_the_script_has_no_ic_gate(self):
+        script = Path("scripts/ashare-retrain.sh").read_text()
+
+        assert "IC gate" not in script
+        assert "IC_THRESHOLD" not in script
+        assert "CONSECUTIVE_DAYS" not in script
+        assert "ic_history" not in script
+
+    def test_the_script_says_how_often_it_runs(self):
+        script = Path("scripts/ashare-retrain.sh").read_text()
+
+        assert "Weekly" in script.splitlines()[1] or "weekly" in script.splitlines()[1]

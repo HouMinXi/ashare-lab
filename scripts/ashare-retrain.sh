@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# IC-driven retraining: retrain only when IC < 0.02 for 3 consecutive days.
-# Runs daily via systemd timer at 22:00.
+# Weekly retraining of the live window plus the freshest walk-forward window.
+# Runs Sundays at 22:00 via a systemd timer.  The retrain is scheduled rather
+# than triggered by IC: this book's daily IC has a standard deviation of 0.23,
+# so a single-period threshold measures noise.  Signal decay is watched by
+# ashare_lab/paper/ic_monitor.py, which reports and never retrains.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,19 +12,8 @@ GPU_HOST="admin@192.168.100.11"
 GPU_REPO="H:/ashare-lab"
 WOL_MAC="04:7C:16:49:BE:32"
 LOG_FILE="$PROJECT_DIR/logs/retrain-$(date +%Y%m%d).log"
-IC_HISTORY="$PROJECT_DIR/data/ic_history.tsv"
 SENTINEL="$PROJECT_DIR/data/last_retrain_date"
 TODAY=$(date +%Y-%m-%d)
-IC_THRESHOLD=0.02
-CONSECUTIVE_DAYS=3
-
-# --force runs the retrain even when the IC gate would decline, for a
-# deliberate out-of-band training run.  It does not skip the deploy gate.
-GATE_BYPASS=0
-if [ "${1:-}" = "--force" ]; then
-    GATE_BYPASS=1
-fi
-
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
 
@@ -59,42 +51,6 @@ if [ -f "$SENTINEL" ]; then
     fi
 fi
 
-# --- IC gate: check consecutive low-IC days ---
-if [ ! -f "$IC_HISTORY" ]; then
-    log "No IC history file at $IC_HISTORY, skipping retrain"
-    exit 0
-fi
-
-low_count=0
-while IFS=$'\t' read -r date ic_val; do
-    [ -z "$date" ] && continue
-    # Empty or null IC counts as low
-    if [ -z "$ic_val" ]; then
-        low_count=$((low_count + 1))
-        continue
-    fi
-    # Compare: IC < threshold counts as low (skip non-numeric)
-    if ! printf '%s' "$ic_val" | grep -qE '^-?[0-9]+\.?[0-9]*$'; then
-        low_count=$((low_count + 1))
-    elif awk "BEGIN { exit !($ic_val < $IC_THRESHOLD) }"; then
-        low_count=$((low_count + 1))
-    else
-        low_count=0  # reset on good IC
-    fi
-done < "$IC_HISTORY"
-
-log "IC gate: $low_count consecutive days below $IC_THRESHOLD (need $CONSECUTIVE_DAYS)"
-
-if [ "$low_count" -lt "$CONSECUTIVE_DAYS" ] && [ "$GATE_BYPASS" -eq 0 ]; then
-    log "IC gate not triggered, no retrain needed"
-    exit 0
-fi
-
-if [ "$GATE_BYPASS" -eq 1 ]; then
-    log "IC gate bypassed by --force; proceeding with retrain"
-fi
-
-log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 
 
 # Serve-now live models (w115) sit outside walk-forward (w1..w11), so

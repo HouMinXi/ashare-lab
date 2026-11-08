@@ -335,6 +335,7 @@ def format_chinese_report(
     report_data: ReportData,
     sentiment_section: str | None = None,
     ic_nan: bool = False,
+    ic_section: str | None = None,
 ) -> str:
     """Format report as Chinese mobile-first template."""
     rd = report_data
@@ -453,6 +454,9 @@ def format_chinese_report(
 
     if ic_nan:
         lines.append("⚠️ 模型自评指标不可用 (IC=nan)")
+
+    if ic_section:
+        lines.append(ic_section)
 
     if rd.hedge_active:
         lines.append(
@@ -853,7 +857,23 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
 
     mode = "chinese"
     ic_nan = config.get("_ic_nan", False)
-    report_text = format_chinese_report(report_data, sentiment_section=sentiment_text, ic_nan=ic_nan)
+
+    # The monitor is advisory: a failure to read the history must not stop the
+    # report from going out.
+    ic_section = None
+    try:
+        from ashare_lab.config import PROJECT_ROOT
+        from ashare_lab.paper import ic_monitor
+
+        pairs = ic_monitor.load_series(PROJECT_ROOT / "data" / "ic_history.tsv")
+        ic_section = ic_monitor.format_line(ic_monitor.summarize(pairs)) or None
+    except Exception:
+        ic_section = None
+
+    report_text = format_chinese_report(
+        report_data, sentiment_section=sentiment_text, ic_nan=ic_nan,
+        ic_section=ic_section,
+    )
 
     if dry_run:
         insert_report(conn, trade_date, mode, report_text, None, "dry_run")
