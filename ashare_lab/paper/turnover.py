@@ -143,6 +143,29 @@ def cap_rotation_buys(
     return chosen, target_value, effective_cap, ramp_state
 
 
+def charge_ramp_day(
+    conn: sqlite3.Connection,
+    ramp_state: dict | None,
+    orders_inserted: int,
+    trade_date: str,
+) -> bool:
+    """Advance the ramp by one day when today actually deployed capital.
+
+    A cap that funded nothing -- or prices that rounded every order to zero
+    shares -- spends no budget, so charging it would shorten the window that
+    exists to fund deployment.  Returns True when the state was written; the
+    caller commits.
+    """
+    if not ramp_state or not ramp_state.get("active", False) or orders_inserted <= 0:
+        return False
+    save_turnover_ramp(
+        conn,
+        ramp_state.get("entry_date") or trade_date,
+        ramp_state.get("k", 0) + 1,
+    )
+    return True
+
+
 def load_turnover_ramp(conn: sqlite3.Connection) -> dict:
     """Load ramp state from paper_state KV table.
 

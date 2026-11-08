@@ -606,6 +606,27 @@ def force_reset_day(conn: sqlite3.Connection, trade_date: str) -> None:
 # Order helpers
 # ---------------------------------------------------------------------------
 
+def symbols_with_buy_in_flight(
+    conn: sqlite3.Connection, symbols: list[str] | set[str]
+) -> set[str]:
+    """Symbols that already have a pending or carried buy order.
+
+    An unfilled buy still represents the position it was sized for. Ordering
+    the same symbol again doubles the exposure when both fill.
+    """
+    wanted = list(symbols)
+    if not wanted:
+        return set()
+    placeholders = ",".join("?" * len(wanted))
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM orders "
+        "WHERE side='buy' AND status IN ('pending','carry') "
+        f"AND symbol IN ({placeholders})",
+        wanted,
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
 def insert_order(
     conn: sqlite3.Connection,
     trade_date: str,

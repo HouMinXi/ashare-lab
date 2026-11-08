@@ -343,10 +343,14 @@ class TestRunBookBPhase1Phase2:
                 "carry_days": 3, "slippage": 0.001,
                 "volume_participation_pct": 0.05,
             },
-            prices={"SH600519": {"close": 180.0}},
-            universe=["SH600519"],
-            market_data={"SH600519": {"close": 180.0, "listing_days": 100,
-                                      "avg_turnover_20d": 100_000_000.0}},
+            prices={"SH600519": {"close": 180.0}, "SH600520": {"close": 90.0}},
+            universe=["SH600519", "SH600520"],
+            market_data={
+                "SH600519": {"close": 180.0, "listing_days": 100,
+                             "avg_turnover_20d": 100_000_000.0},
+                "SH600520": {"close": 90.0, "listing_days": 100,
+                             "avg_turnover_20d": 100_000_000.0},
+            },
             cash=300000.0, total_nav=300000.0, hedge_state=None,
         )
 
@@ -388,14 +392,16 @@ class TestRunBookBPhase1Phase2:
         import pandas as pd
         pred_path = tmp_path / "predictions" / f"{d2}.parquet"
         pred_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
+        pd.DataFrame({"instrument": ["SH600519", "SH600520"],
+                      "score": [0.8, 0.7]}).to_parquet(pred_path)
 
         # Build ctx for d2
         ctx = self._make_ctx(tmp_path, d2, pred_path)
 
         # Patch next_trading_day to return d3, and generate_signals to return fixed data
         with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+             unittest.mock.patch("ashare_lab.paper.signal.generate_signals",
+                                 return_value={"SH600519": 0.8, "SH600520": 0.7}):
             _run_book_b(ctx)
 
         # Debug: check all orders
@@ -414,15 +420,21 @@ class TestRunBookBPhase1Phase2:
             assert row["status"] != "pending", \
                 f"d2 order should be settled, got status={row['status']}"
 
-        # Verify: d3 orders should exist and be pending (Phase 2)
+        # Phase 2 orders the free symbol, and only that symbol: SH600519 still
+        # has its d2 buy open as a carry, which retries on its own, so a second
+        # order would double the position if both fill.
         d3_orders = conn_check.execute(
-            "SELECT status FROM orders WHERE trade_date=?",
+            "SELECT symbol, status FROM orders WHERE trade_date=?",
             (d3,),
         ).fetchall()
-        assert len(d3_orders) > 0, "Phase 2 should have inserted d3 orders"
+        assert d3_orders, "Phase 2 should have inserted d3 orders"
+        assert [r["symbol"] for r in d3_orders] == ["SH600520"], (
+            f"Phase 2 ordered {[r['symbol'] for r in d3_orders]}"
+        )
         for row in d3_orders:
-            assert row["status"] == "pending", \
+            assert row["status"] == "pending", (
                 f"d3 order should be pending, got status={row['status']}"
+            )
 
         conn_check.close()
 
