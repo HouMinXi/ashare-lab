@@ -25,6 +25,7 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 ashare-baseline = "ashare_lab.research.report:main"
+ashare-attribution = "ashare_lab.research.attribution:main"
 
 [tool.setuptools.packages.find]
 include = ["ashare_lab*"]
