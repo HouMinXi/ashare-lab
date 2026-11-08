@@ -1469,3 +1469,78 @@ class TestDumpBinTrailingSymbol:
 
         with pytest.raises(RuntimeError, match="no instruments updated"):
             _dump_bin_update(csv_dir, provider)
+
+
+class TestBinSlotAlignment:
+    """A bin carries positions, not dates, so the writer has to place each row
+    by its calendar index. Appending positionally files a resumed symbol's row
+    under the first session it missed and shifts the rest one slot early; the
+    factor absorbs the difference, so nothing downstream notices."""
+
+    FIELDS = ("open", "high", "low", "close", "volume", "factor", "change")
+
+    def _provider(self, tmp_path, dates):
+        p = tmp_path / "qlib"
+        (p / "calendars").mkdir(parents=True)
+        (p / "calendars" / "day.txt").write_text("\n".join(dates) + "\n", encoding="utf-8")
+        (p / "instruments").mkdir()
+        (p / "instruments" / "all.txt").write_text("SH600519\t2024-03-01\t\n", encoding="utf-8")
+        (p / "features" / "sh600519").mkdir(parents=True)
+        return p
+
+    def _bin(self, provider, field, start, values):
+        import struct
+
+        path = provider / "features" / "sh600519" / f"{field}.day.bin"
+        path.write_bytes(
+            struct.pack("<f", float(start)) + b"".join(struct.pack("<f", float(v)) for v in values)
+        )
+        return path
+
+    def _read(self, path):
+        import struct
+
+        raw = path.read_bytes()
+        return struct.unpack("<f", raw[:4])[0], list(struct.unpack(f"<{len(raw)//4 - 1}f", raw[4:]))
+
+    def _csv(self, tmp_path, date):
+        d = tmp_path / "csvs"
+        d.mkdir(exist_ok=True)
+        (d / "SH600519.csv").write_text(
+            "date,open,high,low,close,volume,factor,change\n"
+            f"{date},12.0,12.5,11.5,12.2,1000.0,0.5,0.02\n",
+            encoding="utf-8",
+        )
+        return d
+
+    def _seed(self, provider):
+        for field in self.FIELDS:
+            self._bin(provider, field, 0, [10.0 if field != "factor" else 0.5])
+
+    def test_a_resumed_symbol_lands_on_its_own_date(self, tmp_path):
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._provider(tmp_path, ["2024-03-01", "2024-03-04", "2024-03-05"])
+        self._seed(provider)
+        csv_dir = self._csv(tmp_path, "2024-03-05")
+
+        _dump_bin_update(csv_dir, provider)
+
+        start, close = self._read(provider / "features" / "sh600519" / "close.day.bin")
+        assert start == 0
+        assert close[0] == pytest.approx(10.0)
+        assert close[1] != close[1], "the missed session must be written as NaN"
+        assert close[2] == pytest.approx(12.2), "the row landed on the wrong date"
+
+    def test_a_truncated_field_bin_is_refused_not_rounded(self, tmp_path):
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._provider(tmp_path, ["2024-03-01", "2024-03-04"])
+        self._seed(provider)
+        path = provider / "features" / "sh600519" / "close.day.bin"
+        raw = path.read_bytes()
+        path.write_bytes(raw + b"\x00\x00")  # an interrupted append
+        csv_dir = self._csv(tmp_path, "2024-03-04")
+
+        with pytest.raises(RuntimeError, match="truncated feature file"):
+            _dump_bin_update(csv_dir, provider)

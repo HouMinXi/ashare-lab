@@ -39,6 +39,10 @@ _BAOSTOCK_FREQ = "d"
 # Columns written to per-symbol CSVs (consumed by qlib dump_bin update)
 _CSV_COLUMNS = ["date", "open", "high", "low", "close", "volume", "factor", "change"]
 
+# A slot a symbol never traded: qlib reads NaN as no data, which is exactly a
+# suspended session.
+NAN_BYTES = struct.pack("<f", float("nan"))
+
 # Index instruments only refresh when the full package is replaced, so a
 # daily incremental run leaves them behind the stocks.
 INDEX_SYMBOLS = ("SH000300", "SH000852", "SH000905", "SH000906", "SZ399300")
@@ -403,8 +407,10 @@ def check_index_membership(
 def _symbol_trails(sym_dir: Path, wanted: set[int], fields: list[str]) -> bool:
     """Whether any maintained field of a symbol has a free slot in ``wanted``.
 
-    Appending is positional, so a row only helps when it lands on a field's
-    next free slot. Only the fields this writer maintains count: adjclose,
+    A field is waiting for a row when its next free slot is at or before the
+    furthest date this batch carries: a slot that falls short is padded with
+    NaN up to the row's own date, which is the whole point of tracking the
+    calendar index. Only the fields this writer maintains count: adjclose,
     amount and vwap arrive with the full package and are never written here,
     so they sit weeks behind and would make every symbol look stale.
 
@@ -416,8 +422,11 @@ def _symbol_trails(sym_dir: Path, wanted: set[int], fields: list[str]) -> bool:
     Returns:
         True when at least one of those fields is waiting for such a row.
     """
+    if not wanted:
+        return False
+    furthest = max(wanted)
     return any(
-        _bin_next_slot(sym_dir / f"{field}.day.bin") in wanted
+        (slot := _bin_next_slot(sym_dir / f"{field}.day.bin")) is not None and slot <= furthest
         for field in fields
     )
 
@@ -458,6 +467,10 @@ def _bin_next_slot(bin_path: Path) -> int | None:
     raw = bin_path.read_bytes()
     if len(raw) < 4:
         return None
+    if (len(raw) - 4) % 4:
+        # An interrupted append left a partial float. Rounding the slot down
+        # would file the next row over the fragment and misalign the series.
+        raise RuntimeError(f"truncated feature file: {bin_path}")
     start = int(struct.unpack("<f", raw[:4])[0])
     return start + (len(raw) - 4) // 4
 
@@ -561,17 +574,38 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
         wrote = False
         for row in rows:
             idx = cal_pos.get(row["date"])
+            if idx is None:
+                continue
             for field in fields:
                 slot = next_slot.get(field)
-                if slot is not None and idx is not None and idx < slot:
-                    continue
                 bin_path = sym_dir / f"{field}.day.bin"
                 if not bin_path.exists():
                     continue
+                if slot is None:
+                    # An empty file has no header to read a slot from. Starting
+                    # the field at this row's own date is the only truthful
+                    # choice: later rows get padded from here.
+                    if bin_path.stat().st_size == 0:
+                        with open(bin_path, "wb") as bf:
+                            bf.write(struct.pack("<f", float(idx)))
+                            bf.write(struct.pack("<f", float(row[field])))
+                        next_slot[field] = idx + 1
+                        wrote = True
+                    continue
+                if idx < slot:
+                    # The field already holds this date.
+                    continue
                 with open(bin_path, "ab") as bf:
+                    if idx > slot:
+                        # The symbol was absent for (idx - slot) sessions. A
+                        # bin carries positions, not dates: appending here
+                        # would file this row under the first missed session
+                        # and shift every later value one slot early, which
+                        # the factor then hides as a corporate action.
+                        bf.write(NAN_BYTES * (idx - slot))
+                        slot = idx
                     bf.write(struct.pack("<f", float(row[field])))
-                if slot is not None:
-                    next_slot[field] = slot + 1
+                next_slot[field] = slot + 1
                 wrote = True
         if wrote:
             count += 1
