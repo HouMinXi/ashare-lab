@@ -145,7 +145,12 @@ problems=""
 # look calm.
 if [ -n "$ic_last" ] && [ "$ic_last" != none ]; then
   ic_age=$(( ( $(date +%s) - $(date -d "$ic_last" +%s 2>/dev/null || date +%s) ) / 86400 ))
-  [ "$ic_age" -gt 5 ] && problems+="- IC history last updated ${ic_age} days ago ($ic_last); signal monitor is running on stale data"$'\n'
+  # The IC series runs five trading days behind by construction: a score is
+  # only scored once five sessions of forward return exist, so on a Sunday the
+  # newest entry is ten calendar days old when everything is working. Ten days
+  # of slack covers the five sessions plus two weekends; a tighter bound alerts
+  # every weekend.
+  [ "$ic_age" -gt 10 ] && problems+="- IC history last updated ${ic_age} days ago ($ic_last); signal monitor is running on stale data"$'\n'
 else
   problems+="- IC history unreadable or empty"$'\n'
 fi
