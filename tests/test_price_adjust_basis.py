@@ -280,15 +280,19 @@ def test_guard_thresholds_are_pinned():
 # --- holes and re-runs (second review round) --------------------------------
 
 
-def test_a_gap_behind_today_is_refused_not_absorbed(tmp_path):
-    """Three sessions of market move must not be folded into the factor."""
+def test_a_gap_behind_today_is_skipped_not_absorbed(tmp_path):
+    """The store stopped at 11.02; the market moved to 11.00 by 11.05.
+
+    Writing this row would fold three sessions of return into the factor. One
+    symbol lagging is a suspension or a hole and is skipped with a warning; the
+    market-wide version of the same shape is refused below.
+    """
     root = _provider(tmp_path, {"SH600000": (10.00 * 0.5, 0.5)}, ["2026-11-02"])
     cal = root / "calendars" / "day.txt"
     cal.write_text("2026-11-02\n2026-11-03\n2026-11-04\n2026-11-05\n2026-11-06\n", encoding="utf-8")
     rows = {"SH600000": _row(11.05, 11.05, 11.05, 11.05, 11.00)}
 
-    with pytest.raises(RuntimeError, match="lag the calendar"):
-        _apply_store_basis(rows, "2026-11-06", root)
+    assert _apply_store_basis(rows, "2026-11-06", root) == {}
 
 
 def test_a_suspended_stock_resuming_is_not_a_gap(tmp_path):
@@ -362,3 +366,48 @@ def test_a_nan_price_is_refused_before_it_reaches_the_bin(tmp_path):
 
     with pytest.raises(ValueError, match="not a usable price"):
         _apply_store_basis(rows, "2026-10-09", root)
+
+
+def test_a_small_batch_of_laggards_does_not_abort_the_run(tmp_path):
+    """Three suspended names out of twenty must not stop the other seventeen.
+
+    The share is taken over the whole fetch and only judged on a full-market
+    batch: a targeted backfill carries laggards by design, so a share computed
+    over survivors would read as "the market is holed" every time.
+    """
+    symbols = {f"SH{600000 + i:06d}": (10.0 * 0.5, 0.5) for i in range(20)}
+    root = _provider(tmp_path, symbols, ["2026-11-02"])
+    cal = root / "calendars" / "day.txt"
+    cal.write_text(
+        "\n".join(["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]) + "\n",
+        encoding="utf-8",
+    )
+    names = list(symbols)
+    rows = {
+        s: (_row(11.0, 11.0, 11.0, 11.0, 11.0) if i < 3 else _row(10.05, 10.05, 10.05, 10.05, 10.00))
+        for i, s in enumerate(names)
+    }
+
+    written = _apply_store_basis(rows, "2026-11-05", root)
+
+    assert len(written) == 17, "the laggards must be skipped, not folded in"
+    assert not any(s in written for s in names[:3])
+
+
+def test_a_market_wide_lag_is_still_refused(tmp_path):
+    symbols = {f"SH{600000 + i:06d}": (10.0 * 0.5, 0.5) for i in range(1200)}
+    root = _provider(tmp_path, symbols, ["2026-11-02"])
+    cal = root / "calendars" / "day.txt"
+    cal.write_text(
+        "\n".join(["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]) + "\n",
+        encoding="utf-8",
+    )
+    # 10% of the market traded at 10.9 yesterday after the store stopped at
+    # 10.0: the store never saw the move, so pre_close is yesterday's 10.9.
+    rows = {
+        s: _row(10.9, 10.9, 10.9, 10.9, 10.9) if i < 120 else _row(10.05, 10.05, 10.05, 10.05, 10.00)
+        for i, s in enumerate(symbols)
+    }
+
+    with pytest.raises(RuntimeError, match="lag the calendar"):
+        _apply_store_basis(rows, "2026-11-05", root)

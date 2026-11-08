@@ -230,8 +230,12 @@ def _apply_store_basis(
         out[symbol] = pd.DataFrame([new_row])
         returns[symbol] = adjusted_return(prev, scaled["close"])
 
-    considered = len(returns) + len(skipped)
-    if considered and len(skipped) / considered > 0.05:
+    # The share is over the whole day's fetch, not over the rows that survived
+    # the per-symbol checks: a targeted backfill carries only the laggards, so
+    # a denominator of survivors would call any such batch systemic.
+    # Only a full-market batch can say anything about the market: a targeted
+    # backfill carries exactly the laggards, so every row in it lags by design.
+    if len(rows) >= 1000 and len(skipped) / len(rows) > 0.05:
         raise RuntimeError(
             f"{len(skipped)} symbols lag the calendar by more than one session on "
             f"{trade_date}; that is a store hole, not a suspension. Backfill first. "
