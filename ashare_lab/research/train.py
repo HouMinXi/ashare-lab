@@ -193,10 +193,10 @@ def train_window(
 
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
 
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     log.info(
-        "W%d: train %s..%s | valid %s..%s | test %s..%s [%s]",
+        "W%s: train %s..%s | valid %s..%s | test %s..%s [%s]",
         window_id,
         window["train_start"],
         window["train_end"],
@@ -210,7 +210,7 @@ def train_window(
     if window["test_start"] > window["test_end"]:
         _fallback = resolve_test_segment(window)
         log.info(
-            "W%d: test period has not started (%s > %s); evaluating on %s..%s",
+            "W%s: test period has not started (%s > %s); evaluating on %s..%s",
             window_id, window["test_start"], window["test_end"],
             _fallback[0], _fallback[1],
         )
@@ -226,7 +226,7 @@ def train_window(
     # Select data handler from config (alpha158 or alpha360).
     cfg_handler = load_config().get("model", {}).get("handler", "alpha158").lower()
     HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158  # noqa: N806
-    log.info("W%d: handler=%s", window_id, cfg_handler)
+    log.info("W%s: handler=%s", window_id, cfg_handler)
 
     cfg_model = load_config().get("model", {})
     model_type = cfg_model.get("type", "lgbm").lower()
@@ -322,12 +322,12 @@ def train_window(
             if _extended_str < true_test_start:
                 segs["test"] = (_extended_str, window["test_end"])
                 log.info(
-                    "W%d: test segment extended %s -> %s (seq_len=%d warmup)",
+                    "W%s: test segment extended %s -> %s (seq_len=%d warmup)",
                     window_id, _extended_str, true_test_start, _seq_len,
                 )
         else:
             log.warning(
-                "W%d: cannot extend test warmup (test_start_idx=%s, seq_len=%d); "
+                "W%s: cannot extend test warmup (test_start_idx=%s, seq_len=%d); "
                 "crash may still occur on short test spans",
                 window_id, _test_start_idx, _seq_len,
             )
@@ -340,7 +340,7 @@ def train_window(
             # internally via view + permute.  Use flat DatasetH to avoid
             # double-windowing (TSDatasetH would yield (N, step_len, 360)).
             dataset = DatasetH(handler=handler, segments=segs)
-            log.info("W%d: ALSTM alpha360 flat path (DatasetH)", window_id)
+            log.info("W%s: ALSTM alpha360 flat path (DatasetH)", window_id)
         else:
             dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
     elif model_type == "tra":
@@ -378,7 +378,7 @@ def train_window(
             batch_size=tra_batch_size,
             shuffle=True,
         )
-        log.info("W%d: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
+        log.info("W%s: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
         # ponytail: pin_memory on MTSDatasetH iter; upgrade to DataLoader if
         # profiling shows host-to-device transfer is still the bottleneck.
         if cfg_model.get("use_amp", False):
@@ -416,7 +416,7 @@ def train_window(
         else:
             # TS variant: takes TSDatasetH output directly.
             from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
-        log.info("W%d: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
+        log.info("W%s: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
         model = ALSTM(
             d_feat=d_feat,
             hidden_size=cfg_model.get("hidden_size", 64),
@@ -441,7 +441,7 @@ def train_window(
                     return _original_fit_alstm(dataset, *a, **kw)
 
             model.fit = _amp_fit
-            log.info("W%d: AMP enabled (bfloat16)", window_id)
+            log.info("W%s: AMP enabled (bfloat16)", window_id)
         _cuda_available = torch.cuda.is_available()
         if _cuda_available:
             torch.cuda.reset_peak_memory_stats()
@@ -455,7 +455,7 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "tra":
@@ -468,7 +468,7 @@ def train_window(
         # routing_cfg is already validated and fetched in the MTSDatasetH block above;
         # reuse it here so num_states is guaranteed consistent between dataset and model.
         log.info(
-            "W%d: TRAModel backbone=%s routing=%s transport=%s pretrain=%s n_epochs=%d",
+            "W%s: TRAModel backbone=%s routing=%s transport=%s pretrain=%s n_epochs=%d",
             window_id,
             backbone_cfg,
             routing_cfg,
@@ -509,7 +509,7 @@ def train_window(
                     return _original_fit_tra(dataset, *a, **kw)
 
             model.fit = _amp_fit
-            log.info("W%d: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
+            log.info("W%s: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
         _cuda_available = torch.cuda.is_available()
         if _cuda_available:
             torch.cuda.reset_peak_memory_stats()
@@ -523,7 +523,7 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "densemble":
@@ -535,7 +535,7 @@ def train_window(
         # Safe only under subprocess isolation (one train_window call per process).
         np.random.seed(effective_seed)
 
-        log.info("W%d: DEnsembleModel num_models=%d epochs=%d", window_id,
+        log.info("W%s: DEnsembleModel num_models=%d epochs=%d", window_id,
                  cfg_model.get("num_models", 6), cfg_model.get("epochs", 28))
         model = DEnsembleModel(
             base_model="gbm",
@@ -573,7 +573,7 @@ def train_window(
             lgb_kwargs["gpu_platform_id"] = cfg_model.get("gpu_platform_id", 0)
             lgb_kwargs["gpu_device_id"] = cfg_model.get("gpu_device_id", 0)
         num_boost_round = cfg_model.get("num_boost_round", 500)
-        log.info("W%d: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
+        log.info("W%s: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
         model = LGBModel(**lgb_kwargs)
         model.fit(dataset, num_boost_round=num_boost_round)
 
@@ -588,7 +588,7 @@ def train_window(
     else:
         model_path = models_dir / f"w{window_id}.pkl"
         model.to_pickle(path=str(model_path))
-    log.info("W%d: model saved -> %s", window_id, model_path)
+    log.info("W%s: model saved -> %s", window_id, model_path)
 
     # Write model metadata for staleness gate (10-03)
     try:
@@ -596,7 +596,7 @@ def train_window(
 
         write_model_meta(model_path, window["train_end"], f"w{window_id}")
     except Exception as exc:
-        log.error("W%d: write_model_meta failed: %s", window_id, exc)
+        log.error("W%s: write_model_meta failed: %s", window_id, exc)
 
     # -----------------------------------------------------------------------
     # Predict on test set and extract labels.
@@ -645,7 +645,7 @@ def train_window(
             label = raw.loc[true_test_start : window["test_end"]].iloc[:, 0]
 
     log.info(
-        "W%d: %d predictions after price filter, %d labels",
+        "W%s: %d predictions after price filter, %d labels",
         window_id,
         len(pred),
         len(label),
@@ -659,7 +659,11 @@ if __name__ == "__main__":
     import sys
 
     # Deferred import to avoid circular dependency (smoke_test imports train)
-    from ashare_lab.research.smoke_test import get_all_windows, get_window  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import (  # noqa: PLC0415
+        get_all_windows,
+        get_live_window,
+        get_window,
+    )
 
     parser = argparse.ArgumentParser(
         description="Walk-forward window training driver"
@@ -698,14 +702,33 @@ if __name__ == "__main__":
         action="store_true",
         help="Re-train windows whose model file already exists",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Train the live window instead: three rolling years ending on the "
+            "last trading day, no held-out period, written as wlive.pt"
+        ),
+    )
     args = parser.parse_args()
 
     if args.serve_now is not None and args.windows:
         log.error("--serve-now and --windows are mutually exclusive")
         sys.exit(2)
+    if args.live and (args.windows or args.serve_now is not None):
+        log.error("--live cannot be combined with --windows or --serve-now")
+        sys.exit(2)
 
     # Resolve windows
-    if args.serve_now is not None:
+    if args.live:
+        window = get_live_window()
+        selected = [window]
+        log.info(
+            "live window: train %s..%s, no held-out period (evaluation is "
+            "paper trading)",
+            window["train_start"], window["train_end"],
+        )
+    elif args.serve_now is not None:
         # get_all_windows stops at the last window whose test period has
         # started, so a freshly-trainable window is invisible to it. Ask
         # for the step directly.
@@ -715,7 +738,7 @@ if __name__ == "__main__":
             sys.exit(2)
         selected = [window]
         log.info(
-            "serve-now: step %d -> W%d train %s..%s",
+            "serve-now: step %d -> W%s train %s..%s",
             args.serve_now, window["window_id"],
             window["train_start"], window["train_end"],
         )
@@ -758,13 +781,13 @@ if __name__ == "__main__":
         wid = window["window_id"]
         model_path = models_dir / f"w{wid}.pt"
         if model_path.exists() and not args.force:
-            log.info("W%d: model exists, skipping (use --force to re-train)", wid)
+            log.info("W%s: model exists, skipping (use --force to re-train)", wid)
             continue
         try:
             train_window(window, exp_dir=args.exp_dir, universe=args.universe)
             trained += 1
         except Exception as exc:
-            log.error("W%d: training failed: %s", wid, exc, exc_info=True)
+            log.error("W%s: training failed: %s", wid, exc, exc_info=True)
             sys.exit(1)
 
     log.info("trained %d/%d windows", trained, len(selected))

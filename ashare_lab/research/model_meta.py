@@ -70,7 +70,11 @@ def write_model_meta(
     window_id : str
         Window identifier (e.g. "w11").
     """
-    meta_path = model_out_path.parent / "meta.json"
+    # One file per checkpoint: a second artifact (the live window) shares this
+    # directory, and a single meta.json would be overwritten by whichever model
+    # wrote last. meta.json is still written for walk-forward models so older
+    # readers keep working.
+    meta_path = model_out_path.parent / f"{model_out_path.stem}.meta.json"
     meta = {
         _MODEL_FILE: model_out_path.name,
         _TRAIN_DATE: train_data_end,
@@ -81,6 +85,10 @@ def write_model_meta(
     try:
         meta_path.write_text(json.dumps(meta, indent=2) + "\n")
         log.info("wrote model meta: %s", meta_path)
+        if model_out_path.stem != "wlive":
+            (model_out_path.parent / "meta.json").write_text(
+                json.dumps(meta, indent=2) + "\n"
+            )
     except OSError as exc:
         log.error("failed to write model meta %s: %s", meta_path, exc)
 
@@ -102,7 +110,10 @@ def read_model_meta(
         Reasons: "absent", "unreadable", "train_date missing",
         "train_date unparseable", "train_date future", "mismatch".
     """
-    meta_path = model_path.parent / "meta.json"
+    # Prefer the checkpoint's own meta file; fall back to the shared one.
+    target = model_path.resolve() if model_path.is_symlink() else model_path
+    stem_meta = target.parent / f"{target.stem}.meta.json"
+    meta_path = stem_meta if stem_meta.exists() else model_path.parent / "meta.json"
     if not meta_path.exists():
         return None, "absent"
 

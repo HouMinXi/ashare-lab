@@ -350,7 +350,15 @@ def _resolve_model_path(
     if window is None:
         if windows and trade_date > windows[-1]["test_end"]:
             window = windows[-1]
-            if model_path is None:
+            live_model = models_dir / "wlive.pt"
+            if model_path is None and live_model.is_file():
+                # The live window is trained through the last trading day and
+                # has no held-out period; it is the artifact meant for dates
+                # after every walk-forward window has closed. Its artifact id
+                # is "wlive", matching the file name and models/meta.json.
+                window = {**windows[-1], "window_id": "wlive"}
+                model_path = live_model
+            elif model_path is None:
                 model_path = models_dir / "latest.pt"
         elif not windows or trade_date < windows[0]["test_start"]:
             raise ValueError(
@@ -359,7 +367,7 @@ def _resolve_model_path(
                 % (trade_date, windows[0]["test_start"] if windows else "N/A")
             )
 
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     if model_path is None:
         model_path = models_dir / f"w{window_id}.pt"
@@ -467,7 +475,7 @@ def predict_for_date(
     model_path, window = _resolve_model_path(
         trade_date, model_path, get_all_windows(), load_config(), MODELS_DIR,
     )
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     # -- Model freshness check (meta.json preferred, mtime fallback) --
     from ashare_lab.research.model_meta import read_model_meta  # noqa: PLC0415
@@ -495,7 +503,7 @@ def predict_for_date(
             )
 
     log.info(
-        "predict %s: window W%d, model %s",
+        "predict %s: window W%s, model %s",
         trade_date,
         window_id,
         model_path.name,

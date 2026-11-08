@@ -478,19 +478,24 @@ class TestRetrainSkipsServeNowLive:
         assert "python3 -c" not in fn
         assert "2>/dev/null" not in fn
 
-    def test_deploy_gate_uses_train_date_for_serve_now(self):
-        """w12 is numerically below w115, so the numeric gate would deploy a
-        staler model without complaint. Serve-now deploys compare train_date,
-        and a serve-now run that cannot read both dates shelves rather than
-        falling through to a gate that cannot judge it."""
+    def test_deploy_gate_judges_named_models_not_the_shared_meta(self):
+        """The gate compares train dates of walk-forward checkpoints by name.
+
+        It used to read models/meta.json. A live artifact writes there too, so
+        whichever model wrote last would supply the dates for a comparison it
+        does not belong to: the live model's train_date is yesterday, which
+        makes every following walk-forward model look staler and shelves it.
+        """
         src = self.RETRAIN.read_text()
-        assert "NEW_TRAIN_DATE" in src
-        assert "LIVE_TRAIN_DATE" in src
-        gate_at = src.index('if [ "$SERVE_NOW_LIVE" -eq 1 ]')
-        numeric_at = src.index('elif [ -n "$NEW_MODEL" ]')
-        assert gate_at < numeric_at
-        closed = src.index('if [ -z "$NEW_TRAIN_DATE" ] || [ -z "$LIVE_TRAIN_DATE" ]')
-        assert gate_at < closed < numeric_at
+        gate = src[src.index("# --- Step 3b"):src.index('if [ "$DEPLOY_SKIP" -eq 1 ]; then')]
+
+        assert "open('meta.json')" not in gate, "gate still reads the shared meta"
+        assert "w*.pt" in gate, "the producing model must be found by name"
+        assert "${NEW_MODEL%.pt}.meta.json" in gate, "per-checkpoint meta not read"
+        assert "NEW_TRAIN_DATE" in gate and "LIVE_TRAIN_DATE" in gate
+        assert "cannot read both train dates" in gate, (
+            "an unreadable pair must shelve, not fall through"
+        )
 
     def test_alerts_do_not_interpolate_values_into_python(self):
         """Alert values read off gpu-win are data, not code. Embedding
@@ -767,3 +772,47 @@ class TestRetrainPointsTheGpuAtItsOwnModel:
             "a shelved model must not be pushed to the GPU, and the copy has to "
             "happen before the server restart"
         )
+
+
+class TestRetrainTrainsTheLiveWindow:
+    """A retrain must leave a model that has actually seen recent data.
+
+    The walk-forward window cannot: its training span ends before its own
+    validation and test spans. The live window trains three rolling years
+    ending on the last trading day, and it is promoted only on the same run
+    that passed the deploy gate.
+    """
+
+    RETRAIN = Path(__file__).resolve().parents[1] / "scripts" / "ashare-retrain.sh"
+
+    def test_the_live_window_is_trained(self):
+        src = self.RETRAIN.read_text()
+        assert "py -m ashare_lab.research.train --live --force" in src
+        assert "Training live window" in src
+
+    def test_the_live_artifact_is_promoted_on_both_hosts(self):
+        src = self.RETRAIN.read_text()
+        assert "wlive.pt" in src
+        assert 'ln -sf "wlive.pt"' in src
+        assert "copy /Y wlive.pt latest.pt" in src
+
+    def test_a_shelved_run_does_not_promote_a_live_model(self):
+        """The live step sits in the else branch of the deploy gate.
+
+        The else body is indented one level. A marker that has drifted to
+        column zero still passes any ordering check while running on a shelved
+        cycle -- promoting a model the gate just refused.
+        """
+        import re
+
+        src = self.RETRAIN.read_text()
+        skip_at = src.index('log "Shelved model: skipping Step 4')
+        live_at = src.index("Training live window")
+        restart_at = src.index("# --- Step 6: Restart llama-server")
+        assert skip_at < live_at < restart_at
+        assert re.search(r'^    log "Training live window\.\.\."$', src, re.M), (
+            "the live step must stay inside the deploying branch"
+        )
+        gate = src.index('if [ "$DEPLOY_SKIP" -eq 1 ]; then')
+        gate_else = src.index("else", gate)
+        assert gate_else < live_at < restart_at

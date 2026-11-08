@@ -103,7 +103,6 @@ log "IC gate triggered: $low_count consecutive low-IC days, starting retrain"
 # last window whose test period has started, so the freshest trainable
 # window needs --serve-now <step> to reach.
 EXPECTED_MODEL=$(read_expected_live_model)
-EXPECTED_N=$(echo "$EXPECTED_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
 # Always retrain the freshest window.  get_all_windows() stops at the last
 # window whose test period has started, so its length is that window's step;
 # --force alone would walk the whole history, which is hours of GPU time for a
@@ -163,57 +162,74 @@ else
 fi
 log "Training exit code: $TRAIN_RC"
 
-# --- Step 3b: Deploy gate (expected_live_model check) ---
+# --- Step 3b: Deploy gate ---
+# Compare training dates, and identify both sides by name: the newest
+# walk-forward checkpoint (w<digits>.pt) on each host. meta.json is deliberately
+# not consulted -- a live artifact shares this directory, and whichever model
+# wrote it last would otherwise supply the dates for a comparison it does not
+# belong to.
 DEPLOY_SKIP=0
-NEW_MODEL=""
-EXPECTED_MODEL=""
-
-# Read new model name from gpu-side meta.json (parse remotely, don't depend on scp)
-NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
-    "cd /d $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['model_file'])\"" 2>/dev/null || true)
-
-# Read expected_live_model from baseline config
 EXPECTED_MODEL=$(read_expected_live_model)
 
-# Serve-now models carry an out-of-band window number (w115), so "12 > 115"
-# is false and a staler w12 would sail through the numeric gate. Compare
-# training dates instead: only a model trained on newer data may deploy.
-# The branch is closed: a serve-now run that cannot read both dates shelves
-# rather than falling back to the numeric gate that cannot judge it.
-SERVE_NOW_LIVE=0
+_wf_train_date() {
+    # $1 = models dir, $2 = model file name
+    META_DIR="$1" META_MODEL="$2" python3 -c '
+import json, os
+d, m = os.environ["META_DIR"], os.environ["META_MODEL"]
+stem = m[:-3] if m.endswith(".pt") else m
+raw = {}
+for name in (stem + ".meta.json", "meta.json"):
+    try:
+        candidate = json.load(open(os.path.join(d, name)))
+    except Exception:
+        continue
+    if candidate.get("model_file", m) == m:
+        raw = candidate
+        break
+print(raw.get("train_date", ""))
+' 2>/dev/null || true
+}
+
+# The model this run produced: newest walk-forward checkpoint on the GPU host.
+NEW_MODEL=$(ssh -o ConnectTimeout=5 "$GPU_HOST" "dir /b $GPU_REPO\\models\\w*.pt" 2>/dev/null \
+    | tr -d '\r' | awk -F'\\' '{print $NF}' | grep -E '^w[0-9]+\.pt$' | sort -V | tail -1 || true)
+
+# The model it would replace: newest walk-forward checkpoint already on W1.
+CUR_MODEL=$(for _f in "$PROJECT_DIR"/models/w[0-9]*.pt; do [ -e "$_f" ] && basename "$_f"; done | sort -V | tail -1 || true)
+
 NEW_TRAIN_DATE=""
 LIVE_TRAIN_DATE=""
-if [ -n "$EXPECTED_N" ] && [ "$EXPECTED_N" -ge 100 ]; then
-    SERVE_NOW_LIVE=1
-    NEW_TRAIN_DATE=$(ssh -o ConnectTimeout=5 "$GPU_HOST" \
-        "cd /d $GPU_REPO/models && python -c \"import json,sys; print(json.load(open('meta.json'))['train_date'])\"" 2>/dev/null || true)
-    if [ -f "$PROJECT_DIR/models/meta.json" ]; then
-        LIVE_TRAIN_DATE=$(META_PATH="$PROJECT_DIR/models/meta.json" \
-        PYTHONPATH="$PROJECT_DIR" python3 -c '
+if [ -n "$NEW_MODEL" ]; then
+    _TMP_META=/tmp/retrain_new_meta_$$.json
+    if scp -q -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/${NEW_MODEL%.pt}.meta.json" "$_TMP_META" 2>/dev/null; then
+        NEW_TRAIN_DATE=$(META_PATH="$_TMP_META" python3 -c '
 import json, os
 print(json.load(open(os.environ["META_PATH"])).get("train_date", ""))
 ' 2>/dev/null || true)
     fi
+    rm -f "$_TMP_META"
+fi
+if [ -n "$CUR_MODEL" ]; then
+    LIVE_TRAIN_DATE=$(_wf_train_date "$PROJECT_DIR/models" "$CUR_MODEL")
 fi
 
-if [ "$SERVE_NOW_LIVE" -eq 1 ]; then
-    if [ -z "$NEW_TRAIN_DATE" ] || [ -z "$LIVE_TRAIN_DATE" ]; then
-        DEPLOY_SKIP=1
-        log "serve-now deploy gate: train_date unavailable (new='${NEW_TRAIN_DATE}', live='${LIVE_TRAIN_DATE}'); not deploying"
-        NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
-        PYTHONPATH="$PROJECT_DIR" python3 -c '
+if [ -z "$NEW_MODEL" ] || [ -z "$NEW_TRAIN_DATE" ] || [ -z "$LIVE_TRAIN_DATE" ]; then
+    DEPLOY_SKIP=1
+    log "deploy gate: cannot read both train dates (new='${NEW_TRAIN_DATE}' from ${NEW_MODEL:-none}, live='${LIVE_TRAIN_DATE}' from ${CUR_MODEL:-none}); not deploying"
+    NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
+    PYTHONPATH="$PROJECT_DIR" python3 -c '
 import os
 from ashare_lab.bridge import send_bridge_alert
 send_bridge_alert("ashare retrain: model shelved",
-                  "serve-now deploy gate could not read train_date "
+                  "deploy gate could not read train_date "
                   "(new=%s, live=%s), artifact left on gpu-win"
                   % (os.environ["NEW_TRAIN_DATE"], os.environ["LIVE_TRAIN_DATE"]))
 ' >>"$LOG_FILE" 2>&1 || true
-    elif [ "$NEW_TRAIN_DATE" \< "$LIVE_TRAIN_DATE" ] || [ "$NEW_TRAIN_DATE" = "$LIVE_TRAIN_DATE" ]; then
-        DEPLOY_SKIP=1
-        log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} is not newer than live ${LIVE_TRAIN_DATE}; not deploying"
-        NEW_MODEL="$NEW_MODEL" NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
-        PYTHONPATH="$PROJECT_DIR" python3 -c '
+elif [ "$NEW_TRAIN_DATE" \< "$LIVE_TRAIN_DATE" ] || [ "$NEW_TRAIN_DATE" = "$LIVE_TRAIN_DATE" ]; then
+    DEPLOY_SKIP=1
+    log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} is not newer than ${CUR_MODEL} ${LIVE_TRAIN_DATE}; not deploying"
+    NEW_MODEL="$NEW_MODEL" NEW_TRAIN_DATE="$NEW_TRAIN_DATE" LIVE_TRAIN_DATE="$LIVE_TRAIN_DATE" \
+    PYTHONPATH="$PROJECT_DIR" python3 -c '
 import os
 from ashare_lab.bridge import send_bridge_alert
 send_bridge_alert("ashare retrain: model shelved",
@@ -221,28 +237,8 @@ send_bridge_alert("ashare retrain: model shelved",
                   % (os.environ["NEW_MODEL"], os.environ["NEW_TRAIN_DATE"],
                      os.environ["LIVE_TRAIN_DATE"]))
 ' >>"$LOG_FILE" 2>&1 || true
-    else
-        log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} supersedes live ${LIVE_TRAIN_DATE}; deploying"
-    fi
-# Numeric comparison: extract digits after 'w'
-elif [ -n "$NEW_MODEL" ] && [ -n "$EXPECTED_MODEL" ]; then
-    NEW_N=$(echo "$NEW_MODEL" | sed -n 's/.*[wW]\([0-9]*\).*/\1/p')
-    if [ -n "$NEW_N" ] && [ -n "$EXPECTED_N" ] && [ "$NEW_N" -gt "$EXPECTED_N" ]; then
-        DEPLOY_SKIP=1
-        log "w${NEW_N} trained but shelved (expected_live_model=w${EXPECTED_N}); not deploying"
-        # Alert via the bridge module (failure must not affect script)
-        NEW_N="$NEW_N" EXPECTED_N="$EXPECTED_N" \
-        PYTHONPATH="$PROJECT_DIR" python3 -c '
-import os
-from ashare_lab.bridge import send_bridge_alert
-send_bridge_alert("ashare retrain: model shelved",
-                  "w%s trained but shelved (expected_live_model=w%s), "
-                  "artifact left on gpu-win"
-                  % (os.environ["NEW_N"], os.environ["EXPECTED_N"]))
-' >>"$LOG_FILE" 2>&1 || true
-    fi
-elif [ -z "$NEW_MODEL" ]; then
-    log "WARNING: could not read gpu-side meta.json, deploying as fallback"
+else
+    log "${NEW_MODEL} trained on ${NEW_TRAIN_DATE} supersedes ${CUR_MODEL} ${LIVE_TRAIN_DATE}; deploying"
 fi
 
 if [ "$DEPLOY_SKIP" -eq 1 ]; then
@@ -297,6 +293,34 @@ else
         else
             log "WARNING: could not point the GPU latest.pt at $DEPLOYED_MODEL; predictions may use the previous model"
         fi
+    fi
+
+    # --- Step 5b: the live window ---
+    # A walk-forward model cannot use recent data by construction: its training
+    # span has to end before its own validation and test spans, which leaves the
+    # freshest one months behind. The live window trains three rolling years
+    # ending on the last trading day and has no held-out period, so paper
+    # trading is its out-of-sample record.
+    log "Training live window..."
+    LIVE_RC=0
+    if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd /d $GPU_REPO && py -m ashare_lab.research.train --live --force" >> "$LOG_FILE" 2>&1; then
+        :
+    else
+        LIVE_RC=$?
+    fi
+    log "Live window exit code: $LIVE_RC"
+    if [ "$LIVE_RC" -eq 0 ] && scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/wlive.pt" "$PROJECT_DIR/models/" 2>>"$LOG_FILE"; then
+        scp -o ConnectTimeout=5 "$GPU_HOST:$GPU_REPO/models/meta.json" "$PROJECT_DIR/models/" 2>>"$LOG_FILE" || true
+        ln -sf "wlive.pt" "$PROJECT_DIR/models/latest.pt"
+        LIVE_TRAIN_DATE_OUT=$(python3 -c "import json; print(json.load(open('$PROJECT_DIR/models/meta.json'))['train_date'])" 2>/dev/null || echo "?")
+        log "latest.pt -> wlive.pt (live window through $LIVE_TRAIN_DATE_OUT)"
+        if ssh -o ConnectTimeout=5 "$GPU_HOST" "cd /d $GPU_REPO/models && copy /Y wlive.pt latest.pt >nul" 2>>"$LOG_FILE"; then
+            log "GPU latest.pt -> wlive.pt"
+        else
+            log "WARNING: GPU latest.pt not updated to wlive.pt"
+        fi
+    else
+        log "WARNING: live window not deployed (rc=$LIVE_RC); predictions keep the walk-forward model"
     fi
 fi
 
