@@ -91,3 +91,55 @@ def test_a_named_window_is_recorded_in_the_model_meta(tmp_path):
     assert not (tmp_path / "meta.json").exists(), (
         "the live artifact must not overwrite the walk-forward descriptor"
     )
+
+
+def test_the_production_date_uses_the_live_model(tmp_path):
+    """The newest window's test_end is clamped to the latest trading day.
+
+    So "past every window" never holds on a production run, and a rule keyed on
+    that never selects the live artifact. The day being predicted is the
+    criterion; historical dates keep their window models.
+    """
+    from ashare_lab.research.predict import _resolve_model_path
+    from ashare_lab.research.smoke_test import latest_trading_day
+
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "wlive.pt").write_bytes(b"live model")
+    for n in (10, 11):
+        (models / f"w{n}.pt").write_bytes(f"window {n}".encode())
+
+    today = str(latest_trading_day())
+    windows = [{
+        "window_id": 11,
+        "train_start": "2022-01-01", "train_end": "2025-12-31",
+        "valid_start": "2026-01-01", "valid_end": "2026-06-30",
+        "test_start": "2026-07-01", "test_end": today,
+    }]
+
+    with patch("ashare_lab.research.predict._send_alert"):
+        path, window = _resolve_model_path(today, None, windows, {"research": {}}, models)
+
+    assert path.name == "wlive.pt"
+    assert window["window_id"] == "wlive"
+
+
+def test_a_historical_date_still_uses_its_window_model(tmp_path):
+    from ashare_lab.research.predict import _resolve_model_path
+
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "wlive.pt").write_bytes(b"live model")
+    (models / "w11.pt").write_bytes(b"window 11")
+
+    windows = [{
+        "window_id": 11,
+        "train_start": "2022-01-01", "train_end": "2025-12-31",
+        "valid_start": "2026-01-01", "valid_end": "2026-06-30",
+        "test_start": "2026-07-01", "test_end": "2026-11-06",
+    }]
+
+    with patch("ashare_lab.research.predict._send_alert"):
+        path, _ = _resolve_model_path("2026-08-03", None, windows, {"research": {}}, models)
+
+    assert path.name == "w11.pt"

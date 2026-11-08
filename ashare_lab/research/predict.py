@@ -342,9 +342,25 @@ def _resolve_model_path(
     _LAST_RESOLUTION["deliberate"] = False
     window: dict | None = None
 
+    # The newest walk-forward window clamps its test_end to the latest trading
+    # day, so "past every window" never holds for a production date: the live
+    # artifact would never be selected. Choose it explicitly for the day being
+    # predicted, and leave historical dates on their window models.
+    from ashare_lab.research.smoke_test import latest_trading_day  # noqa: PLC0415
+
+    live_model = models_dir / "wlive.pt"
+    if (
+        model_path is None
+        and live_model.is_file()
+        and trade_date >= str(latest_trading_day())
+    ):
+        window = dict(windows[-1], window_id="wlive") if windows else {"window_id": "wlive"}
+        model_path = live_model
+
     for w in windows:
         if w["test_start"] <= trade_date <= w["test_end"]:
-            window = w
+            if window is None:
+                window = w
             break
 
     if window is None:
