@@ -448,6 +448,7 @@ class TestTurnoverCapIntegration:
         def mock_insert(conn, td, sym, side, qty, *a, **kw):
             insert_calls.append((sym, side, qty))
         with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
              P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
             _step10_signal_generation(ctx)
 
@@ -489,6 +490,7 @@ class TestTurnoverCapIntegration:
         def mock_insert(conn, td, sym, side, qty, *a, **kw):
             insert_calls.append((sym, side, qty))
         with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
              P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
             _step10_signal_generation(ctx)
 
@@ -557,6 +559,7 @@ class TestTurnoverBugInjection:
             insert_calls.append((sym, side, qty))
 
         with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
              P("ashare_lab.paper.pipeline.generate_signals", return_value=signals), \
              P.object(turnover_mod, "cap_rotation_buys", side_effect=noop_cap):
             _step10_signal_generation(ctx)
@@ -677,6 +680,48 @@ class TestBookBCapIntegration:
 class TestRampChargesOnlyDaysThatDeploy:
     """A day that funds no order must not spend a ramp day."""
 
+    def test_a_day_that_deploys_advances_the_ramp(self, turnover_conn, tmp_path):
+        """The counter is not decorative: funding a name must move it forward.
+
+        Without this, deleting the charge leaves every other ramp test green --
+        they all assert that a day with nothing to buy does not advance it.
+        """
+        from ashare_lab.paper.pipeline import _step10_signal_generation
+        from unittest.mock import patch as P
+
+        save_turnover_ramp(turnover_conn, "2026-07-20", 2)
+        prices = {f"SH6000{i}": {"close": 10.0 + i, "change": 0.01, "volume": 1e6,
+                                 "factor": 1.0, "threshold": 0.099}
+                  for i in range(1, 6)}
+        signals = {f"SH6000{i}": 0.95 - i * 0.05 for i in range(1, 6)}
+        config = {
+            "paper": {
+                "topk": 15, "n_drop": 1, "initial_cash": 300_000,
+                "listing_min_days": 0, "liquidity_min_turnover": 0,
+                "turnover_cap": 0.20, "turnover_ramp_cap": 0.50,
+                "turnover_ramp_days": 5, "turnover_ramp_invested_ratio": 0.30,
+            },
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"exclude_close_above_cny": 300},
+        }
+        ctx = _make_ctx(turnover_conn, signals, prices, config, tmp_path=tmp_path)
+
+        inserted = []
+
+        def mock_insert(conn, td, sym, side, qty, *a, **kw):
+            inserted.append((sym, side, qty))
+
+        with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
+            _step10_signal_generation(ctx)
+
+        assert [c for c in inserted if c[1] == "buy"], "the scenario must place buys"
+        row = turnover_conn.execute(
+            "SELECT value FROM paper_state WHERE key='turnover_ramp'"
+        ).fetchone()
+        assert row["value"] == "2026-07-20|3"
+
     def test_a_day_that_funds_nothing_leaves_the_ramp_where_it_was(
         self, turnover_conn, tmp_path
     ):
@@ -709,6 +754,7 @@ class TestRampChargesOnlyDaysThatDeploy:
             inserted.append((sym, side, qty))
 
         with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
              P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
             _step10_signal_generation(ctx)
 
@@ -754,6 +800,7 @@ class TestBuyOrdersDoNotDoubleUp:
             inserted.append((sym, side, qty))
 
         with P("ashare_lab.paper.pipeline.insert_order", side_effect=mock_insert), \
+             P("ashare_lab.paper.orders.insert_order", side_effect=mock_insert), \
              P("ashare_lab.paper.pipeline.generate_signals", return_value=signals):
             _step10_signal_generation(ctx)
         return inserted
@@ -967,3 +1014,40 @@ class TestBookBOrders:
         assert by_symbol["SH600001"] == 500, (
             f"Book B ordered SH600001 on top of its pending 500: {by_symbol['SH600001']}"
         )
+
+
+def test_a_nan_close_never_becomes_an_order(turnover_conn):
+    """NaN slips past `not price` and `price <= 0`; it must not reach sizing.
+
+    Book B's older copy of this loop checked only those two conditions, so a
+    NaN close reached round_lots and an order with a NaN quantity was written.
+    Both books now share one placement path, and that path rejects it.
+    """
+    import math
+
+    from ashare_lab.paper.orders import place_buys
+
+    prices = {
+        "SH600001": {"close": float("nan")},
+        "SH600002": {"close": 10.0},
+    }
+
+    funded, _, inserted = place_buys(
+        turnover_conn,
+        buy_syms=["SH600001", "SH600002"],
+        target_value=10_000.0,
+        prices=prices,
+        equity_nav=100_000.0,
+        positions={},
+        paper_cfg={},
+        next_td_str="2026-07-22",
+        trade_date="2026-07-21",
+    )
+
+    rows = turnover_conn.execute(
+        "SELECT symbol, target_qty FROM orders WHERE side='buy'"
+    ).fetchall()
+    assert [r["symbol"] for r in rows] == ["SH600002"]
+    assert inserted == 1
+    for row in rows:
+        assert not math.isnan(row["target_qty"])

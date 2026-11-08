@@ -290,7 +290,8 @@ class TestR3Canary:
             with patch("ashare_lab.paper.pipeline.timing_multiplier_detail", return_value=(m, None)), \
                  patch("ashare_lab.paper.pipeline.next_trading_day", return_value=next_td), \
                  patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}), \
-                 patch("ashare_lab.paper.pipeline.insert_order", side_effect=capture_insert_order):
+                 patch("ashare_lab.paper.pipeline.insert_order", side_effect=capture_insert_order), \
+                 patch("ashare_lab.paper.orders.insert_order", side_effect=capture_insert_order):
                 _run_book_b(ctx, "n1")
             return captured
 

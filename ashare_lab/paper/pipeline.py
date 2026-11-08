@@ -35,7 +35,6 @@ from ashare_lab.data.calendar import (
 from ashare_lab.paper.adjust import check_and_apply_adjustfactor
 from ashare_lab.paper.engine import (
     get_limit_threshold,
-    round_lots,
     settle_day,
 )
 from ashare_lab.paper.hedge import (
@@ -52,6 +51,7 @@ from ashare_lab.paper.ipo import (
     detect_board_type,
     determine_ipo_sell_date,
 )
+from ashare_lab.paper.orders import place_buys
 from ashare_lab.paper.ledger import (
     bump_carry_days,
     bump_suspension_carry_days,
@@ -73,7 +73,6 @@ from ashare_lab.paper.ledger import (
     record_nav,
     record_run,
     settlement_gaps,
-    symbols_with_buy_in_flight,
     open_pipeline_run,
     close_pipeline_run,
     set_cooldown,
@@ -1760,64 +1759,17 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         if to_insert > 0:
             insert_order(ctx.conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
 
-    # A pending or carried buy already represents its position, so the symbol
-    # is not a candidate today. Filtering here rather than at insertion keeps
-    # the budget from being spent on an order that will not be sent.
-    in_flight = symbols_with_buy_in_flight(ctx.conn, buy_syms)
-    if in_flight:
-        logger.info(
-            "[orders] %d buy(s) already in flight, not ordering again: %s",
-            len(in_flight), ", ".join(sorted(in_flight)),
-        )
-        buy_syms = [s for s in buy_syms if s not in in_flight]
-
-    # L3: Apply turnover budget cap to discretionary rotation buys
-    from ashare_lab.paper.turnover import (
-        cap_rotation_buys, charge_ramp_day, load_turnover_ramp,
-        check_ramp_activation, reset_turnover_ramp,
+    buy_syms, target_value, _ = place_buys(
+        ctx.conn,
+        buy_syms=buy_syms,
+        target_value=target_value,
+        prices=ctx.prices,
+        equity_nav=equity_nav,
+        positions=ctx.current_positions,
+        paper_cfg=ctx.paper_cfg,
+        next_td_str=next_td_str,
+        trade_date=ctx.trade_date,
     )
-    turnover_cfg = ctx.paper_cfg.get("turnover_cap")
-    ramp_state = None
-    if turnover_cfg and buy_syms and equity_nav > 0:
-        ramp_state = load_turnover_ramp(ctx.conn)
-        # Check ramp activation (cold start / re-entry)
-        invested_threshold = ctx.paper_cfg.get("turnover_ramp_invested_ratio", 0.30)
-        if check_ramp_activation(equity_nav, ctx.current_positions, invested_threshold):
-            if not ramp_state.get("active", False):
-                ramp_state["active"] = True
-                ramp_state["k"] = 0
-                ramp_state["entry_date"] = ctx.trade_date
-                logger.info("[turnover] ramp activated on %s (invested_ratio < %.0f%%)",
-                            ctx.trade_date, invested_threshold * 100)
-        else:
-            if ramp_state.get("active", False):
-                reset_turnover_ramp(ctx.conn)
-                ramp_state = {"entry_date": None, "k": 0, "active": False}
-                logger.info("[turnover] ramp deactivated (invested_ratio >= %.0f%%)",
-                            invested_threshold * 100)
-        ramp_state["ramp_cap"] = ctx.paper_cfg.get("turnover_ramp_cap", 0.50)
-        ramp_state["ramp_days"] = ctx.paper_cfg.get("turnover_ramp_days", 5)
-        buy_syms, target_value, effective_cap, ramp_state = cap_rotation_buys(
-            buy_syms, target_value, ctx.prices, equity_nav, turnover_cfg, ramp_state,
-        )
-    inserted = 0
-    for s in buy_syms:
-        close_price = ctx.prices.get(s, {}).get("close")
-        if (
-            not close_price
-            or close_price <= 0
-            or (isinstance(close_price, float) and close_price != close_price)
-        ):
-            logger.warning("Skip buy %s: invalid close price %s", s, close_price)
-            continue
-        target_qty = round_lots(target_value / close_price, "buy")
-        if target_qty <= 0:
-            continue
-        insert_order(ctx.conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
-        inserted += 1
-
-    if charge_ramp_day(ctx.conn, ramp_state, inserted, ctx.trade_date):
-        ctx.conn.commit()
 
     return -1
 
@@ -2079,7 +2031,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # PHASE 1: Settle yesterday's Book B orders (T+1)
         # Must happen BEFORE computing NAV/signals/target_value,
         # mirroring Book A's flow: _step8_settle -> _step10_signals.
-        from ashare_lab.paper.engine import round_lots, settle_day
+        from ashare_lab.paper.engine import settle_day
 
         # ORDER BY id for the same reason as the main book: settlement
         # walks this list and spends cash as it goes
@@ -2180,54 +2132,18 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
             if to_insert > 0:
                 insert_order(book_conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
 
-        # L3: Apply turnover budget cap (Book B has own ramp state in own DB)
-        from ashare_lab.paper.turnover import (
-            cap_rotation_buys as _cap_buys_b,
-            load_turnover_ramp as _load_ramp_b,
-            charge_ramp_day as _charge_ramp_b,
-            check_ramp_activation as _check_ramp_b,
-            reset_turnover_ramp as _reset_ramp_b,
+        buy_syms, target_value, _ = place_buys(
+            book_conn,
+            buy_syms=buy_syms,
+            target_value=target_value,
+            prices=ctx.prices,
+            equity_nav=equity_nav,
+            positions=book_positions,
+            paper_cfg=ctx.paper_cfg,
+            next_td_str=next_td_str,
+            trade_date=ctx.trade_date,
+            label="book B",
         )
-        in_flight_b = symbols_with_buy_in_flight(book_conn, buy_syms)
-        if in_flight_b:
-            logger.info(
-                "[orders] book B: %d buy(s) already in flight, not ordering again: %s",
-                len(in_flight_b), ", ".join(sorted(in_flight_b)),
-            )
-            buy_syms = [s for s in buy_syms if s not in in_flight_b]
-
-        turnover_cfg_b = ctx.paper_cfg.get("turnover_cap")
-        ramp_b = None
-        if turnover_cfg_b and buy_syms and equity_nav > 0:
-            ramp_b = _load_ramp_b(book_conn)
-            inv_thresh_b = ctx.paper_cfg.get("turnover_ramp_invested_ratio", 0.30)
-            if _check_ramp_b(equity_nav, book_positions, inv_thresh_b):
-                if not ramp_b.get("active", False):
-                    ramp_b["active"] = True
-                    ramp_b["k"] = 0
-                    ramp_b["entry_date"] = ctx.trade_date
-            else:
-                if ramp_b.get("active", False):
-                    _reset_ramp_b(book_conn)
-                    ramp_b = {"entry_date": None, "k": 0, "active": False}
-            ramp_b["ramp_cap"] = ctx.paper_cfg.get("turnover_ramp_cap", 0.50)
-            ramp_b["ramp_days"] = ctx.paper_cfg.get("turnover_ramp_days", 5)
-            buy_syms, target_value, _, ramp_b = _cap_buys_b(
-                buy_syms, target_value, ctx.prices, equity_nav, turnover_cfg_b, ramp_b,
-            )
-        inserted_b = 0
-        for s in buy_syms:
-            close_price = ctx.prices.get(s, {}).get("close")
-            if not close_price or close_price <= 0:
-                continue
-            target_qty = round_lots(target_value / close_price, "buy")
-            if target_qty <= 0:
-                continue
-            insert_order(book_conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
-            inserted_b += 1
-
-        if _charge_ramp_b(book_conn, ramp_b, inserted_b, ctx.trade_date):
-            book_conn.commit()
 
         # Write A/B/C artifact
         _write_abc_artifact(ctx, book_conn, book_id, m, m_degraded)
