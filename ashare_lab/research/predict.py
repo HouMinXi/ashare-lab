@@ -346,7 +346,10 @@ def _resolve_model_path(
     # day, so "past every window" never holds for a production date: the live
     # artifact would never be selected. Choose it explicitly for the day being
     # predicted, and leave historical dates on their window models.
-    from ashare_lab.research.smoke_test import latest_trading_day  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import (  # noqa: PLC0415
+        get_live_window,
+        latest_trading_day,
+    )
 
     live_model = models_dir / "wlive.pt"
     if (
@@ -354,7 +357,11 @@ def _resolve_model_path(
         and live_model.is_file()
         and trade_date >= str(latest_trading_day())
     ):
-        window = dict(windows[-1], window_id="wlive") if windows else {"window_id": "wlive"}
+        # The window carries the fit range the handler normalises with, so it
+        # has to be the span this model was trained on -- not whichever
+        # walk-forward window happens to cover the date, which would feed the
+        # model features scaled over a different period.
+        window = dict(get_live_window(), window_id="wlive")
         model_path = live_model
 
     for w in windows:

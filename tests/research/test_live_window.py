@@ -122,6 +122,14 @@ def test_the_production_date_uses_the_live_model(tmp_path):
 
     assert path.name == "wlive.pt"
     assert window["window_id"] == "wlive"
+    # The fit range must be the one the model was trained over; the matched
+    # walk-forward window carries a different one and would skew the features.
+    from ashare_lab.research.smoke_test import get_live_window
+
+    live = get_live_window()
+    assert (window["train_start"], window["train_end"]) == (
+        live["train_start"], live["train_end"]
+    )
 
 
 def test_a_historical_date_still_uses_its_window_model(tmp_path):
