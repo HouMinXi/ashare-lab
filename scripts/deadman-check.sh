@@ -17,8 +17,9 @@ STATE_DIR="${ASHARE_DEADMAN_STATE:-$HOME/.local/state/ashare-deadman}"
 LOG="$STATE_DIR/deadman.log"
 STAMP="$STATE_DIR/last-alert.stamp"
 MAX_LOG_BYTES=$((512 * 1024))
-# Re-alert at most this often for a condition that stays broken, so a week of
-# downtime does not become a week of hourly messages.
+# Re-alert at most this often for a condition that stays broken. The cron runs
+# once a day, so in practice a failure that persists pages once per run; this
+# value only suppresses repeats if the schedule is ever tightened below a day.
 REALERT_SECONDS="${ASHARE_REALERT_SECONDS:-86400}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
 
