@@ -259,7 +259,8 @@ def gather_report_data(
         daily_loss_halted = daily_return_pct <= -risk_cfg["daily_loss"] * 100.0
         regime_days = risk_cfg.get("market_regime_days", 10)
         c_rows = conn.execute(
-            "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
+            "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? "
+            "AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
             (trade_date, regime_days + 1)
         ).fetchall()
         regime_halted = False
@@ -687,7 +688,10 @@ async def _send_via_ilink(chunks: list[str], chat_id: str, token: str,
                 await asyncio.sleep(delay)
 
 
-def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict, *, force: bool = False) -> str:
+def deliver_report(
+    conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str,
+    config: dict, *, force: bool = False,
+) -> str:
     logger.info("[deliver] start for %s (mode=%s, text_len=%d, force=%s)", trade_date, mode, len(report_text), force)
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
@@ -790,7 +794,9 @@ def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, rep
     return True
 
 
-def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: str, report_text: str, rcfg: dict) -> bool:
+def _deliver_via_ilink_legacy(
+    chunks: list[str], trade_date: str, conn, mode: str, report_text: str, rcfg: dict,
+) -> bool:
     """Send report chunks via iLink (legacy channel). Returns True if all chunks sent."""
     try:
         wx_token = _get_secret("ashare/weixin-token")
@@ -828,7 +834,10 @@ def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: st
     return False
 
 
-def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False, *, force: bool = False) -> int:
+def generate_and_send_report(
+    trade_date: str, conn: sqlite3.Connection, config: dict,
+    dry_run: bool = False, *, force: bool = False,
+) -> int:
     nav_check = conn.execute("SELECT 1 FROM nav WHERE trade_date=?", (trade_date,)).fetchone()
     if not nav_check:
         logger.warning("No data for %s", trade_date)

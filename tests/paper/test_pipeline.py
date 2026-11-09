@@ -810,7 +810,10 @@ class TestHedgePrefetch:
             activate_dd=0.10,
         )
         mock_prices = {"511260": {"close": 10.5, "volume": 1e12, "factor": 1.0, "change": 0.0, "threshold": 0.10}}
-        with patch("ashare_lab.paper.hedge._load_hedge_config", return_value=mock_hedge_cfg),              patch("ashare_lab.paper.pipeline._fetch_hedge_prices") as mock_fetch:
+        with (
+            patch("ashare_lab.paper.hedge._load_hedge_config", return_value=mock_hedge_cfg),
+            patch("ashare_lab.paper.pipeline._fetch_hedge_prices") as mock_fetch,
+        ):
             def side_effect(ctx, syms):
                 ctx.prices.update(mock_prices)
             mock_fetch.side_effect = side_effect

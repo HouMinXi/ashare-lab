@@ -704,6 +704,49 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
         ctx.is_soft_reduced = False
 
 
+def _daily_change(close: float, ref_close: float | None, stored: float) -> float:
+    """The session's move computed from two stored closes.
+
+    The stored ``$change`` is the vendor's own pct field, and it disagrees with
+    the prices on ex-dividend rows: sz300980 on 2026-09-30 stored -30.2% against
+    an actual -3.0%, which reads as limit-down and blocks a sell that the market
+    would have filled. Two closes from the same store cannot disagree with each
+    other, so the ratio wins whenever both are usable.
+    """
+    if ref_close is None or not (ref_close > 0) or not (close > 0):
+        return stored
+    return close / ref_close - 1.0
+
+
+def _price_row(pdata: dict, symbol: str, st_names: set[str]) -> dict:
+    """Turn one fetched qlib row into the record settle consumes.
+
+    qlib's ``$close`` is normalised (IPO day = 1.0); dividing by ``$factor``
+    recovers the CNY price used for NAV and sizing. The move comes from two
+    closes rather than the stored ``$change``, see ``_daily_change``.
+    """
+    raw_factor = pdata.get("factor")
+    if raw_factor is None:
+        # Price may be normalised but real CNY cannot be recovered. Do not
+        # claim "adjusted": the sanity gate has to see this.
+        logger.warning(
+            "Factor missing for %s, using raw qlib close=%.4f", symbol, pdata["close"],
+        )
+        factor = 1.0
+        adjusted = False
+    else:
+        factor = max(raw_factor, 1e-8)
+        adjusted = True
+    return {
+        "close": pdata["close"] / factor,
+        "change": _daily_change(pdata["close"], pdata.get("ref_close"), pdata["change"]),
+        "volume": pdata["volume"],
+        "factor": raw_factor if raw_factor is not None else 1.0,
+        "adjusted": adjusted,
+        "threshold": get_limit_threshold(symbol, st_names),
+    }
+
+
 def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
     """Fetch universe, prices, benchmarks, industry map.  Return 2 on qlib import failure."""
     try:
@@ -783,13 +826,14 @@ qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
 from qlib.data import D
 syms = json.loads(sys.argv[1])
 td = sys.argv[2]
-raw = D.features(instruments=syms, fields=["$close","$change","$volume","$factor"],
+raw = D.features(instruments=syms, fields=["$close","Ref($close,1)","$change","$volume","$factor"],
                  start_time=td, end_time=td)
 if raw is not None and not raw.empty:
     out = {}
     for idx, row in raw.iterrows():
         inst = idx[0] if isinstance(idx, tuple) else str(idx)
-        out[str(inst)] = {"close": float(row.get("$close",0)), "change": float(row.get("$change",0)),
+        out[str(inst)] = {"close": float(row.get("$close",0)), "ref_close": float(row.get("Ref($close,1)",0)),
+                          "change": float(row.get("$change",0)),
                           "volume": float(row.get("$volume",0)), "factor": float(row.get("$factor",1.0))}
     print(json.dumps(out))
 else:
@@ -813,28 +857,7 @@ else:
                             break
                     # qlib $close is normalized (IPO day=1.0); divide by $factor
                     # to recover actual CNY price for NAV and order sizing.
-                    _raw_factor = pdata.get("factor")
-                    if _raw_factor is None:
-                        # Factor missing: price may be normalized but we
-                        # cannot recover real CNY. Log warning, do NOT set
-                        # adjusted=True so the sanity gate can flag it.
-                        logger.warning(
-                            "Factor missing for %s, using raw qlib close=%.4f",
-                            matched, pdata["close"],
-                        )
-                        _factor = 1.0
-                        _adjusted = False
-                    else:
-                        _factor = max(_raw_factor, 1e-8)
-                        _adjusted = True
-                    ctx.prices[matched] = {
-                        "close": pdata["close"] / _factor,
-                        "change": pdata["change"],
-                        "volume": pdata["volume"],
-                        "factor": _raw_factor if _raw_factor is not None else 1.0,
-                        "adjusted": _adjusted,
-                        "threshold": get_limit_threshold(matched, ctx.st_names),
-                    }
+                    ctx.prices[matched] = _price_row(pdata, matched, ctx.st_names)
                 logger.info("fetched %d prices via subprocess", len(ctx.prices))
             else:
                 logger.warning("D.features subprocess failed: rc=%d stderr=%s",

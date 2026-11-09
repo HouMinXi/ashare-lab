@@ -455,7 +455,8 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, "
+                    "nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "tra":
@@ -523,7 +524,8 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, "
+                    "nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "densemble":

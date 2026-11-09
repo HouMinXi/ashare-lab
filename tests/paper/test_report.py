@@ -456,7 +456,15 @@ def test_deliver_report_bridge_partial_failure(mock_bridge, db_conn):
     mock_bridge.side_effect = [True, False]
     with patch("ashare_lab.paper.report.send_serverchan", return_value=True), \
          patch("ashare_lab.paper.report._get_secret", return_value="sc_token"):
-        cfg = {"paper": {"report": {"delivery_channel": "alert_bridge", "ilink_max_message_length": 10, "fallback_service": "serverchan"}}}
+        cfg = {
+            "paper": {
+                "report": {
+                    "delivery_channel": "alert_bridge",
+                    "ilink_max_message_length": 10,
+                    "fallback_service": "serverchan",
+                }
+            }
+        }
         assert deliver_report(db_conn, "2025-01-06", "simple", "A" * 15, cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "serverchan"
@@ -489,7 +497,10 @@ def test_bridge_send_necessary(mock_bridge, db_conn):
         cfg2 = {"paper": {"report": {"delivery_channel": "alert_bridge", "fallback_service": "serverchan"}}}
         result = deliver_report(db_conn, "2025-01-07", "simple", "text", cfg2)
         assert result == "sent"
-        r2 = db_conn.execute("SELECT * FROM reports WHERE trade_date='2025-01-07' ORDER BY created_at DESC LIMIT 1").fetchone()
+        r2 = db_conn.execute(
+            "SELECT * FROM reports WHERE trade_date='2025-01-07' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
         assert r2["delivered_via"] == "serverchan"
 
 

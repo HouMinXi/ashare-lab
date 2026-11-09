@@ -31,16 +31,18 @@ ashare-attribution = "ashare_lab.research.attribution:main"
 include = ["ashare_lab*"]
 
 [tool.ruff]
-line-length = 100
+# The code holds 120; the old 100 was never enforced because E501 was not
+# selected, so every line between the two was silently over the stated limit.
+line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
 # The gate covers what the tree is already clean at: real errors, undefined
-# names, whitespace, and stale `# noqa` comments. Import order (I) is left out
-# on purpose -- it would rewrite nearly every file in one blind commit, and it
-# is churn rather than correctness. Apply it to a file when that file is being
-# edited anyway.
-select = ["E4", "E7", "E9", "F", "W", "RUF100"]
+# names, whitespace, stale `# noqa` comments, and the column limit. Import order
+# (I) is left out on purpose -- it would rewrite nearly every file in one blind
+# commit, and it is churn rather than correctness. Apply it to a file when that
+# file is being edited anyway.
+select = ["E4", "E7", "E9", "F", "W", "RUF100", "E501"]
 
 [tool.ruff.lint.per-file-ignores]
 # These set environment or sys.path before importing the package, which is the

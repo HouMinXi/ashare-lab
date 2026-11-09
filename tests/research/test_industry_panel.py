@@ -149,7 +149,8 @@ def test_autocorrelation_reads_continuation_as_positive(tmp_path):
         for i in range(1, n):
             r[i] = 0.9 * r[i - 1] + noise[i]
         series[name] = r
-    wide = pd.DataFrame(series, index=[f"2026-{m:02d}-{d:02d}" for m, d in [(1 + i // 28, 1 + i % 28) for i in range(n)]])
+    index = [f"2026-{m:02d}-{d:02d}" for m, d in ((1 + i // 28, 1 + i % 28) for i in range(n))]
+    wide = pd.DataFrame(series, index=index)
     panel = (
         wide.reset_index()
         .melt(id_vars="index", var_name="industry", value_name="mean_ret")

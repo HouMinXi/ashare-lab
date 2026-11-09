@@ -212,9 +212,14 @@ def test_ic_step_subprocess_timeout(tmp_path):
     ctx.steps = None
     ctx.trade_date = trade_date
     ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", side_effect=SignalQualityError("subprocess timeout")), \
-         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False):
+    with (
+        patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path),
+        patch(
+            "ashare_lab.paper.signal_quality.compute_forward_returns",
+            side_effect=SignalQualityError("subprocess timeout"),
+        ),
+        patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False),
+    ):
         signal_quality_ic_step(ctx)
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_error" in sidecar
@@ -257,9 +262,14 @@ def test_ic_step_insufficient_rolling_window(tmp_path):
     ctx.steps = None
     ctx.trade_date = trade_date
     ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert:
+    with (
+        patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path),
+        patch(
+            "ashare_lab.paper.signal_quality.compute_forward_returns",
+            return_value=pd.Series([0.01] * 100, index=instruments),
+        ),
+        patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert,
+    ):
         signal_quality_ic_step(ctx)
     mock_alert.assert_not_called()
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())

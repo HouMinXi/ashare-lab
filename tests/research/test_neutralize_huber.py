@@ -4,7 +4,8 @@ Tests cover:
 1. G-Huber-1 (Outlier Immunity): 50-sigma outlier contamination; Huber beta error < 0.05 vs OLS failure.
 2. G-Huber-2 (Normal Parity): Clean Gaussian data; Spearman rank correlation > 0.999 between Huber and OLS residuals.
 3. Fallback on Pathological Input: Constant / collinear input; graceful degradation to OLS without crashing.
-4. neutralize_predictions integration: MultiIndex DataFrame/Series end-to-end output schema, NaN handling, < _MIN_INSTRUMENTS passthrough.
+4. neutralize_predictions integration: MultiIndex DataFrame/Series end-to-end
+   output schema, NaN handling, < _MIN_INSTRUMENTS passthrough.
 5. Diagnostic logging: Verification that log messages are emitted when >10% instruments are downweighted.
 """
 

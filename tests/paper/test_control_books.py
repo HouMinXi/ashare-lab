@@ -399,9 +399,16 @@ class TestRunBookBPhase1Phase2:
         ctx = self._make_ctx(tmp_path, d2, pred_path)
 
         # Patch next_trading_day to return d3, and generate_signals to return fixed data
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals",
-                                 return_value={"SH600519": 0.8, "SH600520": 0.7}):
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8, "SH600520": 0.7},
+            ),
+        ):
             _run_book_b(ctx)
 
         # Debug: check all orders
@@ -466,8 +473,16 @@ class TestRunBookBPhase1Phase2:
         pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
 
         ctx = self._make_ctx(tmp_path, d2, pred_path)
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}) as mock_gs:
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8},
+            ) as mock_gs,
+        ):
             _run_book_b(ctx)
 
         mock_gs.assert_called_once_with(d2, pred_path=ctx.pred_path)
@@ -503,8 +518,16 @@ class TestRunBookBPhase1Phase2:
 
         ctx = self._make_ctx(tmp_path, d2, pred_path)
 
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8},
+            ),
+        ):
             _run_book_b(ctx)
 
         # Verify: no d2 orders to settle, but d3 orders generated

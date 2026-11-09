@@ -200,7 +200,11 @@ def signal_quality_psi_step(ctx: DailyRunContext) -> None:
             else:
                 if not send_bridge_alert(
                     title="ashare SIG: PSI",
-                    body=f"PSI {psi:.3f} > {_PSI_THRESHOLD} on {pred_date} (ref {_REFERENCE_DAYS}d, {_N_BUCKETS} buckets). Distribution drift tripwire.",
+                    body=(
+                        f"PSI {psi:.3f} > {_PSI_THRESHOLD} on {pred_date} "
+                        f"(ref {_REFERENCE_DAYS}d, {_N_BUCKETS} buckets). "
+                        "Distribution drift tripwire."
+                    ),
                     timeout=10,
                 ):
                     log.error("PSI alert send failed (returned False)")

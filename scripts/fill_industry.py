@@ -91,7 +91,11 @@ for sym, bs_code in remaining[:BATCH_SIZE]:
     processed += 1
     if processed % 100 == 0:
         elapsed = time.time() - t0
-        print(f"  {processed}/{min(BATCH_SIZE, len(remaining))} ({len(new_rows)} matched, {timeouts} timeout) {elapsed:.0f}s", flush=True)
+        print(
+            f"  {processed}/{min(BATCH_SIZE, len(remaining))} "
+            f"({len(new_rows)} matched, {timeouts} timeout) {elapsed:.0f}s",
+            flush=True,
+        )
 
 signal.alarm(0)
 bs.logout()
