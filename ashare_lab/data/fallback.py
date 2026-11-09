@@ -15,8 +15,10 @@ import csv as csv_mod
 import datetime as dt
 import logging
 import os
+import socket
 import struct
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -203,6 +205,44 @@ def _fetch_symbol(
         except (ValueError, TypeError) as exc:
             log.debug("skipping %s %s: parse error %s", symbol, date_, exc)
     return rows
+
+
+@contextmanager
+def _socket_deadline(seconds: float):
+    """Give sockets created inside this block a fixed read timeout.
+
+    baostock talks over a raw TCP session with no timeout of its own. A stalled
+    session blocks a query forever -- measured once at 2h22m with one second of
+    CPU and an established connection carrying nothing -- and every caller of
+    gap_fill inherits that hang, including the nightly pipeline. The default is
+    restored on exit; sockets created inside keep the deadline they were given.
+    """
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(previous)
+
+
+def _fetch_all_with_deadline(*args, seconds: float | None = None, **kwargs):
+    """ ``_fetch_all`` under a socket deadline, with a readable failure.
+
+    A raw ``socket.timeout`` from inside baostock says nothing about which stage
+    stalled; the caller gets the timeout value and the symbol count instead.
+    """
+    if seconds is None:
+        from ashare_lab.config import load_config
+
+        seconds = float(load_config().get("fallback", {}).get("socket_timeout_s", 30))
+    try:
+        with _socket_deadline(seconds):
+            return _fetch_all(*args, **kwargs)
+    except (socket.timeout, TimeoutError) as exc:
+        raise RuntimeError(
+            f"baostock query timed out after {seconds:.0f}s; "
+            "the session is stalled, not slow"
+        ) from exc
 
 
 def _fetch_all(
@@ -762,7 +802,9 @@ def gap_fill(
         session_refresh_n,
     )
 
-    data = _fetch_all(symbols, missing[0], missing[-1], session_refresh_n)
+    data = _fetch_all_with_deadline(
+        symbols, missing[0], missing[-1], session_refresh_n,
+    )
 
     # Every row has to land on the store's own basis before it is written.
     anchored: dict[str, pd.DataFrame] = {}
@@ -911,7 +953,7 @@ def backfill_stale_indexes(
     # whole set about two, inside the ~30s baostock idle timeout. One login
     # covers the batch.
     symbols = sorted(stale)
-    data = _fetch_all(symbols, start, target, len(symbols), index=True)
+    data = _fetch_all_with_deadline(symbols, start, target, len(symbols), index=True)
     if not data:
         log.warning("index backfill: no rows returned for %s", sorted(stale))
         return []

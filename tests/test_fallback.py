@@ -1664,3 +1664,39 @@ def test_a_failed_bin_write_leaves_the_calendar_untouched(tmp_path):
             fb._dump_bin_update(csv_dir, provider)
 
     assert (provider / "calendars" / "day.txt").read_text(encoding="utf-8") == "2024-02-29\n"
+
+
+class TestSocketDeadline:
+    """A stalled baostock session must fail loudly instead of blocking forever."""
+
+    def test_a_socket_created_inside_the_block_carries_the_deadline(self):
+        import socket
+
+        from ashare_lab.data.fallback import _socket_deadline
+
+        before = socket.getdefaulttimeout()
+        with _socket_deadline(3):
+            probe = socket.socket()
+            assert probe.gettimeout() == 3, "the session socket inherits the default"
+            probe.close()
+        assert socket.getdefaulttimeout() == before, "the process default is restored"
+
+    def test_a_timeout_becomes_a_readable_failure(self):
+        import socket
+
+        from ashare_lab.data import fallback as fb
+
+        with patch.object(fb, "_fetch_all", side_effect=socket.timeout("stalled")):
+            with pytest.raises(RuntimeError, match="timed out"):
+                fb._fetch_all_with_deadline(["SH600000"], "2024-03-01", "2024-03-01", 50, seconds=2)
+
+    def test_the_default_is_restored_even_when_the_fetch_explodes(self):
+        import socket
+
+        from ashare_lab.data import fallback as fb
+
+        before = socket.getdefaulttimeout()
+        with patch.object(fb, "_fetch_all", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                fb._fetch_all_with_deadline(["SH600000"], "2024-03-01", "2024-03-01", 50, seconds=2)
+        assert socket.getdefaulttimeout() == before
