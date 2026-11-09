@@ -21,7 +21,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from ashare_lab.data.adjust import PrevState, next_factor, scale_prices
 from ashare_lab.data.calendar import trading_days_between
+from ashare_lab.data.store_state import last_state
 from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
 log = logging.getLogger(__name__)
@@ -29,9 +31,13 @@ log = logging.getLogger(__name__)
 # Fallback default when pipeline.yaml is unavailable
 _DEFAULT_SESSION_REFRESH_N = 50
 
-# baostock adjustflag=1 means qfq (forward-adjusted prices)
-_BAOSTOCK_ADJUST_FLAG = "1"
-_BAOSTOCK_FIELDS = "date,open,high,low,close,volume,pctChg,adjustfactor"
+# baostock adjustflag=3 is the unadjusted price, and that is what this path
+# wants: the store keeps front-adjusted values, and the factor that turns one
+# into the other is derived from the previous stored row (see _to_store_basis).
+# Asking for adjustflag=1 returns 后复权, which is a different series, and asking
+# for the field `adjustfactor` is rejected outright (10004012).
+_BAOSTOCK_ADJUST_FLAG = "3"
+_BAOSTOCK_FIELDS = "date,open,high,low,close,volume,pctChg,preclose"
 # An index has no adjustment factor and baostock rejects the field for one.
 _INDEX_FIELDS = "date,open,high,low,close,volume,pctChg"
 _BAOSTOCK_FREQ = "d"
@@ -164,9 +170,9 @@ def _fetch_symbol(
             row = rs.get_row_data()
             if index:
                 date_, open_, high_, low_, close_, vol_, pct_ = row
-                adj_ = None
+                pre_ = ""
             else:
-                date_, open_, high_, low_, close_, vol_, pct_, adj_ = row
+                date_, open_, high_, low_, close_, vol_, pct_, pre_ = row
         except (ValueError, TypeError) as exc:
             log.debug("skipping %s row: field unpack error %s", symbol, exc)
             continue
@@ -182,12 +188,18 @@ def _fetch_symbol(
                     "low": float(low_),
                     "close": float(close_),
                     "volume": float(vol_),
-                    # adjustfactor=1.0 when unavailable (e.g. first listing day)
-                    "factor": float(adj_) if adj_ else 1.0,
+                    # Restated previous close: the anchor a corporate action is
+                    # measured against. None on a first listing day, which _to_store_basis
+                    # refuses rather than guessing a factor.
+                    "pre_close": float(pre_) if pre_ else None,
                     # pctChg is percentage; qlib 'change' is fractional return
                     "change": float(pct_) / 100.0 if pct_ else 0.0,
                 }
             )
+            if index:
+                # An index has no corporate actions, so its basis is the price
+                # itself. Stocks get theirs from _to_store_basis instead.
+                rows[-1]["factor"] = 1.0
         except (ValueError, TypeError) as exc:
             log.debug("skipping %s %s: parse error %s", symbol, date_, exc)
     return rows
@@ -259,6 +271,53 @@ def _fetch_all(
 # ---------------------------------------------------------------------------
 # CSV serialisation and qlib dump_bin
 # ---------------------------------------------------------------------------
+
+
+def _to_store_basis(df: pd.DataFrame, prev: PrevState) -> pd.DataFrame:
+    """Restate raw baostock rows on the store's front-adjusted basis.
+
+    The store holds ``close = raw * factor`` and the factor must stay continuous
+    with the row before it: ``factor_t = factor_(t-1) * raw_(t-1) / pre_close_t``
+    (see ``adjust.next_factor``). baostock gives raw prices and the restated
+    previous close, which is exactly the pair that formula needs. A row without
+    a previous close is refused -- a first listing day has no anchor, and
+    inventing ``factor = 1`` there would write a level break into the series.
+    """
+    rows: list[dict] = []
+    state = prev
+    for rec in df.sort_values("date").to_dict("records"):
+        pre_close = rec.get("pre_close")
+        if pre_close is None:
+            raise ValueError(f"{rec.get('date')}: row carries no previous close")
+        pre_close = float(pre_close)
+        if not (pre_close > 0):
+            raise ValueError(f"{rec.get('date')}: previous close is {pre_close}")
+        factor = next_factor(state, pre_close)
+        prices = scale_prices(
+            {
+                "open": float(rec["open"]),
+                "high": float(rec["high"]),
+                "low": float(rec["low"]),
+                "close": float(rec["close"]),
+            },
+            factor,
+        )
+        rows.append(
+            {
+                "date": rec["date"],
+                "open": prices["open"],
+                "high": prices["high"],
+                "low": prices["low"],
+                "close": prices["close"],
+                "volume": float(rec["volume"]),
+                "factor": factor,
+                # Raw close against the restated previous close: both plain
+                # prices, so a split cannot show up here as a return.
+                "change": float(rec["close"]) / pre_close - 1.0,
+            }
+        )
+        state = PrevState(close=prices["close"], factor=factor)
+    return pd.DataFrame(rows)
 
 
 def _write_csvs(data: dict[str, pd.DataFrame], dest: Path) -> int:
@@ -541,13 +600,13 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
             _extend_instrument_end_dates(inst_dir, _traded, latest_date)
             check_index_membership(inst_dir, latest_date)
         return
-    cal_size = cal_path.stat().st_size if cal_path.exists() else 0
-    with open(cal_path, "a", encoding="utf-8") as f:
-        for d in dates_to_add:
-            f.write(d + "\n")
-    if dates_to_add:
-        calendar = calendar + dates_to_add
-        cal_pos = {d: i for i, d in enumerate(calendar)}
+    # The calendar is appended after the bins, not before. A process that dies
+    # between the two would otherwise leave a date whose symbols have no rows,
+    # and every reader treats a calendar date as data that exists. If the append
+    # fails instead, the bins carry a tail the calendar does not name yet, which
+    # qlib ignores; the next successful append restores the alignment.
+    calendar = calendar + dates_to_add
+    cal_pos = {d: i for i, d in enumerate(calendar)}
 
     # Append binary data per instrument.
     count = 0
@@ -611,13 +670,12 @@ def _dump_bin_update(csv_dir: Path, provider_uri: Path) -> None:
             count += 1
 
     if not count:
-        # Nothing was written, so the dates appended above point at rows that do
-        # not exist. Put the calendar back the way it was: a retry must fail the
-        # same way rather than report success over missing data.
-        if dates_to_add:
-            with open(cal_path, "r+b") as f:
-                f.truncate(cal_size)
         raise RuntimeError("no instruments updated (feature dirs missing?)")
+
+    if dates_to_add:
+        with open(cal_path, "a", encoding="utf-8") as f:
+            for d in dates_to_add:
+                f.write(d + "\n")
 
     if new_dates:
         _extend_instrument_end_dates(inst_dir, traded_syms, max(new_dates))
@@ -705,6 +763,23 @@ def gap_fill(
     )
 
     data = _fetch_all(symbols, missing[0], missing[-1], session_refresh_n)
+
+    # Every row has to land on the store's own basis before it is written.
+    anchored: dict[str, pd.DataFrame] = {}
+    unanchored: list[str] = []
+    for symbol, frame in data.items():
+        state = last_state(provider_uri, symbol.lower())
+        if state is None:
+            unanchored.append(symbol)
+            continue
+        anchored[symbol] = _to_store_basis(frame, state[0])
+    if unanchored:
+        log.warning(
+            "gap-fill: %d symbol(s) have no stored row to anchor a factor on, skipped: %s",
+            len(unanchored),
+            unanchored[:5],
+        )
+    data = anchored
 
     if not data:
         log.warning(

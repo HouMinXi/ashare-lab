@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from ashare_lab.data.adjust import PrevState
 from ashare_lab.data.fallback import (
     _CSV_COLUMNS,
     _all_instruments,
@@ -204,7 +205,8 @@ class TestFetchSymbol:
         row = rows[0]
         assert row["date"] == "2024-03-01"
         assert row["open"] == pytest.approx(12.5)
-        assert row["factor"] == pytest.approx(1.05)
+        assert row["pre_close"] == pytest.approx(1.05)
+        assert "factor" not in row, "the basis is derived, not taken from the vendor"
         assert row["change"] == pytest.approx(0.008)  # 0.8 / 100
 
     def test_suspended_empty_close_skipped(self):
@@ -221,12 +223,12 @@ class TestFetchSymbol:
         rows = _fetch_symbol(bs, "SZ000001", "2024-03-01", "2024-03-01")
         assert rows == []
 
-    def test_missing_adjustfactor_defaults_to_one(self):
+    def test_a_blank_previous_close_stays_none(self):
         bs = self._make_bs_mock(
             [("2024-03-01", "12.5", "12.8", "12.3", "12.6", "500000", "0.5", "")]
         )
         rows = _fetch_symbol(bs, "SZ000001", "2024-03-01", "2024-03-01")
-        assert rows[0]["factor"] == pytest.approx(1.0)
+        assert rows[0]["pre_close"] is None, "no anchor, so no factor may be invented"
 
     def test_missing_pct_change_defaults_to_zero(self):
         bs = self._make_bs_mock(
@@ -356,7 +358,7 @@ class TestGapFill:
                         "low": 12.3,
                         "close": 12.6,
                         "volume": 1e6,
-                        "factor": 1.0,
+                        "pre_close": 12.5,
                         "change": 0.008,
                     }
                 ]
@@ -394,6 +396,10 @@ class TestGapFill:
 
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
+                patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
                 patch("ashare_lab.data.fallback._dump_bin_update", side_effect=fake_dump),
             ):
                 result = gap_fill("2024-03-01", "2024-03-01", p)
@@ -405,6 +411,10 @@ class TestGapFill:
             p = self._make_provider(Path(tmp), [])
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
+                patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
                 patch("ashare_lab.data.fallback._dump_bin_update"),  # no-op, calendar unchanged
             ):
                 result = gap_fill("2024-03-01", "2024-03-01", p)
@@ -433,6 +443,10 @@ class TestGapFill:
             p = self._make_provider(Path(tmp), [])
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
+                patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
                 patch(
                     "ashare_lab.data.fallback._dump_bin_update",
                     side_effect=RuntimeError("dump failed"),
@@ -1001,11 +1015,13 @@ class TestFetchSymbolIndexMode:
         fields = bs.query_history_k_data_plus.call_args.kwargs["fields"]
         assert "adjustfactor" not in fields
 
-    def test_stock_request_keeps_adjustfactor(self):
+    def test_a_stock_request_asks_for_unadjusted_prices(self):
         bs = self._make_bs([])
         _fetch_symbol(bs, "SH600000", "2024-03-01", "2024-03-01")
-        fields = bs.query_history_k_data_plus.call_args.kwargs["fields"]
-        assert "adjustfactor" in fields
+        kwargs = bs.query_history_k_data_plus.call_args.kwargs
+        assert "preclose" in kwargs["fields"]
+        assert "adjustfactor" not in kwargs["fields"], "baostock rejects that field"
+        assert kwargs["adjustflag"] == "3", "raw prices; the store basis is derived"
 
     def test_index_row_carries_unit_factor(self):
         rows = [
@@ -1544,3 +1560,107 @@ class TestBinSlotAlignment:
 
         with pytest.raises(RuntimeError, match="truncated feature file"):
             _dump_bin_update(csv_dir, provider)
+
+class TestToStoreBasis:
+    """Raw vendor rows must land on the store's front-adjusted basis."""
+
+    def _frame(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_without_a_corporate_action_the_factor_is_unchanged(self):
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=10.0, factor=0.5)  # raw 20.0
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 20.0, "high": 20.5, "low": 19.5,
+                 "close": 20.2, "volume": 1e6, "pre_close": 20.0, "change": 0.01},
+            ]
+        )
+
+        out = _to_store_basis(frame, prev)
+
+        assert out.loc[0, "factor"] == pytest.approx(0.5)
+        assert out.loc[0, "close"] == pytest.approx(10.1)
+        assert out.loc[0, "change"] == pytest.approx(0.01)
+
+    def test_a_dividend_moves_the_factor_and_keeps_the_return_sane(self):
+        """A 5% ex-dividend gap: the raw price drops, the adjusted series does not."""
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=100.0, factor=1.0)
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 95.0, "high": 96.0, "low": 94.0,
+                 "close": 95.0, "volume": 1e7, "pre_close": 95.0, "change": 0.0},
+            ]
+        )
+
+        out = _to_store_basis(frame, prev)
+
+        assert out.loc[0, "factor"] == pytest.approx(100.0 / 95.0), "factor absorbs the dividend"
+        assert out.loc[0, "close"] == pytest.approx(100.0), "the adjusted series is continuous"
+        assert abs(out.loc[0, "change"]) < 1e-9
+
+
+    def test_a_row_without_a_previous_close_is_refused(self):
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=10.0, factor=1.0)
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 10.0, "high": 10.0, "low": 10.0,
+                 "close": 10.0, "volume": 1e6, "pre_close": None, "change": 0.0},
+            ]
+        )
+
+        with pytest.raises(ValueError, match="previous close"):
+            _to_store_basis(frame, prev)
+
+
+def test_a_failed_bin_write_leaves_the_calendar_untouched(tmp_path):
+    """The calendar must never name a date whose rows were not written.
+
+    A reader treats calendar presence as data freshness; an exception halfway
+    through the bins would otherwise leave a date that looks fresh and is empty.
+    """
+    import builtins
+
+    from ashare_lab.data import fallback as fb
+
+    provider = tmp_path / "p"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars" / "day.txt").write_text("2024-02-29\n", encoding="utf-8")
+    (provider / "instruments").mkdir()
+    (provider / "instruments" / "all.txt").write_text(
+        "SH600000 2015-01-01 2999-12-31\n", encoding="utf-8"
+    )
+    sym = provider / "features" / "sh600000"
+    sym.mkdir(parents=True)
+    body = struct.pack("<f", 0.0) + struct.pack("<f", 10.0)
+    for field in ("open", "high", "low", "close", "volume", "factor", "change"):
+        (sym / f"{field}.day.bin").write_bytes(body)
+
+    csv_dir = tmp_path / "csv"
+    csv_dir.mkdir()
+    (csv_dir / "SH600000.csv").write_text(
+        "date,open,high,low,close,volume,factor,change\n"
+        "2024-03-01,10.1,10.2,10.0,10.1,1000.0,1.0,0.01\n",
+        encoding="utf-8",
+    )
+
+    real_open = builtins.open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if str(file).endswith(".day.bin") and mode == "ab":
+            raise RuntimeError("disk full")
+        return real_open(file, mode, *args, **kwargs)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        with patch("builtins.open", failing_open):
+            fb._dump_bin_update(csv_dir, provider)
+
+    assert (provider / "calendars" / "day.txt").read_text(encoding="utf-8") == "2024-02-29\n"
