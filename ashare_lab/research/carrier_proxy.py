@@ -21,9 +21,12 @@ Pre-registered 2026-11-10, before any number was computed:
 The floors are not tuned after seeing results: IC_FLOOR is the same 0.02 the
 production IC monitor uses before it calls a signal real.
 
-Measured on the 2017-2026 industry panel: only the one-session variant clears
-(IC 0.0237, t 4.75, long-short +0.09%/session, which is under round-trip cost);
-five sessions is flat and twenty to sixty lean to reversal.
+Measured on the 2017-2026 industry panel: the one-session variant clears (IC
+0.0237, long-short +0.09%/session, under round-trip cost) and five sessions is flat
+(0.0036). The twenty- and sixty-session rows lean to reversal at -0.045 and reach
+significance only under a Newey-West estimator (t -2.78 and -2.40) rather than the
+n/h form used here (t -1.96 and -1.20); both are reported so the choice of
+estimator stays visible instead of being made after the fact.
 """
 
 from __future__ import annotations
