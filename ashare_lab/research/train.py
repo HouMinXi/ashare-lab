@@ -666,6 +666,7 @@ if __name__ == "__main__":
         get_live_window,
         get_window,
     )
+    from ashare_lab.research.windows import rebase_window
 
     parser = argparse.ArgumentParser(
         description="Walk-forward window training driver"
@@ -711,6 +712,29 @@ if __name__ == "__main__":
             "Train the live window instead: three rolling years ending on the "
             "last trading day, no held-out period, written as wlive.pt"
         ),
+    )
+    parser.add_argument(
+        "--train-end",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Move the window anchor: retrain with training data through this date. "
+            "Valid and test are re-derived from it; without it the scheduled "
+            "window is used unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--valid-months",
+        type=int,
+        default=None,
+        help="Length of the validation gap in months (default: the window's own).",
+    )
+    parser.add_argument(
+        "--test-months",
+        type=int,
+        default=None,
+        help="Length of the test span in months (default: the window's own).",
     )
     args = parser.parse_args()
 
@@ -774,6 +798,18 @@ if __name__ == "__main__":
     if not selected:
         log.error("empty window selection -- nothing to train")
         sys.exit(2)
+
+    if args.train_end or args.valid_months or args.test_months:
+        selected = [
+            rebase_window(w, args.train_end, args.valid_months, args.test_months)
+            for w in selected
+        ]
+        for w in selected:
+            log.info(
+                "rebased W%s: train %s..%s, valid %s..%s, test %s..%s",
+                w["window_id"], w["train_start"], w["train_end"],
+                w["valid_start"], w["valid_end"], w["test_start"], w["test_end"],
+            )
 
     # Train each window
     models_dir = args.exp_dir / "models"
