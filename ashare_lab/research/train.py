@@ -51,6 +51,7 @@ def _nvidia_smi_mem() -> int | None:
 # Alpha158 requires ~1 year of price history before the first train_start.
 # This constant is shared with smoke_test.py; both must use the same value.
 ALPHA158_WARMUP_START = "2017-01-01"
+CHECKPOINT_SUFFIXES = {"lgbm": ".pkl", "densemble": ".pkl", "alstm": ".pt", "tra": ".pt"}
 
 
 def apply_price_filter(
@@ -178,12 +179,17 @@ def train_window(
                 prediction scores AFTER price filter.
             label: MultiIndex Series (datetime, instrument) -> float,
                 next-period return labels for the test set.
+
+    Raises:
+        ValueError: The resolved score segment has no sample with finite raw
+            and learned labels, or the model configuration is unsupported.
     """
     # mlflow >=2.x deprecated the filesystem tracking backend used by qlib's
     # experiment recorder.  Set the opt-out flag before any qlib/mlflow import
     # so the file store remains usable until a tracking backend migration is done.
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
+    import numpy as np
     import qlib
     from qlib.config import REG_CN
     from qlib.contrib.data.handler import Alpha158, Alpha360
@@ -231,10 +237,9 @@ def train_window(
     cfg_model = load_config().get("model", {})
     model_type = cfg_model.get("type", "lgbm").lower()
 
-    VALID_MODEL_TYPES = {"lgbm", "alstm", "tra", "densemble"}
-    if model_type not in VALID_MODEL_TYPES:
+    if model_type not in CHECKPOINT_SUFFIXES:
         raise ValueError(
-            f"unknown model.type={model_type!r}, expected one of {sorted(VALID_MODEL_TYPES)}"
+            f"unknown model.type={model_type!r}, expected one of {sorted(CHECKPOINT_SUFFIXES)}"
         )
 
     effective_seed = seed if seed is not None else 42
@@ -252,11 +257,8 @@ def train_window(
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
             {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-            # Scope Fillna to features only (NOT labels):
-            #   - Labels are already clean after DropnaLabel + CSZScoreNorm.
-            #   - Unscoped Fillna would silently replace NaN labels with 0
-            #     (the median after z-score), corrupting degenerate training
-            #     samples instead of surfacing the error.
+            # Fill features only. Normalizing constant labels can leave NaNs;
+            # replacing them with zero would hide unusable training samples.
             # ALSTM fix: NaN features -> NaN predictions -> NaN IC ->
             #   best_param never assigned -> UnboundLocalError at model load.
         ]
@@ -288,49 +290,21 @@ def train_window(
         "test": resolve_test_segment(window),
     }
 
-    # Determine seq_len for time-series models (TRA/ALSTM).
-    # Tabular models (lgbm, densemble) have no sequence requirement.
-    _seq_len = 0
-    if model_type == "alstm":
-        _seq_len = cfg_model.get("step_len", 20)
-    elif model_type == "tra":
-        _seq_len = cfg_model.get("step_len", 60)
-
-    # Extend test segment backward so every date in [test_start, test_end]
-    # has a full seq_len lookback inside the segment.  Without this,
-    # MTSDatasetH/TSDatasetH yield zero test sequences when the test span
-    # is shorter than seq_len, and pytorch_tra.py:322 crashes with
-    # KeyError: 'MSE' on the empty metrics frame after all epochs finish.
-    true_test_start = window["test_start"]
-    if _seq_len > 0:
-        from qlib.data import D as _D
-
-        _cal = _D.calendar(
-            start_time=ALPHA158_WARMUP_START,
-            end_time=window["test_end"],
+    # Check only scoring endpoints, not the history used by time-series samplers.
+    # Alpha360 can fill missing raw labels, and normalization can leave NaN labels.
+    score_dates = slice(*segs["test"])
+    learned = handler.fetch(score_dates, col_set="label", data_key="learn").iloc[:, 0]
+    raw = handler.fetch(score_dates, col_set="label", data_key="raw").iloc[:, 0]
+    if not (np.isfinite(learned) & np.isfinite(raw.reindex(learned.index))).any():
+        raise ValueError(
+            f"test segment has no labelled samples: {segs['test'][0]}..{segs['test'][1]}; "
+            "no finite forward label remains after preprocessing"
         )
-        _cal = sorted(_cal)
-        # Find the index of test_start in the calendar.
-        _test_start_idx = None
-        for _i, _d in enumerate(_cal):
-            if str(_d)[:10] >= true_test_start:
-                _test_start_idx = _i
-                break
-        if _test_start_idx is not None and _test_start_idx >= _seq_len:
-            _extended = _cal[_test_start_idx - _seq_len]
-            _extended_str = str(_extended)[:10]
-            if _extended_str < true_test_start:
-                segs["test"] = (_extended_str, window["test_end"])
-                log.info(
-                    "W%s: test segment extended %s -> %s (seq_len=%d warmup)",
-                    window_id, _extended_str, true_test_start, _seq_len,
-                )
-        else:
-            log.warning(
-                "W%s: cannot extend test warmup (test_start_idx=%s, seq_len=%d); "
-                "crash may still occur on short test spans",
-                window_id, _test_start_idx, _seq_len,
-            )
+
+    # Time-series datasets retain the full handler history. Their segments
+    # select output samples, not the feature lookback. Extending the test
+    # segment here would add validation rows to the model's test metric.
+    true_test_start = window["test_start"]
 
     if model_type == "alstm":
         step_len = cfg_model.get("step_len", 20)
@@ -531,8 +505,6 @@ def train_window(
     elif model_type == "densemble":
         from qlib.contrib.model.double_ensemble import DEnsembleModel
 
-        import numpy as np
-
         # DEnsembleModel has no seed param; best-effort via global np.random.seed.
         # Safe only under subprocess isolation (one train_window call per process).
         np.random.seed(effective_seed)
@@ -582,13 +554,11 @@ def train_window(
     # Persist model.  TRA and ALSTM use torch.save; LGB uses pickle.
     models_dir = exp_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"w{window_id}{CHECKPOINT_SUFFIXES[model_type]}"
     if model_type in ("alstm", "tra"):
         import torch
-
-        model_path = models_dir / f"w{window_id}.pt"
         torch.save(model, str(model_path))
     else:
-        model_path = models_dir / f"w{window_id}.pkl"
         model.to_pickle(path=str(model_path))
     log.info("W%s: model saved -> %s", window_id, model_path)
 
@@ -658,7 +628,11 @@ def train_window(
 
 if __name__ == "__main__":
     import argparse
+    import hashlib
+    import json
     import sys
+
+    from ashare_lab.config import load_config
 
     # Deferred import to avoid circular dependency (smoke_test imports train)
     from ashare_lab.research.smoke_test import (
@@ -674,8 +648,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--exp-dir",
         type=Path,
-        default=Path(__file__).resolve().parent.parent.parent,
-        help="Experiment output directory (default: repo root)",
+        default=None,
+        help="Experiment output directory (required for date overrides; otherwise repo root)",
     )
     parser.add_argument(
         "--windows",
@@ -728,15 +702,26 @@ if __name__ == "__main__":
         "--valid-months",
         type=int,
         default=None,
-        help="Length of the validation gap in months (default: the window's own).",
+        help="Validation calendar months (default: walk_forward.step_months).",
     )
     parser.add_argument(
         "--test-months",
         type=int,
         default=None,
-        help="Length of the test span in months (default: the window's own).",
+        help="Test calendar months (default: walk_forward.step_months).",
     )
     args = parser.parse_args()
+    rebased = any(value is not None for value in (args.train_end, args.valid_months, args.test_months))
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    if rebased:
+        if args.live or args.serve_now is not None:
+            parser.error("date overrides are research-only; --live and --serve-now cannot be rebased")
+        if args.exp_dir is None or args.exp_dir.resolve() == repo_root:
+            parser.error("date overrides require --exp-dir outside the repository root output")
+        if not args.windows or not args.windows.strip() or len(args.windows.split(",")) != 1:
+            parser.error("date overrides require exactly one explicit --windows ID")
+    if args.exp_dir is None:
+        args.exp_dir = repo_root
 
     if args.serve_now is not None and args.windows:
         log.error("--serve-now and --windows are mutually exclusive")
@@ -799,25 +784,56 @@ if __name__ == "__main__":
         log.error("empty window selection -- nothing to train")
         sys.exit(2)
 
-    if args.train_end or args.valid_months or args.test_months:
-        selected = [
-            rebase_window(w, args.train_end, args.valid_months, args.test_months)
-            for w in selected
-        ]
-        for w in selected:
-            log.info(
-                "rebased W%s: train %s..%s, valid %s..%s, test %s..%s",
-                w["window_id"], w["train_start"], w["train_end"],
-                w["valid_start"], w["valid_end"], w["test_start"], w["test_end"],
-            )
+    experiment_contract = None
+    experiment_root = args.exp_dir.resolve()
+    if rebased:
+        source_window_id = selected[0]["window_id"]
+        window = rebase_window(selected[0], args.train_end, args.valid_months, args.test_months)
+        experiment_contract = {
+            "source_window_id": source_window_id,
+            "window": window,
+            "universe": args.universe,
+            "config": load_config(),
+        }
+        digest = hashlib.sha256(json.dumps(experiment_contract, sort_keys=True).encode()).hexdigest()[:16]
+        window["window_id"] = f"experiment-{digest}"
+        args.exp_dir = experiment_root / f"experiment-{digest}"
+        selected = [window]
+        log.info(
+            "rebased W%s: train %s..%s, valid %s..%s, test %s..%s",
+            window["window_id"], window["train_start"], window["train_end"],
+            window["valid_start"], window["valid_end"], window["test_start"], window["test_end"],
+        )
 
-    # Train each window
+    # Train each window. Reusing an experiment cannot change its provenance.
+    model_type = load_config().get("model", {}).get("type", "lgbm").lower()
+    if model_type not in CHECKPOINT_SUFFIXES:
+        parser.error(f"unknown model.type={model_type!r}")
+    suffix = CHECKPOINT_SUFFIXES[model_type]
     models_dir = args.exp_dir / "models"
+    if experiment_contract is not None:
+        manifest = models_dir / f"w{selected[0]['window_id']}.window.json"
+        checkpoint = models_dir / f"w{selected[0]['window_id']}{suffix}"
+        existing_outputs = list(models_dir.iterdir()) if models_dir.is_dir() else []
+        for path in (args.exp_dir, models_dir, manifest, checkpoint, *existing_outputs):
+            if path.is_symlink() or path.is_junction() or not path.resolve().is_relative_to(experiment_root):
+                raise ValueError(f"experiment output alias is not allowed: {path}")
+            if path.is_file() and path.stat().st_nlink > 1:
+                raise ValueError(f"experiment output alias is not allowed: {path}")
+        if manifest.exists():
+            if json.loads(manifest.read_text(encoding="utf-8")) != experiment_contract:
+                raise ValueError("existing experiment contract does not match; use a new output root")
+        elif checkpoint.exists():
+            raise ValueError("existing experiment checkpoint has no contract; use a new output root")
+        else:
+            models_dir.mkdir(parents=True, exist_ok=True)
+            with manifest.open("x", encoding="utf-8") as record:
+                record.write(json.dumps(experiment_contract, indent=2, sort_keys=True) + "\n")
     models_dir.mkdir(parents=True, exist_ok=True)
     trained = 0
     for window in selected:
         wid = window["window_id"]
-        model_path = models_dir / f"w{wid}.pt"
+        model_path = models_dir / f"w{wid}{suffix}"
         if model_path.exists() and not args.force:
             log.info("W%s: model exists, skipping (use --force to re-train)", wid)
             continue

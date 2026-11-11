@@ -123,6 +123,7 @@ sync_code_to_gpu() {
     # that predated --serve-now by three months.
     cp "$REPO/ashare_lab/research/train.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/smoke_test.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/windows.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/model_meta.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
     # matrix_runner and matrix configs may not exist on fresh deploys.

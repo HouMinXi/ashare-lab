@@ -93,6 +93,42 @@ def write_model_meta(
         log.error("failed to write model meta %s: %s", meta_path, exc)
 
 
+def _read_descriptor_file(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    if not path.exists():
+        return None, "absent"
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        return None, "unreadable"
+    return (raw, None) if isinstance(raw, dict) else (None, "unreadable")
+
+
+def read_model_descriptor(model_path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """Read the single preferred descriptor, before freshness validation."""
+    target = model_path.resolve() if model_path.is_symlink() else model_path
+    stem_meta = target.parent / f"{target.stem}.meta.json"
+    meta_path = stem_meta if stem_meta.exists() else model_path.parent / "meta.json"
+    return _read_descriptor_file(meta_path)
+
+
+def has_research_identity(model_path: Path) -> bool:
+    """Inspect retained identity on both the selected entry and resolved target.
+
+    Freshness chooses one descriptor. Admission must not let that precedence
+    hide a research marker in another still-present descriptor or manifest.
+    """
+    for entry in dict.fromkeys((model_path, model_path.resolve())):
+        if entry.name.startswith("wexperiment-") or entry.with_suffix(".window.json").exists():
+            return True
+        for path in (entry.with_suffix(".meta.json"), entry.parent / "meta.json"):
+            descriptor, _ = _read_descriptor_file(path)
+            if descriptor is not None and any(
+                str(descriptor.get(key, "")).startswith("wexperiment-") for key in (_WINDOW_ID, _MODEL_FILE)
+            ):
+                return True
+    return False
+
+
 def read_model_meta(
     model_path: Path,
 ) -> tuple[Optional[dict], Optional[str]]:
@@ -110,20 +146,9 @@ def read_model_meta(
         Reasons: "absent", "unreadable", "train_date missing",
         "train_date unparseable", "train_date future", "mismatch".
     """
-    # Prefer the checkpoint's own meta file; fall back to the shared one.
-    target = model_path.resolve() if model_path.is_symlink() else model_path
-    stem_meta = target.parent / f"{target.stem}.meta.json"
-    meta_path = stem_meta if stem_meta.exists() else model_path.parent / "meta.json"
-    if not meta_path.exists():
-        return None, "absent"
-
-    try:
-        raw = json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None, "unreadable"
-
-    if not isinstance(raw, dict):
-        return None, "unreadable"
+    raw, reason = read_model_descriptor(model_path)
+    if raw is None:
+        return None, reason
 
     train_date_str = raw.get(_TRAIN_DATE)
     if train_date_str is None:

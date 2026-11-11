@@ -425,6 +425,13 @@ def _resolve_model_path(
                     )
                 model_path = fallback
 
+    # Inspect the selected identity after every automatic/explicit route. Both
+    # symlink targets and metadata-bearing copies are normal deployment layouts.
+    from ashare_lab.research.model_meta import has_research_identity
+
+    if has_research_identity(model_path):
+        raise ValueError("research-only checkpoint: scheduled prediction cannot reconstruct its fit contract")
+
     # A pinned model is a standing decision regardless of which branch
     # resolved the path, so judge it by content here, once.
     expected = cfg.get("research", {}).get("expected_live_model")

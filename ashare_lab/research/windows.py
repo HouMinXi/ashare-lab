@@ -1,13 +1,4 @@
-"""Window date arithmetic the training driver applies after window selection.
-
-`get_window` pins the schedule: a training span, a validation gap of `step_months`,
-then a test span of the same length. That shape cannot express the one experiment a
-regime question needs -- a model trained up to the present with a short validation
-gap and a test span that reaches today -- because the gap is fixed and the test
-start is anchored to it. `rebase_window` moves the anchor and re-derives the three
-segments from it.
-"""
-
+"""Re-anchor scheduled train, validation and test calendar spans."""
 from __future__ import annotations
 
 import datetime as dt
@@ -17,16 +8,6 @@ from dateutil.relativedelta import relativedelta
 from ashare_lab.config import load_config
 from ashare_lab.data.calendar import latest_trading_day
 
-MIN_VALID_MONTHS = 1
-
-
-def months_between(start: dt.date, end: dt.date) -> int:
-    """Whole months from start to end, rounded down."""
-    months = (end.year - start.year) * 12 + (end.month - start.month)
-    if end.day < start.day:
-        months -= 1
-    return max(months, 0)
-
 
 def rebase_window(
     window: dict,
@@ -34,41 +15,48 @@ def rebase_window(
     valid_months: int | None = None,
     test_months: int | None = None,
 ) -> dict:
-    """Re-derive valid and test segments from a new training end date.
+    """Move a training cutoff without silently changing default span lengths.
 
-    With no override the window is returned unchanged. A rolling configuration
-    moves train_start with the anchor so the span length in the recipe is kept; an
-    expanding configuration leaves train_start where it is.
+    Validation starts the following day. Each segment lasts the requested number
+    of calendar months, defaulting independently to walk_forward.step_months.
+    A rolling fit retains its configured years and earliest allowed start.
+    No overrides returns an unchanged copy, including the legacy completeness flag.
 
-    Raises:
-        ValueError: if valid_months is below one -- the trainer needs a validation
-        set for early stopping, and an empty segment fails deep inside qlib.
+    Raises ValueError for non-positive spans or a test that has not started yet.
+    Zero validation is not supported: early stopping requires validation samples.
     """
     if train_end is None and valid_months is None and test_months is None:
         return dict(window)
 
-    end = dt.date.fromisoformat(train_end) if train_end else dt.date.fromisoformat(window["train_end"])
-    span_months = (
-        months_between(dt.date.fromisoformat(window["train_end"]), dt.date.fromisoformat(window["valid_end"]))
-        or MIN_VALID_MONTHS
-    )
+    cfg = load_config()["walk_forward"]
+    vm = cfg["step_months"] if valid_months is None else valid_months
+    tm = cfg["step_months"] if test_months is None else test_months
+    if not isinstance(vm, int) or isinstance(vm, bool) or vm < 1:
+        raise ValueError("valid_months must be at least 1: the trainer needs a validation set")
+    if not isinstance(tm, int) or isinstance(tm, bool) or tm < 1:
+        raise ValueError("test_months must be a positive integer")
 
-    vm = span_months if valid_months is None else valid_months
-    tm = span_months if test_months is None else test_months
-    if vm < MIN_VALID_MONTHS:
-        raise ValueError(f"valid_months must be at least {MIN_VALID_MONTHS}: the trainer needs a validation set")
+    end = dt.date.fromisoformat(window["train_end"] if train_end is None else train_end)
+    valid_start = end + dt.timedelta(days=1)
+    test_start = valid_start + relativedelta(months=vm)
+    test_end_raw = test_start + relativedelta(months=tm) - dt.timedelta(days=1)
+    test_end = min(test_end_raw, latest_trading_day())
+    if test_end < test_start:
+        raise ValueError("test segment has not started: test_start is after the latest trading day")
 
     out = dict(window)
-    out["train_end"] = end.isoformat()
-    out["valid_start"] = (end + relativedelta(days=1)).isoformat()
-    out["valid_end"] = (end + relativedelta(months=vm)).isoformat()
-    out["test_start"] = (end + relativedelta(months=vm, days=1)).isoformat()
-    out["test_end"] = min(end + relativedelta(months=vm + tm), latest_trading_day()).isoformat()
-    out["is_complete"] = out["test_start"] <= out["test_end"]
-
-    cfg = load_config().get("walk_forward", {})
+    out.update(
+        train_end=end.isoformat(),
+        valid_start=valid_start.isoformat(),
+        valid_end=(test_start - dt.timedelta(days=1)).isoformat(),
+        test_start=test_start.isoformat(),
+        test_end=test_end.isoformat(),
+        is_complete=test_end == test_end_raw,
+    )
     years = cfg.get("train_window_years")
     if years:
         floor = dt.date.fromisoformat(cfg["train_start"])
         out["train_start"] = max(end - relativedelta(years=years), floor).isoformat()
+    if dt.date.fromisoformat(out["train_start"]) > end:
+        raise ValueError("train_start is after train_end")
     return out

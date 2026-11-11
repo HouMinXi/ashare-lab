@@ -5,7 +5,26 @@ import json
 from datetime import date, datetime, timedelta
 
 
-from ashare_lab.research.model_meta import read_model_meta, write_model_meta
+from ashare_lab.research.model_meta import read_model_descriptor, read_model_meta, write_model_meta
+
+
+def test_descriptor_keeps_research_identity_despite_missing_freshness(tmp_path):
+    model = tmp_path / "latest.pt"
+    model.write_bytes(b"non-loadable marker")
+    raw = {"model_file": "wexperiment-recorded.pt", "window_id": "wexperiment-recorded"}
+    (tmp_path / "latest.meta.json").write_text(json.dumps(raw))
+    descriptor, error = read_model_descriptor(model)
+    assert error is None
+    assert descriptor == raw
+    assert read_model_meta(model) == (None, "train_date missing")
+
+
+def test_non_unicode_metadata_is_unreadable(tmp_path):
+    model = tmp_path / "w11.pt"
+    model.write_bytes(b"marker")
+    (tmp_path / "w11.meta.json").write_bytes(bytes([255, 254]))
+    assert read_model_descriptor(model) == (None, "unreadable")
+    assert read_model_meta(model) == (None, "unreadable")
 
 
 # -- write_model_meta tests --
