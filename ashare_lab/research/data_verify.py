@@ -36,7 +36,7 @@ def verify_csi500_instruments(
         FileNotFoundError: if csi500.txt does not exist.
     """
     if provider_uri is None:
-        from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+        from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
         provider_uri = DEFAULT_PROVIDER_URI
 
@@ -92,11 +92,11 @@ def verify_sh000300_data(start_time: str, end_time: str) -> dict:
     Raises:
         RuntimeError: if zero rows are returned.
     """
-    import qlib  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.data import D  # noqa: PLC0415
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.data import D
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
     qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 

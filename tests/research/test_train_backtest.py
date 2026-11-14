@@ -178,7 +178,19 @@ def test_unknown_model_type_raises():
             train_mod.train_window(window, Path("/tmp/test_exp"), "csi1000")
 
 
-def test_densemble_dispatch():
+def _labelled_training_modules():
+    labels = _make_pred(["2021-07-01"], ["TEST"], [0.01]).to_frame("label")
+    alpha158 = mock.Mock()
+    alpha158.return_value.fetch.return_value = labels
+    dataset_h = mock.Mock()
+    dataset_h.return_value.prepare.return_value = labels
+    return {
+        "qlib.contrib.data.handler": mock.Mock(Alpha158=alpha158),
+        "qlib.data.dataset": mock.Mock(DatasetH=dataset_h),
+    }
+
+
+def test_densemble_dispatch(tmp_path):
     """model.type=densemble calls DEnsembleModel with expected params."""
     import ashare_lab.research.train as train_mod
 
@@ -198,29 +210,12 @@ def test_densemble_dispatch():
         ),
     )
 
-    mock_dataset_cls = mock.MagicMock()
-    mock_dataset_mod = mock.MagicMock()
-    mock_dataset_mod.DatasetH = mock_dataset_cls
-    mock_dataset_mod.TSDatasetH = mock.MagicMock()
-    mock_dataset_instance = mock.MagicMock()
-    mock_dataset_cls.return_value = mock_dataset_instance
-
-    # prepare returns a DataFrame with one label column
-    mock_dataset_instance.prepare.return_value = pd.DataFrame(
-        {"label": [0.01]},
-        index=pd.MultiIndex.from_tuples(
-            [(pd.Timestamp("2021-07-01"), "TEST")],
-            names=["datetime", "instrument"],
-        ),
-    )
-
     with mock.patch.dict("sys.modules", {
         "qlib": mock_qlib,
         "qlib.config": mock_qlib.config,
-        "qlib.contrib.data.handler": mock.MagicMock(),
+        **_labelled_training_modules(),
         "qlib.contrib.model.gbdt": mock.MagicMock(),
         "qlib.contrib.model.double_ensemble": mock_de_mod,
-        "qlib.data.dataset": mock_dataset_mod,
         "qlib.contrib.data.dataset": mock.MagicMock(),
         "ashare_lab.data.update": mock.MagicMock(),
     }), mock.patch(
@@ -240,7 +235,7 @@ def test_densemble_dispatch():
             "test_start": "2021-07-01", "test_end": "2021-12-31",
         }
         model_path, pred, label = train_mod.train_window(
-            window, Path("/tmp/test_exp"), "csi1000",
+            window, tmp_path, "csi1000",
         )
 
     # Verify DEnsembleModel was constructed with expected params
@@ -467,7 +462,7 @@ class TestRunFullWalkForward:
         )
 
 
-def test_meta_write_failure_is_fail_open():
+def test_meta_write_failure_is_fail_open(tmp_path):
     """write_model_meta raising must not crash training nor re-save the model.
 
     Regression: the except handler once re-invoked model.to_pickle (a stray
@@ -492,27 +487,12 @@ def test_meta_write_failure_is_fail_open():
         ),
     )
 
-    mock_dataset_cls = mock.MagicMock()
-    mock_dataset_mod = mock.MagicMock()
-    mock_dataset_mod.DatasetH = mock_dataset_cls
-    mock_dataset_mod.TSDatasetH = mock.MagicMock()
-    mock_dataset_instance = mock.MagicMock()
-    mock_dataset_cls.return_value = mock_dataset_instance
-    mock_dataset_instance.prepare.return_value = pd.DataFrame(
-        {"label": [0.01]},
-        index=pd.MultiIndex.from_tuples(
-            [(pd.Timestamp("2021-07-01"), "TEST")],
-            names=["datetime", "instrument"],
-        ),
-    )
-
     with mock.patch.dict("sys.modules", {
         "qlib": mock_qlib,
         "qlib.config": mock_qlib.config,
-        "qlib.contrib.data.handler": mock.MagicMock(),
+        **_labelled_training_modules(),
         "qlib.contrib.model.gbdt": mock.MagicMock(),
         "qlib.contrib.model.double_ensemble": mock_de_mod,
-        "qlib.data.dataset": mock_dataset_mod,
         "qlib.contrib.data.dataset": mock.MagicMock(),
         "ashare_lab.data.update": mock.MagicMock(),
     }), mock.patch(
@@ -535,14 +515,14 @@ def test_meta_write_failure_is_fail_open():
             "test_start": "2021-07-01", "test_end": "2021-12-31",
         }
         model_path, pred, label = train_mod.train_window(
-            window, Path("/tmp/test_exp"), "csi1000",
+            window, tmp_path, "csi1000",
         )
 
     # Meta-write failure must not re-save the model (regression guard).
     assert mock_de_instance.to_pickle.call_count == 1
 
 
-def test_meta_write_callsite_injection():
+def test_meta_write_callsite_injection(tmp_path):
     """Injection: deleting write_model_meta call in train_window must fail this.
 
     Verifies train_window actually invokes write_model_meta (integration level).
@@ -564,29 +544,14 @@ def test_meta_write_callsite_injection():
         ),
     )
 
-    mock_dataset_cls = mock.MagicMock()
-    mock_dataset_mod = mock.MagicMock()
-    mock_dataset_mod.DatasetH = mock_dataset_cls
-    mock_dataset_mod.TSDatasetH = mock.MagicMock()
-    mock_dataset_instance = mock.MagicMock()
-    mock_dataset_cls.return_value = mock_dataset_instance
-    mock_dataset_instance.prepare.return_value = pd.DataFrame(
-        {"label": [0.01]},
-        index=pd.MultiIndex.from_tuples(
-            [(pd.Timestamp("2021-07-01"), "TEST")],
-            names=["datetime", "instrument"],
-        ),
-    )
-
     mock_write = mock.MagicMock()
 
     with mock.patch.dict("sys.modules", {
         "qlib": mock_qlib,
         "qlib.config": mock_qlib.config,
-        "qlib.contrib.data.handler": mock.MagicMock(),
+        **_labelled_training_modules(),
         "qlib.contrib.model.gbdt": mock.MagicMock(),
         "qlib.contrib.model.double_ensemble": mock_de_mod,
-        "qlib.data.dataset": mock_dataset_mod,
         "qlib.contrib.data.dataset": mock.MagicMock(),
         "ashare_lab.data.update": mock.MagicMock(),
     }), mock.patch(
@@ -608,7 +573,7 @@ def test_meta_write_callsite_injection():
             "valid_start": "2021-01-01", "valid_end": "2021-06-30",
             "test_start": "2021-07-01", "test_end": "2021-12-31",
         }
-        train_mod.train_window(window, Path("/tmp/test_exp"), "csi1000")
+        train_mod.train_window(window, tmp_path, "csi1000")
 
     # Integration proof: train_window called write_model_meta
     assert mock_write.call_count == 1, (

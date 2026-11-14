@@ -199,7 +199,7 @@ async def test_send_text_ilink_headers_payload(mock_post):
         async def __aenter__(self): return self
         async def __aexit__(self, exc_type, exc, tb): pass
     mock_post.return_value = MockResp()
-    
+
     import aiohttp
     async with aiohttp.ClientSession() as session:
         await send_text_ilink(session, "tok", "chat", "txt")
@@ -456,7 +456,15 @@ def test_deliver_report_bridge_partial_failure(mock_bridge, db_conn):
     mock_bridge.side_effect = [True, False]
     with patch("ashare_lab.paper.report.send_serverchan", return_value=True), \
          patch("ashare_lab.paper.report._get_secret", return_value="sc_token"):
-        cfg = {"paper": {"report": {"delivery_channel": "alert_bridge", "ilink_max_message_length": 10, "fallback_service": "serverchan"}}}
+        cfg = {
+            "paper": {
+                "report": {
+                    "delivery_channel": "alert_bridge",
+                    "ilink_max_message_length": 10,
+                    "fallback_service": "serverchan",
+                }
+            }
+        }
         assert deliver_report(db_conn, "2025-01-06", "simple", "A" * 15, cfg) == "sent"
     r = db_conn.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT 1").fetchone()
     assert r["delivered_via"] == "serverchan"
@@ -489,7 +497,10 @@ def test_bridge_send_necessary(mock_bridge, db_conn):
         cfg2 = {"paper": {"report": {"delivery_channel": "alert_bridge", "fallback_service": "serverchan"}}}
         result = deliver_report(db_conn, "2025-01-07", "simple", "text", cfg2)
         assert result == "sent"
-        r2 = db_conn.execute("SELECT * FROM reports WHERE trade_date='2025-01-07' ORDER BY created_at DESC LIMIT 1").fetchone()
+        r2 = db_conn.execute(
+            "SELECT * FROM reports WHERE trade_date='2025-01-07' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
         assert r2["delivered_via"] == "serverchan"
 
 
@@ -572,3 +583,23 @@ def test_generate_and_send_report_skipped_returns_zero(mock_bridge, db_conn, pap
     # Second call: dedup -> skipped -> rc=0
     rc2 = generate_and_send_report("2025-01-06", db_conn, cfg)
     assert rc2 == 0
+
+
+def test_the_ic_monitor_line_reaches_the_report(dummy_report_data):
+    """The monitor is only useful if a human actually sees it."""
+    from ashare_lab.paper.report import format_chinese_report
+
+    text = format_chinese_report(
+        dummy_report_data, ic_section="IC 60日: 均值 -0.0010 | ICIR -0.004 | t(NW) -0.02"
+    )
+
+    assert "IC 60日" in text
+    assert "t(NW) -0.02" in text
+
+
+def test_no_ic_monitor_line_without_history(dummy_report_data):
+    from ashare_lab.paper.report import format_chinese_report
+
+    text = format_chinese_report(dummy_report_data, ic_section=None)
+
+    assert "IC 60日" not in text

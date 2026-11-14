@@ -3,7 +3,6 @@
 Each inject: modify code/config → assert test FAILS → revert → assert PASS.
 Run manually: pytest tests/paper/test_hedge_inject.py -v
 """
-import copy
 import pytest
 import yaml
 from ashare_lab.paper.hedge import (
@@ -83,7 +82,7 @@ def test_inject_3_wrong_threshold_blocks_activation():
     Correct threshold (0.03) would set days=1 → active.
     """
     NAV = 480_000  # DD = 4%
-    cfg = _default_config()
+
     bad_cfg = HedgeConfig(
         equity_ramp=[(0.05, 0.95), (0.15, 0.20)],
         legs=_make_legs(), activate_dd=0.05, min_equity_pct=0.20,

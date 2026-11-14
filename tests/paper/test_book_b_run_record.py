@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sqlite3
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +28,23 @@ from ashare_lab.paper.ledger import (
     insert_order,
 )
 from ashare_lab.paper.pipeline import _bootstrap_book_b, _run_book_b
+from tests.paper.ctx_factory import make_daily_ctx
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+
+
+@pytest.fixture(autouse=True)
+def _cd_tmp_path(tmp_path, monkeypatch):
+    """Keep artifact writes inside tmp_path.
+
+    These tests run the real _run_book_b, which writes the daily comparison
+    artifact to a relative path. Without this the suite drops fixture
+    artifacts into the real experiments/control_books/ directory whenever it
+    runs from a working checkout.
+    """
+    monkeypatch.chdir(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -36,65 +53,27 @@ from ashare_lab.paper.pipeline import _bootstrap_book_b, _run_book_b
 
 def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
     """Build a minimal DailyRunContext for _run_book_b tests."""
-    from ashare_lab.paper.pipeline import DailyRunContext
-
-    ctx = DailyRunContext.__new__(DailyRunContext)
-    ctx.trade_date = trade_date
-    ctx.db_path = tmp_path / "paper.db"
-    ctx.paper_cfg = {
-        "initial_cash": book_a_nav,
-        "topk": 15,
-        "n_drop": 1,
-        "listing_min_days": 60,
-        "turnover_cap": None,
-    }
-    ctx.config = {
-        "cost_model": {"risk_degree": 0.95},
-        "universe": {
-            "listing_min_days": 60,
-            "min_avg_turnover_20d": 0.0,
-            "exclude_close_above_cny": 300.0,
+    return make_daily_ctx(
+        trade_date=trade_date, db_path=tmp_path / "paper.db", pred_path=pred_path,
+        paper_cfg={"initial_cash": book_a_nav, "topk": 15, "n_drop": 1,
+                   "listing_min_days": 60, "turnover_cap": None},
+        config={
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0,
+                         "exclude_close_above_cny": 300.0},
+            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
         },
-        "carry_days": 3,
-        "slippage": 0.001,
-        "volume_participation_pct": 0.05,
-    }
-    ctx.risk_result = MagicMock(
-        buying_halted=False,
-        forced_sells={},
-        blocked_industries=set(),
-        blocked_rebuys=set(),
-        topk_override=None,
-        cooldown_entries={},
+        # volume must be present and positive, otherwise settle reads 0.0,
+        # flags the symbol suspended and carries every buy instead of filling it
+        prices={"SH600519": {"close": 180.0, "volume": 10_000_000.0},
+                "SH601318": {"close": 55.0, "volume": 8_000_000.0}},
+        universe=["SH600519", "SH601318"],
+        market_data={"SH600519": {"close": 180.0, "listing_days": 100,
+                                  "avg_turnover_20d": 100_000_000.0},
+                     "SH601318": {"close": 55.0, "listing_days": 200,
+                                  "avg_turnover_20d": 80_000_000.0}},
+        cash=book_a_nav, total_nav=book_a_nav, hedge_state=None,
     )
-    ctx.prices = {
-        "SH600519": {"close": 180.0, "volume": 10_000_000.0},
-        "SH601318": {"close": 55.0, "volume": 8_000_000.0},
-    }
-    ctx.pred_path = pred_path
-    ctx.universe_symbols = ["SH600519", "SH601318"]
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-    ctx.market_data = {
-        "SH600519": {
-            "close": 180.0,
-            "listing_days": 100,
-            "avg_turnover_20d": 100_000_000.0,
-        },
-        "SH601318": {
-            "close": 55.0,
-            "listing_days": 200,
-            "avg_turnover_20d": 80_000_000.0,
-        },
-    }
-    ctx.industry_map = {}
-    ctx.benchmarks = {"csi1000": 1.0}
-    ctx.hedge_state = None
-    ctx.hedge_symbols = set()
-    ctx.total_nav = book_a_nav
-    ctx.current_positions = {}
-    ctx.cash = book_a_nav
-    return ctx
 
 
 def _init_prod_db(tmp_path, cash=1_000_000.0):

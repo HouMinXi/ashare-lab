@@ -1,5 +1,5 @@
 #!/bin/bash
-# deploy.sh -- two-stage deploy for ashare-lab on X500
+# deploy.sh -- two-stage deploy for ashare-lab on W1
 # Fresh clone or incremental sync, then install systemd timers.
 #
 # Usage: bash scripts/deploy.sh
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO="$HOME/code/ashare-lab"
-REPO_URL="x500:code/ashare-lab.git"
+REPO_URL="w1:code/ashare-lab.git"
 GPU_HOST="192.168.100.11"
 GPU_USER="admin"
 

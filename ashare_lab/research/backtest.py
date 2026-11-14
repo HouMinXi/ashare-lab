@@ -48,9 +48,9 @@ def run_backtest(
                 (lot-size skips). 0 if no trades. None if indicator structure
                 is unrecognised (missing order_amount/trade_amount columns).
     """
-    from qlib.contrib.evaluate import backtest_daily  # noqa: PLC0415
-    from qlib.contrib.strategy import TopkDropoutStrategy  # noqa: PLC0415
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.contrib.evaluate import backtest_daily
+    from qlib.contrib.strategy import TopkDropoutStrategy
+    from qlib.data import D
 
     cfg = load_config()
     cm = cfg["cost_model"]

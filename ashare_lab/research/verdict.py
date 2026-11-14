@@ -334,7 +334,7 @@ def write_ic_csv_png(
     """
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: E402
+    import matplotlib.pyplot as plt
 
     csv_path = exp_dir / "ic_windows.csv"
     png_path = exp_dir / "ic_windows.png"

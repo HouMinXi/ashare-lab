@@ -13,7 +13,7 @@ Uses stdlib urllib to avoid importing requests/aiohttp in the predict
 path.  Callers that need chunking split externally and call this per
 chunk.
 
-Outbound is QQ via X500 alert-bridge (:8377) then hermes send --to qqbot.
+Outbound is QQ via W1 alert-bridge (:8377) then hermes send --to qqbot.
 iLink / weixin send is not used.
 """
 

@@ -30,6 +30,11 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     import numpy as np
 
+# Set by _resolve_model_path: True when the loaded model is the one
+# expected_live_model pins. A pinned model is a standing decision, so its
+# age must not page anyone; the age is still logged.
+_LAST_RESOLUTION: dict[str, bool] = {"deliberate": False}
+
 _MODEL_STALE_DAYS = 7  # warn if model file is older than this
 
 # -- Alert infrastructure (fail-open, stdlib only) --------------------------
@@ -42,12 +47,12 @@ def _send_alert(text: str) -> None:
     set only after a successful send).  Transport and token resolution
     live in ashare_lab.bridge.
     """
-    global _ALERT_SENT_THIS_RUN  # noqa: PLW0603
+    global _ALERT_SENT_THIS_RUN
     if _ALERT_SENT_THIS_RUN:
         return
 
     try:
-        from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+        from ashare_lab.bridge import send_bridge_alert
     except Exception:
         # gpu-win receives a selective file sync; a missing bridge module
         # must never break prediction (alerting is advisory by design).
@@ -102,7 +107,7 @@ def check_score_diversity(
         Requires 2 consecutive failures OR 1 failure + Tier 1 same day.
         Skip if < 5 days of history (cold start).
     """
-    import numpy as np  # noqa: PLC0415
+    import numpy as np
 
     result = DiversityResult()
     n = len(scores)
@@ -137,7 +142,7 @@ def check_score_diversity(
     # -- Tier 2 metrics --
     # Kurtosis (Fisher/excess): -1.2 for uniform, 0 for normal, >0 for heavy tails
     try:
-        from scipy.stats import kurtosis as sp_kurtosis  # noqa: PLC0415
+        from scipy.stats import kurtosis as sp_kurtosis
         kurt = float(sp_kurtosis(scores, fisher=True))
         if not np.isfinite(kurt):
             kurt = 0.0
@@ -286,6 +291,39 @@ def _update_diversity_history(
         log.debug("Failed to update diversity history", exc_info=True)
 
 
+def _model_age_days(
+    model_meta: dict | None,
+    model_path: Path,
+    today: date,
+    meta_reason: str = "",
+) -> tuple[float, str]:
+    """Days since this model was produced, and where the number came from.
+
+    meta.json's train_date is the cutoff of the training data, and in a
+    walk-forward window that cutoff lags today by months: the model retrained
+    on 2026-11-07 from window 11 carries train_date 2026-06-30 and would be
+    reported as 131 days stale the hour it was written. Staleness answers "has
+    anyone retrained", so anchor on trained_at and fall back to the cutoff only
+    when the timestamp is absent, then to the file's modification time.
+    """
+    if model_meta:
+        trained_at = model_meta.get("trained_at")
+        if trained_at:
+            try:
+                stamp = datetime.fromisoformat(str(trained_at).replace("Z", "+00:00"))
+                return float((today - stamp.date()).days), "meta.json(trained_at)"
+            except ValueError:
+                pass
+        train_date = model_meta.get("train_date")
+        if train_date:
+            try:
+                return float((today - date.fromisoformat(str(train_date))).days), "meta.json(train_date)"
+            except ValueError:
+                pass
+    age = (time.time() - model_path.stat().st_mtime) / 86400
+    return age, f"mtime-fallback({meta_reason})" if meta_reason else "mtime-fallback"
+
+
 def _resolve_model_path(
     trade_date: str,
     model_path: Path | None,
@@ -299,17 +337,51 @@ def _resolve_model_path(
     missing-model situations; deliberately mismatches (expected_live_model)
     are logged at INFO only.
     """
+    # Reset per call: the flag is module state, and a stale True would
+    # suppress a genuine staleness alert on a later trade date.
+    _LAST_RESOLUTION["deliberate"] = False
     window: dict | None = None
+
+    # The newest walk-forward window clamps its test_end to the latest trading
+    # day, so "past every window" never holds for a production date: the live
+    # artifact would never be selected. Choose it explicitly for the day being
+    # predicted, and leave historical dates on their window models.
+    from ashare_lab.research.smoke_test import (
+        get_live_window,
+        latest_trading_day,
+    )
+
+    live_model = models_dir / "wlive.pt"
+    if (
+        model_path is None
+        and live_model.is_file()
+        and trade_date >= str(latest_trading_day())
+    ):
+        # The window carries the fit range the handler normalises with, so it
+        # has to be the span this model was trained on -- not whichever
+        # walk-forward window happens to cover the date, which would feed the
+        # model features scaled over a different period.
+        window = dict(get_live_window(), window_id="wlive")
+        model_path = live_model
 
     for w in windows:
         if w["test_start"] <= trade_date <= w["test_end"]:
-            window = w
+            if window is None:
+                window = w
             break
 
     if window is None:
         if windows and trade_date > windows[-1]["test_end"]:
             window = windows[-1]
-            if model_path is None:
+            live_model = models_dir / "wlive.pt"
+            if model_path is None and live_model.is_file():
+                # The live window is trained through the last trading day and
+                # has no held-out period; it is the artifact meant for dates
+                # after every walk-forward window has closed. Its artifact id
+                # is "wlive", matching the file name and models/meta.json.
+                window = {**windows[-1], "window_id": "wlive"}
+                model_path = live_model
+            elif model_path is None:
                 model_path = models_dir / "latest.pt"
         elif not windows or trade_date < windows[0]["test_start"]:
             raise ValueError(
@@ -318,7 +390,7 @@ def _resolve_model_path(
                 % (trade_date, windows[0]["test_start"] if windows else "N/A")
             )
 
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     if model_path is None:
         model_path = models_dir / f"w{window_id}.pt"
@@ -327,7 +399,7 @@ def _resolve_model_path(
             if fallback.exists():
                 expected = cfg.get("research", {}).get("expected_live_model")
                 # Check if latest.pt contains the expected model.
-                # Works for both symlinks (X500) and regular-file copies (gpu-win).
+                # Works for both symlinks (W1) and regular-file copies (gpu-win).
                 expected_file = models_dir / f"{expected}.pt" if expected else None
                 is_expected = (
                     expected
@@ -352,6 +424,25 @@ def _resolve_model_path(
                         f"Action: train w{window_id}.pt"
                     )
                 model_path = fallback
+
+    # Inspect the selected identity after every automatic/explicit route. Both
+    # symlink targets and metadata-bearing copies are normal deployment layouts.
+    from ashare_lab.research.model_meta import has_research_identity
+
+    if has_research_identity(model_path):
+        raise ValueError("research-only checkpoint: scheduled prediction cannot reconstruct its fit contract")
+
+    # A pinned model is a standing decision regardless of which branch
+    # resolved the path, so judge it by content here, once.
+    expected = cfg.get("research", {}).get("expected_live_model")
+    expected_file = models_dir / f"{expected}.pt" if expected else None
+    if (
+        expected_file is not None
+        and expected_file.exists()
+        and model_path.exists()
+        and filecmp.cmp(str(model_path), str(expected_file), shallow=False)
+    ):
+        _LAST_RESOLUTION["deliberate"] = True
 
     if not model_path.exists():
         raise FileNotFoundError(
@@ -395,53 +486,54 @@ def predict_for_date(
         FileNotFoundError: the resolved model .pt does not exist (models
             are gitignored; train on the GPU host or sync them).
     """
-    import numpy as np  # noqa: PLC0415
-    import pandas as pd  # noqa: PLC0415
-    import torch  # noqa: PLC0415
-    import qlib  # noqa: PLC0415
-    from qlib.config import C as _QlibC  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
-    from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
+    import numpy as np
+    import pandas as pd
+    import torch
+    import qlib
+    from qlib.config import C as _QlibC
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158
+    from qlib.contrib.data.dataset import MTSDatasetH
 
-    from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config  # noqa: PLC0415
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
-    from ashare_lab.research.blend import blend_tra_ntra  # noqa: PLC0415
-    from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
-    from ashare_lab.research.train import ALPHA158_WARMUP_START  # noqa: PLC0415
+    from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+    from ashare_lab.research.blend import blend_tra_ntra
+    from ashare_lab.research.smoke_test import get_all_windows
+    from ashare_lab.research.train import ALPHA158_WARMUP_START
 
     # -- 1. Window selection (resolves both window dict and model path) ----
     model_path, window = _resolve_model_path(
         trade_date, model_path, get_all_windows(), load_config(), MODELS_DIR,
     )
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     # -- Model freshness check (meta.json preferred, mtime fallback) --
-    from ashare_lab.research.model_meta import read_model_meta  # noqa: PLC0415
+    from ashare_lab.research.model_meta import read_model_meta
 
     model_meta, meta_reason = read_model_meta(model_path)
     # fixed +08:00 offset, no tzdata dependency (works on hosts without IANA data)
     today = datetime.now(timezone(timedelta(hours=8))).date()
-    if model_meta is not None:
-        model_age_days = (today - date.fromisoformat(model_meta["train_date"])).days
-        age_source = "meta.json"
-    else:
-        model_age_days = (time.time() - model_path.stat().st_mtime) / 86400
-        age_source = f"mtime-fallback({meta_reason})"
+    model_age_days, age_source = _model_age_days(
+        model_meta, model_path, today, meta_reason
+    )
     if model_age_days > _MODEL_STALE_DAYS:
+        pinned = _LAST_RESOLUTION["deliberate"]
         log.warning(
-            "MODEL STALE: %s is %.0f days old (threshold: %d days, source: %s). "
-            "Consider retraining.",
+            "MODEL STALE: %s is %.0f days old (threshold: %d days, source: %s)%s",
             model_path.name, model_age_days, _MODEL_STALE_DAYS, age_source,
+            " [pinned by expected_live_model, not paging]"
+            if pinned
+            else ". Consider retraining.",
         )
-        _send_alert(
-            f"[predict] model stale: {model_path.name} is {model_age_days:.1f} days old "
-            f"(threshold: {_MODEL_STALE_DAYS}, source: {age_source}) on {trade_date}. "
-            f"Action: retrain"
-        )
+        if not pinned:
+            _send_alert(
+                f"[predict] model stale: {model_path.name} is "
+                f"{model_age_days:.1f} days old (threshold: {_MODEL_STALE_DAYS}, "
+                f"source: {age_source}) on {trade_date}. Action: retrain"
+            )
 
     log.info(
-        "predict %s: window W%d, model %s",
+        "predict %s: window W%s, model %s",
         trade_date,
         window_id,
         model_path.name,

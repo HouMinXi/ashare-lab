@@ -93,10 +93,10 @@ research:
   # deliberate -- log.info only, no alert.
   # Update this value when swapping the live model; no code edits needed.
   # 2026-08-15: swapped to w115 (serve-now retrain, user-approved swap).
-  # NOTE: the retrain deploy gate compares window numbers numerically, so
-  # a future w12 (12 < 115) would NOT be shelved against this value --
-  # review the gate before the next cadence retrain (~2027-02).
-  expected_live_model: "w115"
+  # 2026-11-07: swapped to w12, trained through 2026-06-30. The deploy gate
+  #   compares train_date, not window numbers, so the numeric worry recorded
+  #   here was unfounded: w12 superseded w115 on its training cutoff.
+  expected_live_model: "w12"
 paper:
   db_path: "paper.db"
   carry_days: 3

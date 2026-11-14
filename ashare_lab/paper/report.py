@@ -67,7 +67,7 @@ def gather_report_data(
     ).fetchone()
     if not row_today:
         raise ValueError(f"No NAV data for {trade_date}")
-    
+
     total_nav = float(row_today["total_nav"])
     cash = float(row_today["cash"])
     today_bench = row_today["benchmark_csi1000"]
@@ -85,17 +85,17 @@ def gather_report_data(
         "SELECT total_nav, benchmark_csi1000 FROM nav WHERE trade_date < ? ORDER BY trade_date DESC LIMIT 1",
         (trade_date,)
     ).fetchone()
-    
+
     prev_nav = float(row_prev["total_nav"]) if row_prev else total_nav
     daily_return_pct = (total_nav - prev_nav) / prev_nav * 100.0 if prev_nav > 0 else 0.0
     daily_pnl = total_nav - prev_nav
-    
+
     prev_bench = row_prev["benchmark_csi1000"] if row_prev else None
     if prev_bench is not None and today_bench is not None and float(prev_bench) > 0:
         benchmark_return_pct = (today_bench - float(prev_bench)) / float(prev_bench) * 100.0
     else:
         benchmark_return_pct = 0.0
-        
+
     cash_ratio = cash / total_nav * 100.0 if total_nav > 0 else 100.0
 
     # max drawdown
@@ -211,7 +211,7 @@ def gather_report_data(
             "side": r["side"],
             "qty": int(r["target_qty"]),
         })
-        
+
     # Sell order count (all sells, not just forced)
     sell_order_count = conn.execute(
         "SELECT COUNT(*) FROM orders WHERE created_run_date = ? AND side = 'sell'",
@@ -220,7 +220,7 @@ def gather_report_data(
 
     # Cooldown count
     cooldown_count = conn.execute("SELECT COUNT(*) FROM cooldowns").fetchone()[0]
-    
+
     # Risk state (from state machine, not recomputed)
     row_state = conn.execute("SELECT value FROM paper_state WHERE key = 'risk_state'").fetchone()
     risk_state_str = row_state["value"] if row_state else "normal"
@@ -259,7 +259,8 @@ def gather_report_data(
         daily_loss_halted = daily_return_pct <= -risk_cfg["daily_loss"] * 100.0
         regime_days = risk_cfg.get("market_regime_days", 10)
         c_rows = conn.execute(
-            "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
+            "SELECT benchmark_csi1000 FROM nav WHERE trade_date <= ? "
+            "AND benchmark_csi1000 IS NOT NULL ORDER BY trade_date DESC LIMIT ?",
             (trade_date, regime_days + 1)
         ).fetchall()
         regime_halted = False
@@ -335,6 +336,7 @@ def format_chinese_report(
     report_data: ReportData,
     sentiment_section: str | None = None,
     ic_nan: bool = False,
+    ic_section: str | None = None,
 ) -> str:
     """Format report as Chinese mobile-first template."""
     rd = report_data
@@ -454,6 +456,9 @@ def format_chinese_report(
     if ic_nan:
         lines.append("⚠️ 模型自评指标不可用 (IC=nan)")
 
+    if ic_section:
+        lines.append(ic_section)
+
     if rd.hedge_active:
         lines.append(
             f"🛡 对冲: DD {rd.hedge_dd:.1%} → "
@@ -501,13 +506,13 @@ def _get_secret(key: str) -> str:
 def split_report_text(text: str, max_length: int = 4000) -> list[str]:
     if len(text) <= max_length:
         return [text]
-        
+
     chunks = []
     paras = text.split("\n\n")
     current = []
     curr_len = 0
     buf_sep = "\n\n"
-    
+
     for p in paras:
         plen = len(p)
         if curr_len + plen + 2 > max_length and current:
@@ -515,7 +520,7 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
             current = []
             curr_len = 0
             buf_sep = "\n\n"
-            
+
         if plen > max_length:
             buf_sep = "\n"
             lines = p.split("\n")
@@ -540,10 +545,10 @@ def split_report_text(text: str, max_length: int = 4000) -> list[str]:
         else:
             current.append(p)
             curr_len += plen + 2
-            
+
     if current:
         chunks.append(buf_sep.join(current))
-        
+
     return chunks
 
 
@@ -567,7 +572,7 @@ def _ilink_headers(token: str, body: str) -> dict[str, str]:
 async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout: int = 15) -> dict:
     import uuid
     import aiohttp
-    
+
     payload = {
         "msg": {
             "from_user_id": "",
@@ -586,10 +591,10 @@ async def send_text_ilink(session, token: str, chat_id: str, text: str, timeout:
             "channel_version": CHANNEL_VERSION
         }
     }
-    
+
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     headers = _ilink_headers(token, body)
-    
+
     async with session.post(
         f"{ILINK_BASE_URL}/{EP_SEND_MESSAGE}",
         data=body.encode("utf-8"),
@@ -683,7 +688,10 @@ async def _send_via_ilink(chunks: list[str], chat_id: str, token: str,
                 await asyncio.sleep(delay)
 
 
-def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str, config: dict, *, force: bool = False) -> str:
+def deliver_report(
+    conn: sqlite3.Connection, trade_date: str, mode: str, report_text: str,
+    config: dict, *, force: bool = False,
+) -> str:
     logger.info("[deliver] start for %s (mode=%s, text_len=%d, force=%s)", trade_date, mode, len(report_text), force)
     insert_report(conn, trade_date, mode, report_text, None, "pending")
     conn.commit()
@@ -772,7 +780,7 @@ def deliver_report(conn: sqlite3.Connection, trade_date: str, mode: str, report_
 
 def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, report_text: str) -> bool:
     """Send report chunks via alert-bridge. Returns True if all chunks sent."""
-    from ashare_lab.bridge import send_bridge_alert  # noqa: PLC0415
+    from ashare_lab.bridge import send_bridge_alert
 
     title_base = f"A股日报 {trade_date}"
     for i, chunk in enumerate(chunks):
@@ -786,7 +794,9 @@ def _deliver_via_bridge(chunks: list[str], trade_date: str, conn, mode: str, rep
     return True
 
 
-def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: str, report_text: str, rcfg: dict) -> bool:
+def _deliver_via_ilink_legacy(
+    chunks: list[str], trade_date: str, conn, mode: str, report_text: str, rcfg: dict,
+) -> bool:
     """Send report chunks via iLink (legacy channel). Returns True if all chunks sent."""
     try:
         wx_token = _get_secret("ashare/weixin-token")
@@ -824,7 +834,10 @@ def _deliver_via_ilink_legacy(chunks: list[str], trade_date: str, conn, mode: st
     return False
 
 
-def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: dict, dry_run: bool = False, *, force: bool = False) -> int:
+def generate_and_send_report(
+    trade_date: str, conn: sqlite3.Connection, config: dict,
+    dry_run: bool = False, *, force: bool = False,
+) -> int:
     nav_check = conn.execute("SELECT 1 FROM nav WHERE trade_date=?", (trade_date,)).fetchone()
     if not nav_check:
         logger.warning("No data for %s", trade_date)
@@ -853,7 +866,23 @@ def generate_and_send_report(trade_date: str, conn: sqlite3.Connection, config: 
 
     mode = "chinese"
     ic_nan = config.get("_ic_nan", False)
-    report_text = format_chinese_report(report_data, sentiment_section=sentiment_text, ic_nan=ic_nan)
+
+    # The monitor is advisory: a failure to read the history must not stop the
+    # report from going out.
+    ic_section = None
+    try:
+        from ashare_lab.config import PROJECT_ROOT
+        from ashare_lab.paper import ic_monitor
+
+        pairs = ic_monitor.load_series(PROJECT_ROOT / "data" / "ic_history.tsv")
+        ic_section = ic_monitor.format_line(ic_monitor.summarize(pairs)) or None
+    except Exception:
+        ic_section = None
+
+    report_text = format_chinese_report(
+        report_data, sentiment_section=sentiment_text, ic_nan=ic_nan,
+        ic_section=ic_section,
+    )
 
     if dry_run:
         insert_report(conn, trade_date, mode, report_text, None, "dry_run")

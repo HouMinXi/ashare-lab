@@ -13,11 +13,16 @@ ChiNext/STAR stocks (41.5% of CSI1000) have 20% daily limits.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import json
 import logging
 from dataclasses import dataclass
 
 from ashare_lab.paper.engine import round_lots
+
+if TYPE_CHECKING:
+    from ashare_lab.paper.pipeline import DailyRunContext
 
 logger = logging.getLogger(__name__)
 
@@ -421,7 +426,7 @@ def _fetch_hedge_prices(ctx: "DailyRunContext", leg_symbols: list[str]) -> None:
     are skipped.  Missing prices are logged and left absent.
     """
     try:
-        import akshare as ak  # noqa: PLC0415
+        import akshare as ak
     except ImportError:
         logger.warning("akshare not installed, hedge prices unavailable")
         return

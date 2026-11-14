@@ -127,7 +127,7 @@ class TestAssignDataPatchOnlyForTra:
 
         # ALSTM branch: only model.fit is wrapped, dataset is untouched
         if model_type == "alstm":
-            model = MagicMock()
+
             if cfg_model.get("use_amp", False):
                 # Only wrap model.fit -- no assign_data patch
                 pass

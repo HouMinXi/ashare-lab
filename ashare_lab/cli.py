@@ -47,27 +47,60 @@ def cmd_update(args: argparse.Namespace) -> int:
         return 2
 
 
+MAX_GAP_FILL_DAYS = 10
+
+
 def cmd_fetch_today(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
-    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
-    from ashare_lab.data.fetcher import (  # noqa: PLC0415
+    import datetime as dt
+    from ashare_lab.data.calendar import (
+        is_trading_day,
+        latest_trading_day,
+        market_today,
+    )
+    from ashare_lab.data.fetcher import (
         fetch_today_data,
         fetch_cross_validation_sample,
         refresh_stock_names_cache,
         CSI1000_SAMPLE_SYMBOLS,
     )
-    from ashare_lab.data.validator import validate_daily_data  # noqa: PLC0415
+    from ashare_lab.data.validator import validate_daily_data
 
-    today = dt.date.today()
+    today = market_today()
     if not is_trading_day(today):
         print("not a trading day")
         return 0
 
     trade_date = str(latest_trading_day(today))
 
+    # Fill any hole behind today before appending: the factor carries the
+    # corporate action between two adjacent sessions, and a hole would fold the
+    # gap's return into it.
+    try:
+        from ashare_lab.data.fallback import _calendar_dates, backfill_missing_dates
+
+        have = _calendar_dates(DEFAULT_PROVIDER_URI)
+        behind = [d for d in have if d < trade_date]
+        if behind:
+            start = dt.date.fromisoformat(max(behind)) + dt.timedelta(days=1)
+            end = dt.date.fromisoformat(trade_date) - dt.timedelta(days=1)
+            # A store stale for months would otherwise pull every missing
+            # session on the critical path, one full-market call each.
+            if (end - start).days > MAX_GAP_FILL_DAYS:
+                log.warning(
+                    "store is %d days behind; filling at most %d and leaving the rest",
+                    (end - start).days, MAX_GAP_FILL_DAYS,
+                )
+                end = start + dt.timedelta(days=MAX_GAP_FILL_DAYS)
+            if start <= end:
+                filled = backfill_missing_dates(start, end)
+                if filled:
+                    log.info("filled %d session(s) before appending %s", len(filled), trade_date)
+    except Exception as exc:  # a gap fill must not block the day
+        log.warning("pre-append gap fill failed: %s", exc)
+
     try:
         tushare_data = fetch_today_data(trade_date)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         log.error("fetch_today_data failed: %s", exc)
         return 1
 
@@ -95,25 +128,50 @@ def cmd_fetch_today(args: argparse.Namespace) -> int:
         for w in result.warnings:
             log.warning("validation: %s", w)
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp_csv_dir:
-            _write_csvs(tushare_data, Path(tmp_csv_dir))
-            _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
-    except Exception as exc:
-        log.error("write/dump failed: %s", exc)
-        return 1
+    if not tushare_data:
+        # Every symbol was already stored for this date: a re-run, not a failure.
+        log.info("fetch-today: %s already stored for every symbol, nothing to write", trade_date)
+    else:
+        try:
+            with tempfile.TemporaryDirectory() as tmp_csv_dir:
+                _write_csvs(tushare_data, Path(tmp_csv_dir))
+                _dump_bin_update(Path(tmp_csv_dir), DEFAULT_PROVIDER_URI)
+        except (RuntimeError, ValueError) as exc:
+            log.error("write/dump failed: %s", exc)
+            return 1
+        except Exception as exc:
+            log.error("write/dump failed: %s", exc)
+            return 1
 
     log.info("fetch-today complete for %s (%d symbols)", trade_date, len(tushare_data))
+
+    # The daily fetch covers stocks only, so every index keeps the tail it
+    # had when the full package was last unpacked. A reader of a stale index
+    # gets no error, just an older last date. Refresh them separately so a
+    # failure here leaves the gap backfill above intact.
+    try:
+        from ashare_lab.data.fallback import (
+            backfill_stale_indexes,
+        )
+
+        filled = backfill_stale_indexes(trade_date)
+        if filled:
+            log.info("refreshed stale indexes: %s", filled)
+    except Exception as exc:
+        log.warning("index refresh failed (non-fatal): %s", exc)
     return 0
 
 
 def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
-    import json as _json  # noqa: PLC0415
-    from ashare_lab.data.calendar import is_trading_day, latest_trading_day  # noqa: PLC0415
-    from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS  # noqa: PLC0415
+    import json as _json
+    from ashare_lab.data.calendar import (
+        is_trading_day,
+        latest_trading_day,
+        market_today,
+    )
+    from ashare_lab.data.fetcher import CSI1000_SAMPLE_SYMBOLS
 
-    today = dt.date.today()
+    today = market_today()
     if not is_trading_day(today):
         print("not a trading day")
         return 0
@@ -121,9 +179,9 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
     trade_date = str(latest_trading_day(today))
 
     try:
-        import qlib  # noqa: PLC0415
+        import qlib
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
         df = D.features(
             instruments=CSI1000_SAMPLE_SYMBOLS,
             fields=["$close"],
@@ -148,11 +206,10 @@ def cmd_chenditc_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_chenditc_diff(args: argparse.Namespace) -> int:
-    import datetime as dt  # noqa: PLC0415
-    import json as _json  # noqa: PLC0415
-    from ashare_lab.data.calendar import latest_trading_day  # noqa: PLC0415
+    import json as _json
+    from ashare_lab.data.calendar import latest_trading_day
 
-    trade_date = str(latest_trading_day(dt.date.today()))
+    trade_date = str(latest_trading_day())
     snap_path = Path(f"/tmp/incremental_snapshot_{trade_date}.json")
 
     if not snap_path.exists():
@@ -165,9 +222,9 @@ def cmd_chenditc_diff(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        import qlib  # noqa: PLC0415
+        import qlib
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
         symbols = list(snapshot.keys())
         df = D.features(
             instruments=symbols,
@@ -234,7 +291,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 def cmd_paper_settle(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily
         return run_daily(
             trade_date=getattr(args, "date", None),
             force=getattr(args, "force", False),
@@ -247,7 +304,7 @@ def cmd_paper_settle(args: argparse.Namespace) -> int:
 
 def cmd_paper_signal(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_daily
         return run_daily(
             trade_date=getattr(args, "date", None),
             force=False,
@@ -260,8 +317,8 @@ def cmd_paper_signal(args: argparse.Namespace) -> int:
 
 def cmd_paper_run_all(args: argparse.Namespace) -> int:
     try:
-        from pathlib import Path  # noqa: PLC0415
-        from ashare_lab.paper.pipeline import run_daily  # noqa: PLC0415
+        from pathlib import Path
+        from ashare_lab.paper.pipeline import run_daily
         pred = getattr(args, "pred_path", None)
         return run_daily(
             trade_date=getattr(args, "date", None),
@@ -275,7 +332,7 @@ def cmd_paper_run_all(args: argparse.Namespace) -> int:
 
 def cmd_paper_backfill(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import run_backfill  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import run_backfill
         return run_backfill(
             args.from_date,
             args.to_date,
@@ -288,7 +345,7 @@ def cmd_paper_backfill(args: argparse.Namespace) -> int:
 
 def cmd_paper_status(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.pipeline import get_status  # noqa: PLC0415
+        from ashare_lab.paper.pipeline import get_status
         status = get_status()
         print(json.dumps(status, indent=2))
         return 0
@@ -299,13 +356,13 @@ def cmd_paper_status(args: argparse.Namespace) -> int:
 
 def cmd_paper_report(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.report import generate_and_send_report  # noqa: PLC0415
+        from ashare_lab.paper.report import generate_and_send_report
         from ashare_lab.paper.ledger import get_connection
         from ashare_lab.config import load_config, PROJECT_ROOT
         config = load_config()
         db_path = PROJECT_ROOT / config["paper"]["db_path"]
         conn = get_connection(db_path)
-        
+
         trade_date = getattr(args, "date", None)
         if trade_date is None:
             latest_settled = conn.execute(
@@ -330,7 +387,7 @@ def cmd_paper_report(args: argparse.Namespace) -> int:
 
 def cmd_paper_sentiment(args: argparse.Namespace) -> int:
     try:
-        from ashare_lab.paper.sentiment import run_sentiment_veto  # noqa: PLC0415
+        from ashare_lab.paper.sentiment import run_sentiment_veto
         from ashare_lab.paper.ledger import get_connection, init_schema
         from ashare_lab.paper.pipeline import _load_industry_cache
         from ashare_lab.config import load_config, PROJECT_ROOT

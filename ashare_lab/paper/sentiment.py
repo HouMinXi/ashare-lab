@@ -111,7 +111,7 @@ def _rate_limited_get(url, params, headers, config, timeout=15):
 
     config is the flat sentiment sub-config (has rate_limit_base etc.).
     """
-    import requests  # noqa: PLC0415
+    import requests
 
     base = config.get("rate_limit_base", 1.0)
     jitter = config.get("rate_limit_jitter", 0.5)
@@ -221,7 +221,7 @@ def fetch_global_news(config: dict) -> list[dict]:
     Returns list of {title, summary, date} dicts.
     """
     try:
-        import requests  # noqa: PLC0415
+        import requests
 
         url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
         params = {
@@ -354,7 +354,7 @@ def _call_llm_score(prompt: str, config: dict) -> int:
     Returns integer score -3..+3, or 0 on any failure (fail-open).
     """
     try:
-        import requests  # noqa: PLC0415
+        import requests
 
         # LLM config -- provider-agnostic, all fields required in config.
         for key in ("llm_base_url", "llm_model", "llm_api_key_pass"):

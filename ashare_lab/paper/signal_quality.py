@@ -8,7 +8,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import math
 import os
 import re
 import subprocess
@@ -22,6 +21,7 @@ import pandas as pd
 
 from ashare_lab.bridge import send_bridge_alert
 from ashare_lab.config import PREDICTIONS_DIR, PROJECT_ROOT
+from ashare_lab.paper import ic_monitor
 from ashare_lab.data.calendar import previous_trading_day
 
 if TYPE_CHECKING:
@@ -31,19 +31,27 @@ log = logging.getLogger(__name__)
 
 # Frozen thresholds (10-CONTEXT.md)
 _PSI_THRESHOLD = 0.25
-_IC_THRESHOLD = 0.01
 _REFERENCE_DAYS = 60
 _N_BUCKETS = 10
-_ROLLING_WINDOW = 20
 _MIN_REFERENCE_FILES = 20
 _MIN_INSTRUMENTS = 50
+
+# The pipeline appends one IC per settlement; the monitor reads that series so
+# the alert, the report and any later analysis all quote the same numbers.
+IC_HISTORY_PATH = PROJECT_ROOT / "data" / "ic_history.tsv"
 
 
 # ---------------------------------------------------------------------------
 # Helper: atomic sidecar writes
 # ---------------------------------------------------------------------------
-def _write_sidecar(path: Path, data: dict) -> None:
-    """Atomic read-modify-write of a .meta.json sidecar file."""
+def _write_sidecar(path: Path, data: dict, clear: tuple[str, ...] = ()) -> None:
+    """Atomic read-modify-write of a .meta.json sidecar file.
+
+    *clear* is a tuple of key names removed before the update: a success must not
+    leave an error from an earlier attempt sitting beside a value it has since
+    produced. Keys listed in *data* are written afterwards, so clearing and
+    setting the same key in one call is defined as "set".
+    """
     def _to_native(obj):
         if isinstance(obj, np.bool_):
             return bool(obj)
@@ -55,12 +63,22 @@ def _write_sidecar(path: Path, data: dict) -> None:
             return obj.tolist()
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-    existing = {}
+    existing: dict = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
+            loaded = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            # A sidecar written by an older tool, or truncated mid-UTF-8, is
+            # unreadable for our purposes; start from an empty one instead of
+            # letting the decode error escape into the step that called us.
+            # A sidecar written by an older tool, or truncated mid-UTF-8, is
+            # unreadable for our purposes; start from an empty one instead of
+            # letting the decode error escape into the step that called us.
+            loaded = None
+        if isinstance(loaded, dict):
+            existing = loaded
+    for key in clear:
+        existing.pop(key, None)
     existing.update(data)
     dir_path = path.parent
     tmp = None
@@ -171,14 +189,22 @@ def signal_quality_psi_step(ctx: DailyRunContext) -> None:
         psi = compute_psi(ref, scores)
         if psi is None:
             log.warning("PSI computation returned None (empty/degenerate)")
-        _write_sidecar(sidecar, {"psi": psi, "psi_reference_days": ref_n})
+        _write_sidecar(
+            sidecar,
+            {"psi": psi, "psi_reference_days": ref_n},
+            clear=("psi_error", "psi_reason"),
+        )
         if psi is not None and psi > _PSI_THRESHOLD:
             if dry_run:
                 log.warning("dry-run: alert suppressed")
             else:
                 if not send_bridge_alert(
                     title="ashare SIG: PSI",
-                    body=f"PSI {psi:.3f} > {_PSI_THRESHOLD} on {pred_date} (ref {_REFERENCE_DAYS}d, {_N_BUCKETS} buckets). Distribution drift tripwire.",
+                    body=(
+                        f"PSI {psi:.3f} > {_PSI_THRESHOLD} on {pred_date} "
+                        f"(ref {_REFERENCE_DAYS}d, {_N_BUCKETS} buckets). "
+                        "Distribution drift tripwire."
+                    ),
                     timeout=10,
                 ):
                     log.error("PSI alert send failed (returned False)")
@@ -292,34 +318,44 @@ def lagged_ic_for_date(
     return ic, len(aligned_df)
 
 
-def rolling_lagged_ic(
-    predictions_dir: Path,
-    end_date: str,
-    window: int = _ROLLING_WINDOW,
-) -> tuple[float | None, int]:
-    """Compute rolling mean of lagged IC from sidecar files."""
-    values = []
-    for f in predictions_dir.glob("*.meta.json"):
-        m = re.search(r"(\d{4}-\d{2}-\d{2})", f.stem)
-        if not m:
-            continue
-        date = m.group(1)
-        if date > end_date:
-            continue
-        try:
-            meta = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            log.warning("corrupt sidecar skipped: %s", f)
-            continue
-        val = meta.get("lagged_ic_t5")
-        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
-            values.append((date, val))
-    values.sort(key=lambda x: x[0], reverse=True)
-    values = values[:window]
-    if len(values) < window:
-        return None, len(values)
-    mean = sum(v for _, v in values) / len(values)
-    return mean, len(values)
+# At most one push a week while the condition holds: the monitor's window
+# spans weeks, so a daily message would teach the reader to ignore it.
+_IC_ALERT_MIN_DAYS = 7
+
+
+def _stamp_path(state_dir: Path) -> Path:
+    return Path(state_dir) / ".ic_alert_stamp"
+
+
+def _ic_alert_due(state_dir: Path, trade_date: str) -> bool:
+    """Whether this run should push. Reads the stamp, never writes it.
+
+    Writing here, before the caller has sent anything, meant one failed
+    delivery silenced the alert for a week -- the failure and the success
+    produced the same state.
+    """
+    stamp = _stamp_path(state_dir)
+    try:
+        last = stamp.read_text().strip()
+    except OSError:
+        return True
+    if not last:
+        return True
+    try:
+        return (dt.date.fromisoformat(trade_date) - dt.date.fromisoformat(last)).days >= _IC_ALERT_MIN_DAYS
+    except ValueError:
+        # A corrupt stamp must not mute the monitor.
+        return True
+
+
+def _mark_ic_alert_sent(state_dir: Path, trade_date: str) -> None:
+    stamp = _stamp_path(state_dir)
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(trade_date)
+    except OSError:
+        # A read-only data directory must not turn a monitor into a crash.
+        pass
 
 
 def signal_quality_ic_step(ctx: DailyRunContext) -> None:
@@ -353,7 +389,15 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
     t5_sidecar_path = predictions_dir / f"{date_t5_str}.meta.json"
     if not pred_t5_path.exists():
         log.warning("missing t-5 parquet for %s", date_t5_str)
-        _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": None, "lagged_ic_t5_n": 0, "lagged_ic_t5_reason": "missing_t5_parquet"})
+        _write_sidecar(
+            t5_sidecar_path,
+            {
+                "lagged_ic_t5": None,
+                "lagged_ic_t5_n": 0,
+                "lagged_ic_t5_reason": "missing_t5_parquet",
+            },
+            clear=("lagged_ic_error",),
+        )
         ic, n_instruments = None, 0
     else:
         try:
@@ -363,25 +407,49 @@ def signal_quality_ic_step(ctx: DailyRunContext) -> None:
             coverage = n_instruments / len(instruments) if instruments else 0
             if coverage < 0.95:
                 log.warning("low instrument coverage (%.1f%%)", coverage * 100)
-            _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": ic, "lagged_ic_t5_n": n_instruments})
+            _write_sidecar(
+                t5_sidecar_path,
+                {"lagged_ic_t5": ic, "lagged_ic_t5_n": n_instruments},
+                clear=("lagged_ic_error", "lagged_ic_t5_reason"),
+            )
+            # The t-5 derivation failure is recorded on today's file, which the
+            # write above cannot reach; clear it here so a later success wins.
+            _write_sidecar(
+                predictions_dir / f"{trade_date}.meta.json",
+                {},
+                clear=("lagged_ic_error",),
+            )
         except Exception as exc:
             log.error("IC computation failed: %s", exc, exc_info=True)
-            _write_sidecar(t5_sidecar_path, {"lagged_ic_t5": None, "lagged_ic_error": f"{type(exc).__name__}: {exc}"})
+            _write_sidecar(
+                t5_sidecar_path,
+                {"lagged_ic_t5": None, "lagged_ic_error": f"{type(exc).__name__}: {exc}"},
+                clear=("lagged_ic_t5_n", "lagged_ic_t5_reason"),
+            )
+    # One IC voice for the whole system. The old tripwire compared a 20-day
+    # mean against 0.01: the same statistic with a shorter window, no
+    # significance test, and an answer that could disagree with the report's.
     try:
-        mean, n = rolling_lagged_ic(predictions_dir, trade_date)
+        stats = ic_monitor.summarize(ic_monitor.load_series(IC_HISTORY_PATH))
     except Exception as exc:
-        log.error("rolling_lagged_ic failed: %s", exc, exc_info=True)
+        log.error("IC monitor failed: %s", exc, exc_info=True)
         return
-    if n >= _ROLLING_WINDOW and mean is not None and mean < _IC_THRESHOLD:
+
+    if stats.get("alert"):
         if dry_run:
             log.warning("dry-run: alert suppressed")
-        else:
+        elif _ic_alert_due(IC_HISTORY_PATH.parent, trade_date):
             try:
-                if not send_bridge_alert(
+                if send_bridge_alert(
                     title="ashare SIG: lagged IC",
-                    body=f"20d rolling lagged T+5 IC {mean:.4f} < {_IC_THRESHOLD} as of {trade_date} (n={_ROLLING_WINDOW}). Ranking-power decay tripwire.",
+                    body=(
+                        f"{ic_monitor.format_line(stats)} as of {trade_date}. "
+                        "Sustained negative edge; judge the signal before trusting it."
+                    ),
                     timeout=10,
                 ):
-                    log.error("lagged IC alert send failed (returned False)")
+                    _mark_ic_alert_sent(IC_HISTORY_PATH.parent, trade_date)
+                else:
+                    log.error("lagged IC alert send failed (returned False); will retry")
             except Exception as exc:
-                log.error("lagged IC alert send exception: %s", exc)
+                log.error("lagged IC alert send exception: %s; will retry", exc)

@@ -30,11 +30,11 @@ Three machines, three distinct roles:
   - Never edit code here -- it is a push/run/collect target, not a
     dev environment. All edits happen locally in a worktree, then
     push via tar/scp.
-  - SSH key: X500 ed25519 authorized via `C:\ProgramData\ssh\administrators_authorized_keys`
+  - SSH key: W1 ed25519 authorized via `C:\ProgramData\ssh\administrators_authorized_keys`
     (Windows OpenSSH admin user rule -- NOT `~/.ssh/authorized_keys`).
-- **X500 (x500:~/code/ashare-lab)**: permanent archive AND Phase 3+ execution host. Code, models, predictions, and results all land here permanently. Phase 3/4/5 paper engine runs on X500; test results are collected from X500.
+- **W1 (w1:~/code/ashare-lab)**: permanent archive AND Phase 3+ execution host. Code, models, predictions, and results all land here permanently. Phase 3/4/5 paper engine runs on W1; test results are collected from W1.
 
-X500 and GPU machine details in project memory `reference_gpu_machine.md`.
+W1 and GPU machine details in project memory `reference_gpu_machine.md`.
 
 
 ## Dev-First Workflow
@@ -43,9 +43,9 @@ Full flow for any code change:
 
 1. Local worktree edit
 2. Forge review + anti-ai-audit + non-ASCII check
-3. Commit to main, push to x500 remote: `git push x500 main`
+3. Commit to main, push to the bare: `git push origin main` on W1, `git push w1 main` from z66
 4. If GPU training needed: tar/scp worktree to GPU -> run -> scp results back -> local verify -> clean GPU temp files
-5. Sync verified results + data artifacts to X500 (see X500 Sync below)
+5. Sync verified results + data artifacts to W1 (see W1 Sync below)
 
 - Push from the worktree, never the main tree.
 - GPU run scripts (`run_*.py`) are operational and not committed.
@@ -66,26 +66,28 @@ Full flow for any code change:
 3. Clean ashare temp files only (delete `run_*.py`, `*.log`).
    Preserve canonical experiment dir AND any harness forge-bot
    output (`models/*.pt`, `predictions/*.parquet`).
-4. Sync verified results to X500 (see X500 Sync)
+4. Sync verified results to W1 (see W1 Sync)
 
-Order is mandatory: collect -> verify -> clean GPU -> sync X500. Never reverse.
+Order is mandatory: collect -> verify -> clean GPU -> sync W1. Never reverse.
 
 
-## X500 Sync (mandatory after every verified result)
+## W1 Sync (mandatory after every verified result)
 
-X500 is the only permanent store. Local machine reboots unpredictably -- a result that only exists locally is not archived. After local verification passes:
+W1 is the only permanent store. Local machine reboots unpredictably -- a result that only exists locally is not archived. After local verification passes:
 
 ```bash
 # Code
-git push x500 main
+git push w1 main          # from z66
+# on W1 itself the bare is the origin remote
+git push origin main
 
 # Gitignored data (models, predictions, results)
-scp -r results/ x500:code/ashare-lab/
-scp experiments/<dir>/models/*.pt x500:code/ashare-lab/experiments/<dir>/models/
-scp experiments/<dir>/predictions/*.parquet x500:code/ashare-lab/experiments/<dir>/predictions/
+scp -r results/ w1:code/ashare-lab/
+scp experiments/<dir>/models/*.pt w1:code/ashare-lab/experiments/<dir>/models/
+scp experiments/<dir>/predictions/*.parquet w1:code/ashare-lab/experiments/<dir>/predictions/
 ```
 
-Phase 3+ paper engine runs on X500. Test results for Phase 3/4/5 are collected from X500, not local.
+Phase 3+ paper engine runs on W1. Test results for Phase 3/4/5 are collected from W1, not local.
 
 
 ## 60/40 Blend Lock
@@ -101,7 +103,7 @@ ashare group sovereign territory (Zone C): paper.db, models, pipeline, sentinel,
 
 **gpu-win GPU split (user policy 2026-07-25)**: static dual-GPU partition -- GPU 0 (RTX 3080) is RESERVED for local models (llama-server serving), ashare training runs pinned to GPU 1 (RTX 3060 Ti, `CUDA_VISIBLE_DEVICES=1`). Training no longer contends with serving; do NOT stop llama-server for training. Legacy: `batch_experiment.py` may still acquire `H:\gpu.lock` (stale-lock TTL, mtime-based expiry) from the pre-split era.
 
-**X500 timer namespace** (reserved): ashare-wol 17:30, data-update 17:45, pipeline 18:00, dsa-sentinel 18:50, chenditc 21:00, backup 23:00 (CST). Harness dispatcher gets separate namespace per J2.
+**W1 timer namespace** (reserved): ashare-wol 17:30, data-update 17:45, pipeline 18:00, dsa-sentinel 18:50, chenditc 21:00, backup 23:00 (CST). Harness dispatcher gets separate namespace per J2.
 
 Fleet law binding: S1/S2/S2b, known-answer validation, pre-registration, zone discipline, R4 agent contract, Golden Rules 1-6. Full ref: memory `reference_fleet_assignments.md`.
 
@@ -146,7 +148,7 @@ Incidence evidence: project memory `feedback_pipeline_incident_20260713.md`.
 Incidence evidence: `bump_suspension_carry_days` was added to ledger.py and called in pipeline.py:1091, but pipeline.py never imported it. All unit tests passed (mocks masked the missing import). Pipeline crashed on first real run with `NameError`.
 
 - **Unit tests passing ≠ pipeline works.** Mocks hide missing imports, dead code, and schema mismatches. An import that is mocked in tests but missing in production code will never fail in tests.
-- **End-to-end test is mandatory for logic-bearing changes.** After any change to pipeline.py/engine.py/risk.py/ledger.py imports or function signatures, run `python3 -m ashare_lab.cli paper run-all` with real data on X500. This is a HARD GATE -- do not skip even for "obvious" one-line fixes.
+- **End-to-end test is mandatory for logic-bearing changes.** After any change to pipeline.py/engine.py/risk.py/ledger.py imports or function signatures, run `python3 -m ashare_lab.cli paper run-all` with real data on W1. This is a HARD GATE -- do not skip even for "obvious" one-line fixes.
 - **Import smoke test is NOT sufficient.** `python3 -c "from ashare_lab.paper.pipeline import run_daily"` only verifies the import chain resolves. It does NOT verify the function bodies execute without NameError on missing imports that are called deeper in the code path.
 - **New function checklist**: when adding a function to any module, verify: (1) it is imported in every file that calls it, (2) it is mocked in every test file that exercises the calling code path, (3) it is actually called (not dead code).
 - **Forge review is required for all logic-bearing changes.** 3 rounds minimum, fix all confirmed findings before committing. This applies even to "trivial" wiring changes like adding a function call to an aggregator.

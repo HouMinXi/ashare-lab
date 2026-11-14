@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -92,7 +91,7 @@ def _rebacktest_window(
     Returns None (and logs a warning) if pred_path is missing or unreadable.
     mean_rank_ic is reused from the original (IC is independent of slippage/n_drop).
     """
-    from ashare_lab.research.backtest import run_backtest  # noqa: PLC0415
+    from ashare_lab.research.backtest import run_backtest
 
     pred_path = Path(window_result["pred_path"])
     if not pred_path.exists():
@@ -250,7 +249,7 @@ def write_feature_importance(models_dir: Path, exp_dir: Path) -> Path:
     Returns:
         Path to exp_dir/feature_importance/ directory (may be empty on partial failure).
     """
-    from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
+    from qlib.contrib.model.gbdt import LGBModel
 
     fi_dir = exp_dir / "feature_importance"
     fi_dir.mkdir(parents=True, exist_ok=True)

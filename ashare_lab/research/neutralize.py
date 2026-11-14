@@ -124,7 +124,7 @@ def compute_style_factors(
         ["size", "volatility", "momentum"]. NaN values are preserved
         (caller decides how to handle).
     """
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.data import D
 
     fields = [
         "$close",

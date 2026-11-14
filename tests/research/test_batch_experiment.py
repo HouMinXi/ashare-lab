@@ -6,18 +6,15 @@ All tests mock subprocess.run -- no real SSH/SCP calls.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import importlib.util
 
 import pytest
 
 from ashare_lab.research.batch_experiment import (
-    _DEFAULT_GPU_IP,
     _kill_remote_python,
     _recover_result_from_gpu,
     append_result,

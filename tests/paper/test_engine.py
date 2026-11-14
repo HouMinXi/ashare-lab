@@ -1014,7 +1014,7 @@ class TestSuspensionResumeForcedSell:
         # Now stock resumes (volume > 0)
         orders = []  # no pending orders
         prices = _make_prices("S", 10.0, volume=1e6)  # resumed
-        result = settle_day(
+        settle_day(
             conn, "2024-02-01", orders, prices, positions,
             100_000.0, set(), {"csi300": 100.0, "csi1000": 200.0},
             _make_config(),

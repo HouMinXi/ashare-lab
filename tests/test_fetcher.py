@@ -37,7 +37,7 @@ def test_tushare_code_to_qlib_bj():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_today_data_column_mapping():
+def test_fetch_today_data_column_mapping(tmp_path):
     """Tushare DataFrame maps to _CSV_COLUMNS with correct transforms."""
     from ashare_lab.data.fallback import _CSV_COLUMNS
     from ashare_lab.data.fetcher import fetch_today_data
@@ -81,7 +81,7 @@ def test_fetch_today_data_column_mapping():
         patch("ashare_lab.data.fetcher.ts") as mock_ts,
     ):
         mock_ts.pro_api.return_value = mock_pro
-        result = fetch_today_data("2026-06-26")
+        result = fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
     assert "sz000001" in result
     assert "sh600000" in result
@@ -94,7 +94,7 @@ def test_fetch_today_data_column_mapping():
     assert abs(df.iloc[0]["change"] - (-0.018234)) < 1e-6
 
 
-def test_fetch_today_data_compact_date_format():
+def test_fetch_today_data_compact_date_format(tmp_path):
     """Compact YYYYMMDD format is accepted and normalized to YYYY-MM-DD in output."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -123,13 +123,13 @@ def test_fetch_today_data_compact_date_format():
         patch("ashare_lab.data.fetcher.ts") as mock_ts,
     ):
         mock_ts.pro_api.return_value = mock_pro
-        result = fetch_today_data("20260626")
+        result = fetch_today_data("20260626", provider_uri=tmp_path)
 
     assert "sz000001" in result
     assert result["sz000001"].iloc[0]["date"] == "2026-06-26"
 
 
-def test_fetch_today_data_empty_raises():
+def test_fetch_today_data_empty_raises(tmp_path):
     """Empty tushare response raises RuntimeError."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -142,10 +142,10 @@ def test_fetch_today_data_empty_raises():
     ):
         mock_ts.pro_api.return_value = mock_pro
         with pytest.raises(RuntimeError, match="empty"):
-            fetch_today_data("2026-06-26")
+            fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
 
-def test_fetch_today_data_none_raises():
+def test_fetch_today_data_none_raises(tmp_path):
     """None tushare response raises RuntimeError."""
     from ashare_lab.data.fetcher import fetch_today_data
 
@@ -158,7 +158,7 @@ def test_fetch_today_data_none_raises():
     ):
         mock_ts.pro_api.return_value = mock_pro
         with pytest.raises(RuntimeError, match="empty"):
-            fetch_today_data("2026-06-26")
+            fetch_today_data("2026-06-26", provider_uri=tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -296,3 +296,76 @@ def test_stock_names_cache(tmp_path: Path):
     cached = pd.read_csv(cache_path)
     assert list(cached.columns) == ["symbol", "name"]
     assert len(cached) == 2
+
+
+def _stub_fetch_today(monkeypatch, trade_date=None):
+    """Stub everything cmd_fetch_today needs except the backfill under test."""
+    import datetime as dt
+
+    day = trade_date or dt.date(2024, 3, 5)
+    monkeypatch.setattr('ashare_lab.data.calendar.is_trading_day', lambda d: True)
+    monkeypatch.setattr(
+        'ashare_lab.data.calendar.latest_trading_day', lambda d: day)
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.fetch_today_data', lambda d: {'sz000001': object()})
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.fetch_cross_validation_sample',
+        lambda *a, **k: {})
+    monkeypatch.setattr(
+        'ashare_lab.data.fetcher.refresh_stock_names_cache', lambda *a, **k: {})
+    monkeypatch.setattr(
+        'ashare_lab.data.validator.validate_daily_data',
+        lambda *a, **k: type('R', (), {'passed': True, 'warnings': []})())
+    monkeypatch.setattr('ashare_lab.cli._write_csvs', lambda *a, **k: 1)
+    monkeypatch.setattr('ashare_lab.cli._dump_bin_update', lambda *a, **k: None)
+    return day
+
+
+def test_fetch_today_fills_gaps_before_appending(monkeypatch):
+    """The hole is filled first: appending onto it would fold the gap into
+    the factor. A fill failure must not fail the day."""
+    import datetime as dt
+
+    from ashare_lab.cli import cmd_fetch_today
+
+    seen = {}
+
+    def fake_backfill(start, end, provider_uri=None):
+        seen['span'] = (start, end)
+        raise RuntimeError('tushare down')
+
+    _stub_fetch_today(monkeypatch)
+    monkeypatch.setattr('ashare_lab.data.fallback.backfill_missing_dates', fake_backfill)
+    monkeypatch.setattr(
+        'ashare_lab.data.fallback._calendar_dates',
+        lambda provider: {'2024-02-01', '2024-02-28'})
+
+    rc = cmd_fetch_today(type('A', (), {})())
+
+    assert rc == 0
+    assert seen['span'] == (dt.date(2024, 2, 29), dt.date(2024, 3, 4))
+
+
+def test_fetch_today_refreshes_stale_indexes(monkeypatch):
+    """The daily fetch covers stocks only, so an index keeps an older tail
+    until it is refreshed here. A refresh failure must not fail the day."""
+    from ashare_lab.cli import cmd_fetch_today
+
+    seen = {}
+
+    def fake_index_backfill(trade_date, provider_uri=None):
+        seen['date'] = trade_date
+        raise RuntimeError('baostock down')
+
+    _stub_fetch_today(monkeypatch)
+    monkeypatch.setattr(
+        'ashare_lab.data.fallback.backfill_missing_dates', lambda *a, **k: [])
+    monkeypatch.setattr(
+        'ashare_lab.data.fallback._calendar_dates', lambda provider: set())
+    monkeypatch.setattr(
+        'ashare_lab.data.fallback.backfill_stale_indexes', fake_index_backfill)
+
+    rc = cmd_fetch_today(type('A', (), {})())
+
+    assert rc == 0
+    assert seen['date'] == '2024-03-05', 'the day just written is the target'

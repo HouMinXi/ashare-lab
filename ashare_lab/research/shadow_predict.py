@@ -51,18 +51,18 @@ def shadow_predict_for_date(
             survive after inference.
         FileNotFoundError: The resolved model file does not exist.
     """
-    import numpy as np  # noqa: PLC0415
-    import pandas as pd  # noqa: PLC0415
-    import qlib  # noqa: PLC0415
-    from qlib.config import C as _QlibC  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
+    import numpy as np
+    import pandas as pd
+    import qlib
+    from qlib.config import C as _QlibC
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158, Alpha360
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
-    from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
-    from ashare_lab.research.train import ALPHA158_WARMUP_START  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+    from ashare_lab.research.smoke_test import get_all_windows
+    from ashare_lab.research.train import ALPHA158_WARMUP_START
 
-    import ashare_lab.config as cfg  # noqa: PLC0415
+    import ashare_lab.config as cfg
 
     # -- 1. Config merge: baseline + candidate model section ------------------
     # Not reentrant: mutates global cfg.CONFIG_PATH (safe under subprocess isolation).
@@ -138,7 +138,7 @@ def shadow_predict_for_date(
             qlib.init(provider_uri=uri, region=REG_CN)
 
         # -- 6. Build handler -------------------------------------------------
-        HandlerClass = Alpha360 if handler_name == "alpha360" else Alpha158  # noqa: N806
+        HandlerClass = Alpha360 if handler_name == "alpha360" else Alpha158
 
         if model_type in ("alstm", "tra"):
             learn_procs = [
@@ -166,7 +166,7 @@ def shadow_predict_for_date(
         segs = {"test": (trade_date, trade_date)}
 
         if model_type == "tra":
-            from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
+            from qlib.contrib.data.dataset import MTSDatasetH
 
             step_len = int(model_cfg.get("step_len", 20))
             num_states = int(model_cfg.get("routing", {}).get("num_states", 3))
@@ -176,28 +176,28 @@ def shadow_predict_for_date(
                 batch_size=-1, shuffle=True,
             )
         elif model_type == "alstm":
-            from qlib.data.dataset import TSDatasetH  # noqa: PLC0415
+            from qlib.data.dataset import TSDatasetH
 
             step_len = int(model_cfg.get("step_len", 20))
             dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
         else:
-            from qlib.data.dataset import DatasetH  # noqa: PLC0415
+            from qlib.data.dataset import DatasetH
 
             dataset = DatasetH(handler=handler, segments=segs)
 
         # Load persisted model
         if ext == ".pt":
-            import torch  # noqa: PLC0415
+            import torch
 
             model = torch.load(str(model_path), weights_only=False)
             # TRA writer shim (same as predict.py)
             if hasattr(model, "_writer"):
                 model._writer = None
         else:
-            import pickle  # noqa: PLC0415
+            import pickle
 
             with open(model_path, "rb") as mf:
-                model = pickle.load(mf)  # noqa: S301
+                model = pickle.load(mf)
 
         pred_raw = model.predict(dataset, segment="test")
 

@@ -70,7 +70,11 @@ def write_model_meta(
     window_id : str
         Window identifier (e.g. "w11").
     """
-    meta_path = model_out_path.parent / "meta.json"
+    # One file per checkpoint: a second artifact (the live window) shares this
+    # directory, and a single meta.json would be overwritten by whichever model
+    # wrote last. meta.json is still written for walk-forward models so older
+    # readers keep working.
+    meta_path = model_out_path.parent / f"{model_out_path.stem}.meta.json"
     meta = {
         _MODEL_FILE: model_out_path.name,
         _TRAIN_DATE: train_data_end,
@@ -81,8 +85,48 @@ def write_model_meta(
     try:
         meta_path.write_text(json.dumps(meta, indent=2) + "\n")
         log.info("wrote model meta: %s", meta_path)
+        if model_out_path.stem != "wlive":
+            (model_out_path.parent / "meta.json").write_text(
+                json.dumps(meta, indent=2) + "\n"
+            )
     except OSError as exc:
         log.error("failed to write model meta %s: %s", meta_path, exc)
+
+
+def _read_descriptor_file(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    if not path.exists():
+        return None, "absent"
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        return None, "unreadable"
+    return (raw, None) if isinstance(raw, dict) else (None, "unreadable")
+
+
+def read_model_descriptor(model_path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """Read the single preferred descriptor, before freshness validation."""
+    target = model_path.resolve() if model_path.is_symlink() else model_path
+    stem_meta = target.parent / f"{target.stem}.meta.json"
+    meta_path = stem_meta if stem_meta.exists() else model_path.parent / "meta.json"
+    return _read_descriptor_file(meta_path)
+
+
+def has_research_identity(model_path: Path) -> bool:
+    """Inspect retained identity on both the selected entry and resolved target.
+
+    Freshness chooses one descriptor. Admission must not let that precedence
+    hide a research marker in another still-present descriptor or manifest.
+    """
+    for entry in dict.fromkeys((model_path, model_path.resolve())):
+        if entry.name.startswith("wexperiment-") or entry.with_suffix(".window.json").exists():
+            return True
+        for path in (entry.with_suffix(".meta.json"), entry.parent / "meta.json"):
+            descriptor, _ = _read_descriptor_file(path)
+            if descriptor is not None and any(
+                str(descriptor.get(key, "")).startswith("wexperiment-") for key in (_WINDOW_ID, _MODEL_FILE)
+            ):
+                return True
+    return False
 
 
 def read_model_meta(
@@ -102,17 +146,9 @@ def read_model_meta(
         Reasons: "absent", "unreadable", "train_date missing",
         "train_date unparseable", "train_date future", "mismatch".
     """
-    meta_path = model_path.parent / "meta.json"
-    if not meta_path.exists():
-        return None, "absent"
-
-    try:
-        raw = json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None, "unreadable"
-
-    if not isinstance(raw, dict):
-        return None, "unreadable"
+    raw, reason = read_model_descriptor(model_path)
+    if raw is None:
+        return None, reason
 
     train_date_str = raw.get(_TRAIN_DATE)
     if train_date_str is None:
@@ -128,7 +164,7 @@ def read_model_meta(
     if train_date > today:
         return None, "train_date future"
 
-    # Identity: symlink resolve (X500 latest.pt -> wN.pt) OR a
+    # Identity: symlink resolve (W1 latest.pt -> wN.pt) OR a
     # regular-file copy of the named model (gpu-win cannot ship
     # the same symlink; predict.py already treats that as a copy).
     expected_model = raw.get(_MODEL_FILE)

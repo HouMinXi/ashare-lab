@@ -6,7 +6,6 @@ import contextlib
 import datetime as dt
 import json
 import sqlite3
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +17,7 @@ from ashare_lab.paper.ledger import (
     record_nav,
     record_run,
 )
+from tests.module_patch import patched_modules
 from ashare_lab.paper.risk import RiskCheckResult
 
 _MOD = "ashare_lab.paper.pipeline"
@@ -215,16 +215,13 @@ def _pipeline_patches(
         "bump_carry_days": patch(f"{_MOD}.bump_carry_days"),
         "bump_suspension_carry_days": patch(f"{_MOD}.bump_suspension_carry_days"),
         # Patch deferred imports via sys.modules
-        "qlib_data": patch.dict(
-            sys.modules,
+        "qlib_data": patched_modules(
             {"qlib": MagicMock(), "qlib.data": qlib_data_mod},
         ),
-        "baostock": patch.dict(
-            sys.modules,
+        "baostock": patched_modules(
             {"baostock": MagicMock()},
         ),
-        "update_mod": patch.dict(
-            sys.modules,
+        "update_mod": patched_modules(
             {"ashare_lab.data.update": update_mod},
         ),
     }
@@ -358,8 +355,7 @@ class TestDataStaleSkip:
             patch(f"{_MOD}.load_config", return_value=base_config),
             patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
             patch(f"{_MOD}.is_day_settled", return_value=False),
-            patch.dict(
-                sys.modules,
+            patched_modules(
                 {"ashare_lab.data.update": update_mod},
             ),
         ):
@@ -390,8 +386,7 @@ class TestDataStaleSkip:
             patch(f"{_MOD}.load_config", return_value=base_config),
             patch(f"{_MOD}.PROJECT_ROOT", db_path.parent),
             patch(f"{_MOD}.is_day_settled", return_value=False),
-            patch.dict(
-                sys.modules,
+            patched_modules(
                 {"ashare_lab.data.update": update_mod},
             ),
         ):
@@ -712,8 +707,6 @@ class TestPreCommitNavGate:
         """NAV change >20% -> row deleted, preventing corrupted persistence."""
         from ashare_lab.paper.ledger import get_connection, init_schema, record_nav
         from ashare_lab.paper.pipeline import DailyRunContext, _step12_backup_and_finalize
-        from dataclasses import dataclass, field
-        from pathlib import Path
         from unittest.mock import patch
 
         db_path = tmp_path / "test.db"
@@ -817,7 +810,10 @@ class TestHedgePrefetch:
             activate_dd=0.10,
         )
         mock_prices = {"511260": {"close": 10.5, "volume": 1e12, "factor": 1.0, "change": 0.0, "threshold": 0.10}}
-        with patch("ashare_lab.paper.hedge._load_hedge_config", return_value=mock_hedge_cfg),              patch("ashare_lab.paper.pipeline._fetch_hedge_prices") as mock_fetch:
+        with (
+            patch("ashare_lab.paper.hedge._load_hedge_config", return_value=mock_hedge_cfg),
+            patch("ashare_lab.paper.pipeline._fetch_hedge_prices") as mock_fetch,
+        ):
             def side_effect(ctx, syms):
                 ctx.prices.update(mock_prices)
             mock_fetch.side_effect = side_effect
@@ -1073,7 +1069,7 @@ class TestWriteAbcArtifactNavB:
         """nav_b must reflect post-settle positions, not just cash."""
         from ashare_lab.paper.ledger import (
             get_connection, init_schema, snapshot_positions,
-            record_nav, record_run,
+            record_run,
         )
         from ashare_lab.paper.pipeline import _write_abc_artifact, DailyRunContext
 
@@ -1115,7 +1111,7 @@ class TestWriteAbcArtifactNavB:
         ctx.benchmarks = {"csi1000": 5000.0}
 
         # Write artifact
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         # Read artifact
@@ -1160,7 +1156,7 @@ class TestWriteAbcArtifactNavB:
         ctx.paper_cfg = base_config["paper"]
         ctx.benchmarks = {"csi1000": 5000.0}
 
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         artifact_path = tmp_path / "experiments" / "control_books" / "2025-01-06_none.json"

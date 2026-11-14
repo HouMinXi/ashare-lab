@@ -21,12 +21,12 @@ from unittest.mock import patch
 
 from ashare_lab.paper.ledger import get_connection, init_schema, insert_order
 from ashare_lab.paper.pipeline import (
-    DailyRunContext,
     _BOOK_B_IDS,
     _force_reset_book_b,
     _step2_idempotency,
     run_backfill,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 T = "2026-07-24"
 PREV = "2026-07-23"
@@ -171,11 +171,8 @@ class TestStep2ForceEntry:
             pre_ids[book_id] = _seed_day_state(tmp_path / f"paper_b_{book_id}.db", T)
         # n1 / n3 do not exist: the skip path must treat that as a no-op.
 
-        ctx = DailyRunContext.__new__(DailyRunContext)
-        ctx.trade_date = T
-        ctx.force = True
-        ctx.db_path = prod_db
-        ctx.conn = get_connection(prod_db)
+        ctx = make_daily_ctx(T, force=True, db_path=prod_db,
+                             conn=get_connection(prod_db))
 
         rc = _step2_idempotency(ctx)
 

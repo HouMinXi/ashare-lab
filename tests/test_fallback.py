@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from ashare_lab.data.adjust import PrevState
 from ashare_lab.data.fallback import (
     _CSV_COLUMNS,
     _all_instruments,
@@ -204,7 +205,8 @@ class TestFetchSymbol:
         row = rows[0]
         assert row["date"] == "2024-03-01"
         assert row["open"] == pytest.approx(12.5)
-        assert row["factor"] == pytest.approx(1.05)
+        assert row["pre_close"] == pytest.approx(1.05)
+        assert "factor" not in row, "the basis is derived, not taken from the vendor"
         assert row["change"] == pytest.approx(0.008)  # 0.8 / 100
 
     def test_suspended_empty_close_skipped(self):
@@ -221,12 +223,12 @@ class TestFetchSymbol:
         rows = _fetch_symbol(bs, "SZ000001", "2024-03-01", "2024-03-01")
         assert rows == []
 
-    def test_missing_adjustfactor_defaults_to_one(self):
+    def test_a_blank_previous_close_stays_none(self):
         bs = self._make_bs_mock(
             [("2024-03-01", "12.5", "12.8", "12.3", "12.6", "500000", "0.5", "")]
         )
         rows = _fetch_symbol(bs, "SZ000001", "2024-03-01", "2024-03-01")
-        assert rows[0]["factor"] == pytest.approx(1.0)
+        assert rows[0]["pre_close"] is None, "no anchor, so no factor may be invented"
 
     def test_missing_pct_change_defaults_to_zero(self):
         bs = self._make_bs_mock(
@@ -356,7 +358,7 @@ class TestGapFill:
                         "low": 12.3,
                         "close": 12.6,
                         "volume": 1e6,
-                        "factor": 1.0,
+                        "pre_close": 12.5,
                         "change": 0.008,
                     }
                 ]
@@ -394,6 +396,10 @@ class TestGapFill:
 
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
+                patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
                 patch("ashare_lab.data.fallback._dump_bin_update", side_effect=fake_dump),
             ):
                 result = gap_fill("2024-03-01", "2024-03-01", p)
@@ -405,6 +411,10 @@ class TestGapFill:
             p = self._make_provider(Path(tmp), [])
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
+                patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
                 patch("ashare_lab.data.fallback._dump_bin_update"),  # no-op, calendar unchanged
             ):
                 result = gap_fill("2024-03-01", "2024-03-01", p)
@@ -434,6 +444,10 @@ class TestGapFill:
             with (
                 patch("ashare_lab.data.fallback._fetch_all", return_value=self._one_row_data()),
                 patch(
+                    "ashare_lab.data.fallback.last_state",
+                    return_value=(PrevState(12.5, 1.0), "2024-02-29"),
+                ),
+                patch(
                     "ashare_lab.data.fallback._dump_bin_update",
                     side_effect=RuntimeError("dump failed"),
                 ),
@@ -460,6 +474,9 @@ class TestDumpBinUpdate:
             for field in ("open", "close", "high", "low", "volume", "factor", "change"):
                 bin_path = feat / f"{field}.day.bin"
                 with open(bin_path, "wb") as f:
+                    # production layout: a float32 holding the calendar
+                    # index of the first point, then one per point
+                    f.write(struct.pack("<f", 0.0))
                     for _ in dates:
                         f.write(struct.pack("<f", 1.0))
             start = dates[0] if dates else "2024-01-01"
@@ -493,8 +510,8 @@ class TestDumpBinUpdate:
 
         close_bin = provider / "features" / "sh600519" / "close.day.bin"
         data = close_bin.read_bytes()
-        assert len(data) == 8  # 2 x float32
-        vals = struct.unpack("<2f", data)
+        assert len(data) == 12  # header + 2 x float32
+        vals = struct.unpack("<2f", data[4:])  # skip the start-index header
         assert vals[0] == pytest.approx(1.0)
         assert vals[1] == pytest.approx(10.5)
 
@@ -699,7 +716,6 @@ class TestOpenRowExtension:
     def test_early_return_path_extends(self, tmp_path: Path) -> None:
         """T4: early-return path in _dump_bin_update still extends open rows."""
         from ashare_lab.data.fallback import _dump_bin_update
-        from ashare_lab.data.fallback import _write_csvs as _wc
 
         symbols = [f"SH{i:06d}" for i in range(1000)]
 
@@ -854,3 +870,833 @@ class TestIndexMembershipGate:
         return provider
 
     # Reuse _make_csv from TestDumpBinUpdate (same signature, includes 'change' column).
+
+
+# ---------------------------------------------------------------------------
+# backfill_missing_dates
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillMissingDates:
+    def _provider(self, root: Path, dates: list[str]) -> Path:
+        p = root / "provider"
+        (p / "calendars").mkdir(parents=True)
+        (p / "calendars" / "day.txt").write_text("\n".join(dates) + "\n")
+        (p / "features").mkdir()
+        (p / "instruments").mkdir()
+        return p
+
+    def test_fills_gap_and_keeps_calendar_sorted(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        got: list[str] = []
+
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
+            got.append(trade_date)
+            return {"sz000001": pd.DataFrame([{
+                "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
+                "close": 1.0, "volume": 1.0, "factor": 1.0, "change": 0.0,
+            }])}
+
+        def fake_dump(csv_dir: Path, provider_uri: Path) -> None:
+            cal = provider_uri / "calendars" / "day.txt"
+            have = [ln for ln in cal.read_text().splitlines() if ln.strip()]
+            cal.write_text("\n".join(sorted(set(have) | set(got))) + "\n")
+
+        monkeypatch.setattr(
+            "ashare_lab.data.fetcher.fetch_today_data", fake_fetch)
+        monkeypatch.setattr(
+            "ashare_lab.data.fallback._dump_bin_update", fake_dump)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(
+                Path(tmp), ["2024-03-01", "2024-03-05"])
+            filled = backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            calendar = (provider / "calendars" / "day.txt").read_text().splitlines()
+
+        assert filled == ["2024-03-04"]
+        assert got == ["2024-03-04"]
+        assert calendar == sorted(calendar)
+        assert "2024-03-04" in calendar
+
+    def test_failed_day_does_not_undo_filled_days(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
+            if trade_date == '2024-03-04':
+                raise RuntimeError('token locked')
+            return {'sz000001': pd.DataFrame([{
+                'date': trade_date, 'open': 1.0, 'high': 1.0, 'low': 1.0,
+                'close': 1.0, 'volume': 1.0, 'factor': 1.0, 'change': 0.0,
+            }])}
+
+        def fake_dump(csv_dir: Path, provider_uri: Path) -> None:
+            cal = provider_uri / 'calendars' / 'day.txt'
+            have = {ln.strip() for ln in cal.read_text().splitlines() if ln.strip()}
+            added = set()
+            for csv in csv_dir.glob('*.csv'):
+                added.update(line.split(',')[0] for line in csv.read_text().splitlines()[1:])
+            cal.write_text('\n'.join(sorted(have | added)) + '\n')
+
+        monkeypatch.setattr('ashare_lab.data.fetcher.fetch_today_data', fake_fetch)
+        monkeypatch.setattr('ashare_lab.data.fallback._dump_bin_update', fake_dump)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(Path(tmp), ['2024-03-01'])
+            filled = backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            calendar = (provider / 'calendars' / 'day.txt').read_text().splitlines()
+
+        assert filled == ['2024-03-05']
+        assert '2024-03-05' in calendar
+        assert '2024-03-04' not in calendar
+
+    def test_calendar_rewrite_does_not_write_day_txt_directly(self, monkeypatch):
+        import datetime as dt
+
+        from ashare_lab.data.fallback import backfill_missing_dates
+
+        def fake_fetch(trade_date: str, provider_uri=None) -> dict:
+            return {"sz000001": pd.DataFrame([{
+                "date": trade_date, "open": 1.0, "high": 1.0, "low": 1.0,
+                "close": 1.0, "volume": 1.0, "factor": 1.0, "change": 0.0}])}
+
+        real_write = Path.write_text
+
+        def guard(self, *a, **k):
+            if self.name == "day.txt":
+                raise OSError("disk full")
+            return real_write(self, *a, **k)
+
+        monkeypatch.setattr("ashare_lab.data.fetcher.fetch_today_data", fake_fetch)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = self._provider(Path(tmp), ["2024-03-05", "2024-03-01"])
+            (provider / "features" / "sz000001").mkdir(parents=True)
+            for field in ["open", "close", "high", "low", "volume", "factor"]:
+                (provider / "features" / "sz000001" / f"{field}.day.bin").write_bytes(
+                    bytes(4))
+            (provider / "instruments" / "all.txt").write_text(
+                "SZ000001\t2024-03-01\t2024-03-01\n")
+            before = (provider / "calendars" / "day.txt").read_bytes()
+            monkeypatch.setattr(Path, "write_text", guard)
+            backfill_missing_dates(
+                dt.date(2024, 3, 1), dt.date(2024, 3, 5), provider)
+            after = (provider / "calendars" / "day.txt").read_bytes()
+        assert after != before
+        assert b"2024-03-04" in after
+
+
+# ---------------------------------------------------------------------------
+# Index instruments
+# ---------------------------------------------------------------------------
+
+
+class TestFetchSymbolIndexMode:
+    """baostock rejects the adjustfactor field for index instruments."""
+
+    def _make_bs(self, rows):
+        bs = MagicMock()
+        rs = MagicMock()
+        rs.error_code = "0"
+        rs.next.side_effect = [True] * len(rows) + [False]
+        rs.get_row_data.side_effect = list(rows)
+        bs.query_history_k_data_plus.return_value = rs
+        return bs
+
+    def test_index_request_omits_adjustfactor(self):
+        bs = self._make_bs([])
+        _fetch_symbol(bs, "SH000852", "2024-03-01", "2024-03-01", index=True)
+        fields = bs.query_history_k_data_plus.call_args.kwargs["fields"]
+        assert "adjustfactor" not in fields
+
+    def test_a_stock_request_asks_for_unadjusted_prices(self):
+        bs = self._make_bs([])
+        _fetch_symbol(bs, "SH600000", "2024-03-01", "2024-03-01")
+        kwargs = bs.query_history_k_data_plus.call_args.kwargs
+        assert "preclose" in kwargs["fields"]
+        assert "adjustfactor" not in kwargs["fields"], "baostock rejects that field"
+        assert kwargs["adjustflag"] == "3", "raw prices; the store basis is derived"
+
+    def test_index_row_carries_unit_factor(self):
+        rows = [
+            ["2024-03-01", "6700.0", "6750.0", "6600.0", "6630.7753", "1000", "1.5"]
+        ]
+        bs = self._make_bs(rows)
+        out = _fetch_symbol(bs, "SH000852", "2024-03-01", "2024-03-01", index=True)
+        assert len(out) == 1
+        assert out[0]["factor"] == 1.0
+        assert out[0]["close"] == pytest.approx(6630.7753)
+        assert out[0]["change"] == pytest.approx(0.015)
+
+
+class TestInstrumentEndDates:
+    def test_reads_symbol_end_dates(self):
+        from ashare_lab.data.fallback import _instrument_end_dates
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "instruments").mkdir()
+            (root / "instruments" / "all.txt").write_text(
+                "SH000852\t2005-01-04\t2026-10-08\n"
+                "SZ000001\t2000-01-04\t2026-10-26\n"
+            )
+            got = _instrument_end_dates(root)
+        assert got["SH000852"] == "2026-10-08"
+        assert got["SZ000001"] == "2026-10-26"
+
+    def test_missing_file_gives_empty_mapping(self):
+        from ashare_lab.data.fallback import _instrument_end_dates
+
+        with tempfile.TemporaryDirectory() as td:
+            assert _instrument_end_dates(Path(td)) == {}
+
+
+class TestBackfillStaleIndexes:
+    """An index only refreshes on a full package swap, so it falls behind."""
+
+    def _write_instruments(self, root, end_dates):
+        (root / "instruments").mkdir(parents=True, exist_ok=True)
+        body = "".join(f"{s}\t2005-01-04\t{d}\n" for s, d in end_dates.items())
+        (root / "instruments" / "all.txt").write_text(body)
+
+    def _frame(self, date):
+        return pd.DataFrame(
+            [[date, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 0.0]], columns=list(_CSV_COLUMNS)
+        )
+
+    def test_fills_index_that_lags_behind(self):
+        from ashare_lab.data.fallback import backfill_stale_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_instruments(
+                root, {"SH000852": "2026-10-08", "SZ000001": "2026-10-26"}
+            )
+            with patch(
+                "ashare_lab.data.fallback._fetch_all",
+                return_value={"SH000852": self._frame("2026-10-09")},
+            ) as fetch, patch(
+                "ashare_lab.data.fallback._dump_bin_update"
+            ) as dump:
+                filled = backfill_stale_indexes("2026-10-26", provider_uri=root)
+
+        assert filled == ["SH000852"]
+        assert dump.called
+        args, kwargs = fetch.call_args
+        assert list(args[0]) == ["SH000852"], "only the lagging index is fetched"
+        assert args[1] == "2026-10-09", "starts the day after the stored end date"
+        assert args[2] == "2026-10-26"
+        assert args[3] == len(args[0]), "one login covers the batch"
+        assert kwargs.get("index") is True, "index mode must reach _fetch_all"
+
+    def test_one_login_covers_the_whole_batch(self):
+        """Fetching every stale index takes about two seconds, inside the
+        baostock idle timeout, so re-logging in per symbol only adds cost."""
+        from ashare_lab.data.fallback import backfill_stale_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_instruments(
+                root,
+                {
+                    "SH000852": "2026-10-08",
+                    "SH000300": "2026-10-08",
+                    "SZ000001": "2026-10-26",
+                },
+            )
+            with patch(
+                "ashare_lab.data.fallback._fetch_all",
+                return_value={"SH000852": self._frame("2026-10-09")},
+            ) as fetch, patch("ashare_lab.data.fallback._dump_bin_update"):
+                backfill_stale_indexes("2026-10-26", provider_uri=root)
+
+        args, _ = fetch.call_args
+        assert sorted(args[0]) == ["SH000300", "SH000852"], "both stale indexes"
+        assert args[3] == 2, "the interval spans the batch, not one symbol"
+
+    def test_skips_index_already_current(self):
+        from ashare_lab.data.fallback import backfill_stale_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_instruments(root, {"SH000852": "2026-10-26"})
+            with patch("ashare_lab.data.fallback._fetch_all") as fetch, patch(
+                "ashare_lab.data.fallback._dump_bin_update"
+            ) as dump:
+                filled = backfill_stale_indexes("2026-10-26", provider_uri=root)
+
+        assert filled == []
+        assert not fetch.called
+        assert not dump.called
+
+    def test_empty_fetch_writes_nothing(self):
+        from ashare_lab.data.fallback import backfill_stale_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_instruments(root, {"SH000852": "2026-10-08"})
+            with patch(
+                "ashare_lab.data.fallback._fetch_all", return_value={}
+            ), patch("ashare_lab.data.fallback._dump_bin_update") as dump:
+                filled = backfill_stale_indexes("2026-10-26", provider_uri=root)
+
+        assert filled == []
+        assert not dump.called
+
+    def test_unknown_symbol_is_not_fetched(self):
+        from ashare_lab.data.fallback import backfill_stale_indexes
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._write_instruments(root, {"SZ000001": "2026-10-26"})
+            with patch("ashare_lab.data.fallback._fetch_all") as fetch:
+                filled = backfill_stale_indexes("2026-10-26", provider_uri=root)
+
+        assert filled == []
+        assert not fetch.called
+
+
+class TestDumpBinTrailingSymbol:
+    """A symbol can lag the calendar that its peers moved forward.
+
+    Unlike the helper in TestDumpBinUpdate, these bins carry the production
+    layout: a leading float32 holding the calendar index of the first point.
+    The append path never reads that header, but deciding whether a symbol
+    has fallen behind does.
+    """
+
+    @staticmethod
+    def _make_provider(
+        root: Path,
+        calendar: list[str],
+        points: int,
+        start_index: int = 0,
+        field_points: dict[str, int] | None = None,
+    ) -> Path:
+        (root / "calendars").mkdir(parents=True)
+        (root / "calendars" / "day.txt").write_text(
+            "\n".join(calendar) + "\n", encoding="utf-8"
+        )
+        (root / "instruments").mkdir()
+        first = calendar[start_index]
+        last = calendar[start_index + points - 1]
+        (root / "instruments").joinpath("all.txt").write_text(
+            f"SH000852\t{first}\t{last}\n", encoding="utf-8"
+        )
+        feat = root / "features" / "sh000852"
+        feat.mkdir(parents=True)
+        fields = (
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "factor",
+            "change",
+            "adjclose",
+            "amount",
+            "vwap",
+        )
+        for field in fields:
+            n = (field_points or {}).get(field, points)
+            with open(feat / f"{field}.day.bin", "wb") as f:
+                f.write(struct.pack("<f", float(start_index)))
+                for _ in range(n):
+                    f.write(struct.pack("<f", 1.0))
+        return root
+
+    @staticmethod
+    def _make_csv(csv_dir: Path, dates: list[str]) -> None:
+        """Write the csv the way _write_csvs does: upper-case symbol name,
+        while the feature directory it must reach is lower case."""
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        head = "date,open,high,low,close,volume,factor,change\n"
+        body = "".join(f"{d},2,2,2,2,200,1.0,0.0\n" for d in dates)
+        (csv_dir / "SH000852.csv").write_text(head + body, encoding="utf-8")
+
+    def test_appends_rows_a_trailing_symbol_is_missing(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04", "2024-03-05"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        before = bin_path.stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-04", "2024-03-05"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert bin_path.stat().st_size == before + 8, "two points must land"
+        cal_after = (
+            (provider / "calendars" / "day.txt").read_text().splitlines()
+        )
+        assert cal_after == cal, "the calendar already had them; no duplicates"
+
+    def test_leaves_a_current_symbol_alone(self, tmp_path: Path) -> None:
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=2)
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        before = bin_path.stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-04"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert bin_path.stat().st_size == before, "nothing to catch up"
+
+    def test_header_offset_decides_whether_rows_are_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """The header holds the calendar index of the first point. Ignoring
+        it makes a symbol that already reaches the calendar end look like it
+        trails, and the rows get appended a second time."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = [
+            "2024-03-01",
+            "2024-03-04",
+            "2024-03-05",
+            "2024-03-06",
+            "2024-03-07",
+        ]
+        provider = self._make_provider(
+            tmp_path / "qlib", cal, points=2, start_index=3
+        )
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        before = bin_path.stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-07"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert bin_path.stat().st_size == before, "already at the calendar end"
+
+    def test_trails_when_a_single_field_lags(self, tmp_path: Path) -> None:
+        """A run that died mid-write leaves some fields short of the others.
+        Judging only by close would skip the symbol and strand volume."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04", "2024-03-05"]
+        provider = self._make_provider(
+            tmp_path / "qlib", cal, points=3, field_points={"volume": 1}
+        )
+        vol_path = provider / "features" / "sh000852" / "volume.day.bin"
+        close_path = provider / "features" / "sh000852" / "close.day.bin"
+        vol_before = vol_path.stat().st_size
+        close_before = close_path.stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-04", "2024-03-05"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert vol_path.stat().st_size > vol_before, "the lagging field must fill"
+        assert close_path.stat().st_size == close_before, (
+            "close already holds those days and must not grow"
+        )
+
+    def test_repeat_run_does_not_shift_a_current_field(
+        self, tmp_path: Path
+    ) -> None:
+        """A production stock keeps fields the daily fetch never writes, so
+        adjclose sits weeks behind close. A repeat run must not read that as
+        licence to append the already-current fields a second time, which
+        would push every later value onto the wrong day."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04", "2024-03-05"]
+        provider = self._make_provider(
+            tmp_path / "qlib", cal, points=3, field_points={"adjclose": 1}
+        )
+        feat = provider / "features" / "sh000852"
+        close_before = (feat / "close.day.bin").stat().st_size
+        vol_before = (feat / "volume.day.bin").stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-05"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert (feat / "close.day.bin").stat().st_size == close_before, (
+            "close already holds 03-05"
+        )
+        assert (feat / "volume.day.bin").stat().st_size == vol_before, (
+            "volume already holds 03-05"
+        )
+
+    def test_unmaintained_field_does_not_force_a_write(
+        self, tmp_path: Path
+    ) -> None:
+        """adjclose, amount and vwap arrive with the full package and are
+        never written here, so they sit weeks behind. Letting them vote on
+        whether a symbol trails would wake the writer for rows it cannot
+        place, leaving it with nothing to do."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04", "2024-03-05"]
+        provider = self._make_provider(
+            tmp_path / "qlib", cal, points=3, field_points={"adjclose": 1}
+        )
+        feat = provider / "features" / "sh000852"
+        sizes = {
+            b.name: b.stat().st_size for b in sorted(feat.glob("*.day.bin"))
+        }
+        # 03-04 is exactly the slot adjclose is waiting for, and no
+        # maintained field wants it
+        self._make_csv(tmp_path / "csvs", ["2024-03-04"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        after = {b.name: b.stat().st_size for b in sorted(feat.glob("*.day.bin"))}
+        assert after == sizes, "every field already holds 03-04 or is not ours"
+
+    def test_a_blank_calendar_line_does_not_shift_positions(
+        self, tmp_path: Path
+    ) -> None:
+        """Bin slots are calendar positions, so a blank line in the calendar
+        file would offset every date after it and park values on the wrong
+        day. qlib skips blank lines when it builds those positions, and so
+        must every reader here."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        close_path = provider / "features" / "sh000852" / "close.day.bin"
+        before = close_path.stat().st_size
+        self._make_csv(tmp_path / "csvs", ["2024-03-04"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        assert close_path.stat().st_size > before, (
+            "03-04 sits at position 1 once the blank line is skipped"
+        )
+
+    def test_end_date_tracks_what_was_written(self, tmp_path: Path) -> None:
+        """Advertising a date the bin does not hold turns a lookup into a
+        silent miss, so the stored end date must follow the data."""
+        from ashare_lab.data.fallback import _dump_bin_update, _instrument_end_dates
+
+        cal = ["2024-03-01", "2024-03-04", "2024-03-05"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        self._make_csv(tmp_path / "csvs", ["2024-03-04", "2024-03-05"])
+
+        _dump_bin_update(tmp_path / "csvs", provider)
+
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        points = (bin_path.stat().st_size - 4) // 4
+        assert _instrument_end_dates(provider)["SH000852"] == cal[points - 1]
+
+    def test_a_symbol_without_a_directory_is_not_marked_as_updated(
+        self, tmp_path: Path
+    ) -> None:
+        """An index row for a symbol whose features have not landed must keep its
+        own end date: rolling it forward claims data that does not exist, and the
+        stale-index repair reads exactly this file to decide what is current."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        all_txt = provider / "instruments" / "all.txt"
+        all_txt.write_text(
+            all_txt.read_text(encoding="utf-8")
+            + "SZ999999\t2024-03-01\t2024-03-01\n",
+            encoding="utf-8",
+        )
+
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, ["2024-03-04"])
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        _dump_bin_update(csv_dir, provider)
+
+        rows = {
+            line.split("\t")[0]: line.split("\t")[1:]
+            for line in all_txt.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        assert rows["SH000852"][1] == "2024-03-04", "the written symbol advances"
+        assert rows["SZ999999"][1] == "2024-03-01", (
+            "nothing was written for it, so its end date must not move"
+        )
+
+    def test_a_csv_without_a_feature_directory_is_skipped(self, tmp_path: Path) -> None:
+        """A symbol the provider has no directory for cannot be written, but it
+        must not stop the symbols that can."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01", "2024-03-04"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        csv_dir = tmp_path / "csvs"
+        self._make_csv(csv_dir, ["2024-03-04"])
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        _dump_bin_update(csv_dir, provider)
+
+        bin_path = provider / "features" / "sh000852" / "close.day.bin"
+        assert (bin_path.stat().st_size - 4) // 4 == 2, "the symbol with a directory still got its row"
+
+    def test_a_run_with_nothing_to_write_raises(self, tmp_path: Path) -> None:
+        """If every CSV lacks a feature directory the run wrote nothing; that is
+        a broken provider layout, not a quiet success."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        # The date must be new to the calendar, otherwise the function returns
+        # early and never reaches the write loop this test is about.
+        cal = ["2024-03-01"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        csv_dir = tmp_path / "csvs"
+        csv_dir.mkdir()
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
+
+    def test_a_failed_run_leaves_the_calendar_untouched(self, tmp_path: Path) -> None:
+        """The dates are appended before the write loop, so a run that writes
+        nothing must put them back. Otherwise the next run finds every date
+        present, skips the loop, and reports success over missing data."""
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        cal = ["2024-03-01"]
+        provider = self._make_provider(tmp_path / "qlib", cal, points=1)
+        day_txt = provider / "calendars" / "day.txt"
+        before = day_txt.read_bytes()
+
+        csv_dir = tmp_path / "csvs"
+        csv_dir.mkdir()
+        head = "date,open,high,low,close,volume,factor,change\n"
+        (csv_dir / "SZ999999.csv").write_text(
+            head + "2024-03-04,2,2,2,2,200,1.0,0.0\n", encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
+        assert day_txt.read_bytes() == before, "the calendar must not move"
+
+        with pytest.raises(RuntimeError, match="no instruments updated"):
+            _dump_bin_update(csv_dir, provider)
+
+
+class TestBinSlotAlignment:
+    """A bin carries positions, not dates, so the writer has to place each row
+    by its calendar index. Appending positionally files a resumed symbol's row
+    under the first session it missed and shifts the rest one slot early; the
+    factor absorbs the difference, so nothing downstream notices."""
+
+    FIELDS = ("open", "high", "low", "close", "volume", "factor", "change")
+
+    def _provider(self, tmp_path, dates):
+        p = tmp_path / "qlib"
+        (p / "calendars").mkdir(parents=True)
+        (p / "calendars" / "day.txt").write_text("\n".join(dates) + "\n", encoding="utf-8")
+        (p / "instruments").mkdir()
+        (p / "instruments" / "all.txt").write_text("SH600519\t2024-03-01\t\n", encoding="utf-8")
+        (p / "features" / "sh600519").mkdir(parents=True)
+        return p
+
+    def _bin(self, provider, field, start, values):
+        import struct
+
+        path = provider / "features" / "sh600519" / f"{field}.day.bin"
+        path.write_bytes(
+            struct.pack("<f", float(start)) + b"".join(struct.pack("<f", float(v)) for v in values)
+        )
+        return path
+
+    def _read(self, path):
+        import struct
+
+        raw = path.read_bytes()
+        return struct.unpack("<f", raw[:4])[0], list(struct.unpack(f"<{len(raw)//4 - 1}f", raw[4:]))
+
+    def _csv(self, tmp_path, date):
+        d = tmp_path / "csvs"
+        d.mkdir(exist_ok=True)
+        (d / "SH600519.csv").write_text(
+            "date,open,high,low,close,volume,factor,change\n"
+            f"{date},12.0,12.5,11.5,12.2,1000.0,0.5,0.02\n",
+            encoding="utf-8",
+        )
+        return d
+
+    def _seed(self, provider):
+        for field in self.FIELDS:
+            self._bin(provider, field, 0, [10.0 if field != "factor" else 0.5])
+
+    def test_a_resumed_symbol_lands_on_its_own_date(self, tmp_path):
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._provider(tmp_path, ["2024-03-01", "2024-03-04", "2024-03-05"])
+        self._seed(provider)
+        csv_dir = self._csv(tmp_path, "2024-03-05")
+
+        _dump_bin_update(csv_dir, provider)
+
+        start, close = self._read(provider / "features" / "sh600519" / "close.day.bin")
+        assert start == 0
+        assert close[0] == pytest.approx(10.0)
+        assert close[1] != close[1], "the missed session must be written as NaN"
+        assert close[2] == pytest.approx(12.2), "the row landed on the wrong date"
+
+    def test_a_truncated_field_bin_is_refused_not_rounded(self, tmp_path):
+        from ashare_lab.data.fallback import _dump_bin_update
+
+        provider = self._provider(tmp_path, ["2024-03-01", "2024-03-04"])
+        self._seed(provider)
+        path = provider / "features" / "sh600519" / "close.day.bin"
+        raw = path.read_bytes()
+        path.write_bytes(raw + b"\x00\x00")  # an interrupted append
+        csv_dir = self._csv(tmp_path, "2024-03-04")
+
+        with pytest.raises(RuntimeError, match="truncated feature file"):
+            _dump_bin_update(csv_dir, provider)
+
+class TestToStoreBasis:
+    """Raw vendor rows must land on the store's front-adjusted basis."""
+
+    def _frame(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_without_a_corporate_action_the_factor_is_unchanged(self):
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=10.0, factor=0.5)  # raw 20.0
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 20.0, "high": 20.5, "low": 19.5,
+                 "close": 20.2, "volume": 1e6, "pre_close": 20.0, "change": 0.01},
+            ]
+        )
+
+        out = _to_store_basis(frame, prev)
+
+        assert out.loc[0, "factor"] == pytest.approx(0.5)
+        assert out.loc[0, "close"] == pytest.approx(10.1)
+        assert out.loc[0, "change"] == pytest.approx(0.01)
+
+    def test_a_dividend_moves_the_factor_and_keeps_the_return_sane(self):
+        """A 5% ex-dividend gap: the raw price drops, the adjusted series does not."""
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=100.0, factor=1.0)
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 95.0, "high": 96.0, "low": 94.0,
+                 "close": 95.0, "volume": 1e7, "pre_close": 95.0, "change": 0.0},
+            ]
+        )
+
+        out = _to_store_basis(frame, prev)
+
+        assert out.loc[0, "factor"] == pytest.approx(100.0 / 95.0), "factor absorbs the dividend"
+        assert out.loc[0, "close"] == pytest.approx(100.0), "the adjusted series is continuous"
+        assert abs(out.loc[0, "change"]) < 1e-9
+
+
+    def test_a_row_without_a_previous_close_is_refused(self):
+        from ashare_lab.data.adjust import PrevState
+        from ashare_lab.data.fallback import _to_store_basis
+
+        prev = PrevState(close=10.0, factor=1.0)
+        frame = self._frame(
+            [
+                {"date": "2024-03-01", "open": 10.0, "high": 10.0, "low": 10.0,
+                 "close": 10.0, "volume": 1e6, "pre_close": None, "change": 0.0},
+            ]
+        )
+
+        with pytest.raises(ValueError, match="previous close"):
+            _to_store_basis(frame, prev)
+
+
+def test_a_failed_bin_write_leaves_the_calendar_untouched(tmp_path):
+    """The calendar must never name a date whose rows were not written.
+
+    A reader treats calendar presence as data freshness; an exception halfway
+    through the bins would otherwise leave a date that looks fresh and is empty.
+    """
+    import builtins
+
+    from ashare_lab.data import fallback as fb
+
+    provider = tmp_path / "p"
+    (provider / "calendars").mkdir(parents=True)
+    (provider / "calendars" / "day.txt").write_text("2024-02-29\n", encoding="utf-8")
+    (provider / "instruments").mkdir()
+    (provider / "instruments" / "all.txt").write_text(
+        "SH600000 2015-01-01 2999-12-31\n", encoding="utf-8"
+    )
+    sym = provider / "features" / "sh600000"
+    sym.mkdir(parents=True)
+    body = struct.pack("<f", 0.0) + struct.pack("<f", 10.0)
+    for field in ("open", "high", "low", "close", "volume", "factor", "change"):
+        (sym / f"{field}.day.bin").write_bytes(body)
+
+    csv_dir = tmp_path / "csv"
+    csv_dir.mkdir()
+    (csv_dir / "SH600000.csv").write_text(
+        "date,open,high,low,close,volume,factor,change\n"
+        "2024-03-01,10.1,10.2,10.0,10.1,1000.0,1.0,0.01\n",
+        encoding="utf-8",
+    )
+
+    real_open = builtins.open
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        if str(file).endswith(".day.bin") and mode == "ab":
+            raise RuntimeError("disk full")
+        return real_open(file, mode, *args, **kwargs)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        with patch("builtins.open", failing_open):
+            fb._dump_bin_update(csv_dir, provider)
+
+    assert (provider / "calendars" / "day.txt").read_text(encoding="utf-8") == "2024-02-29\n"
+
+
+class TestSocketDeadline:
+    """A stalled baostock session must fail loudly instead of blocking forever."""
+
+    def test_a_socket_created_inside_the_block_carries_the_deadline(self):
+        import socket
+
+        from ashare_lab.data.fallback import _socket_deadline
+
+        before = socket.getdefaulttimeout()
+        with _socket_deadline(3):
+            probe = socket.socket()
+            assert probe.gettimeout() == 3, "the session socket inherits the default"
+            probe.close()
+        assert socket.getdefaulttimeout() == before, "the process default is restored"
+
+    def test_a_timeout_becomes_a_readable_failure(self):
+        import socket
+
+        from ashare_lab.data import fallback as fb
+
+        with patch.object(fb, "_fetch_all", side_effect=socket.timeout("stalled")):
+            with pytest.raises(RuntimeError, match="timed out"):
+                fb._fetch_all_with_deadline(["SH600000"], "2024-03-01", "2024-03-01", 50, seconds=2)
+
+    def test_the_default_is_restored_even_when_the_fetch_explodes(self):
+        import socket
+
+        from ashare_lab.data import fallback as fb
+
+        before = socket.getdefaulttimeout()
+        with patch.object(fb, "_fetch_all", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                fb._fetch_all_with_deadline(["SH600000"], "2024-03-01", "2024-03-01", 50, seconds=2)
+        assert socket.getdefaulttimeout() == before

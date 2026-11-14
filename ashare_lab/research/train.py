@@ -28,7 +28,7 @@ def _nvidia_smi_mem() -> int | None:
     Respects CUDA_VISIBLE_DEVICES: when set, queries the corresponding
     physical GPU instead of always reading GPU 0.
     """
-    import subprocess  # noqa: PLC0415
+    import subprocess
 
     try:
         cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
@@ -51,6 +51,7 @@ def _nvidia_smi_mem() -> int | None:
 # Alpha158 requires ~1 year of price history before the first train_start.
 # This constant is shared with smoke_test.py; both must use the same value.
 ALPHA158_WARMUP_START = "2017-01-01"
+CHECKPOINT_SUFFIXES = {"lgbm": ".pkl", "densemble": ".pkl", "alstm": ".pt", "tra": ".pt"}
 
 
 def apply_price_filter(
@@ -75,7 +76,7 @@ def apply_price_filter(
     Returns:
         Filtered Series with the same MultiIndex structure as pred.
     """
-    from qlib.data import D  # noqa: PLC0415
+    from qlib.data import D
 
     if pred.empty:
         log.debug("price filter: empty pred; returning as-is")
@@ -125,6 +126,21 @@ def apply_price_filter(
     return pred[mask]
 
 
+def resolve_test_segment(window: dict) -> tuple[str, str]:
+    """The span the trainer evaluates on.
+
+    The freshest walk-forward window can have its test period still in the
+    future (window 11: test 2027-01-01..2026-11-06), which leaves the test
+    segment empty.  qlib's pytorch_tra then reads metrics["MSE"] off an empty
+    frame and raises KeyError after the first epoch, so a live retrain could
+    never finish.  A serve-now model has no held-out period to report; it is
+    trained on everything that exists, so report on the validation span.
+    """
+    if window["test_start"] > window["test_end"]:
+        return window["valid_start"], window["valid_end"]
+    return window["test_start"], window["test_end"]
+
+
 def train_window(
     window: dict,
     exp_dir: Path,
@@ -163,25 +179,30 @@ def train_window(
                 prediction scores AFTER price filter.
             label: MultiIndex Series (datetime, instrument) -> float,
                 next-period return labels for the test set.
+
+    Raises:
+        ValueError: The resolved score segment has no sample with finite raw
+            and learned labels, or the model configuration is unsupported.
     """
     # mlflow >=2.x deprecated the filesystem tracking backend used by qlib's
     # experiment recorder.  Set the opt-out flag before any qlib/mlflow import
     # so the file store remains usable until a tracking backend migration is done.
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
-    import qlib  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158, Alpha360  # noqa: PLC0415
-    from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
-    from qlib.data.dataset import DatasetH, TSDatasetH  # noqa: PLC0415
-    from qlib.contrib.data.dataset import MTSDatasetH  # noqa: PLC0415
+    import numpy as np
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158, Alpha360
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.data.dataset import DatasetH, TSDatasetH
+    from qlib.contrib.data.dataset import MTSDatasetH
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
-    window_id: int = window["window_id"]
+    window_id = window["window_id"]
 
     log.info(
-        "W%d: train %s..%s | valid %s..%s | test %s..%s [%s]",
+        "W%s: train %s..%s | valid %s..%s | test %s..%s [%s]",
         window_id,
         window["train_start"],
         window["train_end"],
@@ -192,26 +213,33 @@ def train_window(
         universe,
     )
 
+    if window["test_start"] > window["test_end"]:
+        _fallback = resolve_test_segment(window)
+        log.info(
+            "W%s: test period has not started (%s > %s); evaluating on %s..%s",
+            window_id, window["test_start"], window["test_end"],
+            _fallback[0], _fallback[1],
+        )
+
     # qlib.init() must only be called once per process; subsequent calls while
     # a QlibRecorder is active raise RecorderInitializationError.  Guard here
     # so walk-forward windows W2..W6 don't re-initialize.
-    from qlib.config import C as _QlibC  # noqa: PLC0415
+    from qlib.config import C as _QlibC
 
     if not getattr(_QlibC, "registered", False):
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI), region=REG_CN)
 
     # Select data handler from config (alpha158 or alpha360).
     cfg_handler = load_config().get("model", {}).get("handler", "alpha158").lower()
-    HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158  # noqa: N806
-    log.info("W%d: handler=%s", window_id, cfg_handler)
+    HandlerClass = Alpha360 if cfg_handler == "alpha360" else Alpha158
+    log.info("W%s: handler=%s", window_id, cfg_handler)
 
     cfg_model = load_config().get("model", {})
     model_type = cfg_model.get("type", "lgbm").lower()
 
-    VALID_MODEL_TYPES = {"lgbm", "alstm", "tra", "densemble"}
-    if model_type not in VALID_MODEL_TYPES:
+    if model_type not in CHECKPOINT_SUFFIXES:
         raise ValueError(
-            f"unknown model.type={model_type!r}, expected one of {sorted(VALID_MODEL_TYPES)}"
+            f"unknown model.type={model_type!r}, expected one of {sorted(CHECKPOINT_SUFFIXES)}"
         )
 
     effective_seed = seed if seed is not None else 42
@@ -229,11 +257,8 @@ def train_window(
             {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
             {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
             {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-            # Scope Fillna to features only (NOT labels):
-            #   - Labels are already clean after DropnaLabel + CSZScoreNorm.
-            #   - Unscoped Fillna would silently replace NaN labels with 0
-            #     (the median after z-score), corrupting degenerate training
-            #     samples instead of surfacing the error.
+            # Fill features only. Normalizing constant labels can leave NaNs;
+            # replacing them with zero would hide unusable training samples.
             # ALSTM fix: NaN features -> NaN predictions -> NaN IC ->
             #   best_param never assigned -> UnboundLocalError at model load.
         ]
@@ -262,52 +287,24 @@ def train_window(
     segs = {
         "train": (window["train_start"], window["train_end"]),
         "valid": (window["valid_start"], window["valid_end"]),
-        "test": (window["test_start"], window["test_end"]),
+        "test": resolve_test_segment(window),
     }
 
-    # Determine seq_len for time-series models (TRA/ALSTM).
-    # Tabular models (lgbm, densemble) have no sequence requirement.
-    _seq_len = 0
-    if model_type == "alstm":
-        _seq_len = cfg_model.get("step_len", 20)
-    elif model_type == "tra":
-        _seq_len = cfg_model.get("step_len", 60)
-
-    # Extend test segment backward so every date in [test_start, test_end]
-    # has a full seq_len lookback inside the segment.  Without this,
-    # MTSDatasetH/TSDatasetH yield zero test sequences when the test span
-    # is shorter than seq_len, and pytorch_tra.py:322 crashes with
-    # KeyError: 'MSE' on the empty metrics frame after all epochs finish.
-    true_test_start = window["test_start"]
-    if _seq_len > 0:
-        from qlib.data import D as _D  # noqa: PLC0415
-
-        _cal = _D.calendar(
-            start_time=ALPHA158_WARMUP_START,
-            end_time=window["test_end"],
+    # Check only scoring endpoints, not the history used by time-series samplers.
+    # Alpha360 can fill missing raw labels, and normalization can leave NaN labels.
+    score_dates = slice(*segs["test"])
+    learned = handler.fetch(score_dates, col_set="label", data_key="learn").iloc[:, 0]
+    raw = handler.fetch(score_dates, col_set="label", data_key="raw").iloc[:, 0]
+    if not (np.isfinite(learned) & np.isfinite(raw.reindex(learned.index))).any():
+        raise ValueError(
+            f"test segment has no labelled samples: {segs['test'][0]}..{segs['test'][1]}; "
+            "no finite forward label remains after preprocessing"
         )
-        _cal = sorted(_cal)
-        # Find the index of test_start in the calendar.
-        _test_start_idx = None
-        for _i, _d in enumerate(_cal):
-            if str(_d)[:10] >= true_test_start:
-                _test_start_idx = _i
-                break
-        if _test_start_idx is not None and _test_start_idx >= _seq_len:
-            _extended = _cal[_test_start_idx - _seq_len]
-            _extended_str = str(_extended)[:10]
-            if _extended_str < true_test_start:
-                segs["test"] = (_extended_str, window["test_end"])
-                log.info(
-                    "W%d: test segment extended %s -> %s (seq_len=%d warmup)",
-                    window_id, _extended_str, true_test_start, _seq_len,
-                )
-        else:
-            log.warning(
-                "W%d: cannot extend test warmup (test_start_idx=%s, seq_len=%d); "
-                "crash may still occur on short test spans",
-                window_id, _test_start_idx, _seq_len,
-            )
+
+    # Time-series datasets retain the full handler history. Their segments
+    # select output samples, not the feature lookback. Extending the test
+    # segment here would add validation rows to the model's test metric.
+    true_test_start = window["test_start"]
 
     if model_type == "alstm":
         step_len = cfg_model.get("step_len", 20)
@@ -317,7 +314,7 @@ def train_window(
             # internally via view + permute.  Use flat DatasetH to avoid
             # double-windowing (TSDatasetH would yield (N, step_len, 360)).
             dataset = DatasetH(handler=handler, segments=segs)
-            log.info("W%d: ALSTM alpha360 flat path (DatasetH)", window_id)
+            log.info("W%s: ALSTM alpha360 flat path (DatasetH)", window_id)
         else:
             dataset = TSDatasetH(handler=handler, segments=segs, step_len=step_len)
     elif model_type == "tra":
@@ -355,11 +352,11 @@ def train_window(
             batch_size=tra_batch_size,
             shuffle=True,
         )
-        log.info("W%d: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
+        log.info("W%s: MTSDatasetH seq_len=%d num_states=%d", window_id, step_len, num_states)
         # ponytail: pin_memory on MTSDatasetH iter; upgrade to DataLoader if
         # profiling shows host-to-device transfer is still the bottleneck.
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             if _torch.cuda.is_available():
                 _orig_iter = dataset.__class__.__iter__
@@ -389,11 +386,11 @@ def train_window(
         d_feat = cfg_model.get("d_feat", 360)
         if cfg_handler == "alpha360":
             # Flat variant: takes (N, 360) and reshapes to (N, 60, 6) internally.
-            from qlib.contrib.model.pytorch_alstm import ALSTM  # noqa: PLC0415
+            from qlib.contrib.model.pytorch_alstm import ALSTM
         else:
             # TS variant: takes TSDatasetH output directly.
-            from qlib.contrib.model.pytorch_alstm_ts import ALSTM  # noqa: PLC0415
-        log.info("W%d: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
+            from qlib.contrib.model.pytorch_alstm_ts import ALSTM
+        log.info("W%s: ALSTM d_feat=%d step_len=%d GPU=%s", window_id, d_feat, step_len, cfg_model.get("GPU", 0))
         model = ALSTM(
             d_feat=d_feat,
             hidden_size=cfg_model.get("hidden_size", 64),
@@ -407,9 +404,9 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_alstm = None
-        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
+        import torch
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             _original_fit_alstm = model.fit
 
@@ -418,7 +415,7 @@ def train_window(
                     return _original_fit_alstm(dataset, *a, **kw)
 
             model.fit = _amp_fit
-            log.info("W%d: AMP enabled (bfloat16)", window_id)
+            log.info("W%s: AMP enabled (bfloat16)", window_id)
         _cuda_available = torch.cuda.is_available()
         if _cuda_available:
             torch.cuda.reset_peak_memory_stats()
@@ -432,20 +429,21 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, "
+                    "nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "tra":
         # TRAModel: Temporal Routing Adaptor (KDD 2021).
         # GPU device is auto-detected via torch.cuda.is_available() at module level;
         # no explicit GPU parameter in TRAModel constructor.
-        from qlib.contrib.model.pytorch_tra import TRAModel  # noqa: PLC0415
+        from qlib.contrib.model.pytorch_tra import TRAModel
 
         backbone_cfg: dict = dict(cfg_model.get("backbone", {}))
         # routing_cfg is already validated and fetched in the MTSDatasetH block above;
         # reuse it here so num_states is guaranteed consistent between dataset and model.
         log.info(
-            "W%d: TRAModel backbone=%s routing=%s transport=%s pretrain=%s n_epochs=%d",
+            "W%s: TRAModel backbone=%s routing=%s transport=%s pretrain=%s n_epochs=%d",
             window_id,
             backbone_cfg,
             routing_cfg,
@@ -464,9 +462,9 @@ def train_window(
             seed=effective_seed,
         )
         _original_fit_tra = None
-        import torch  # noqa: PLC0415  -- needed for GPU peak tracking even without AMP
+        import torch
         if cfg_model.get("use_amp", False):
-            import torch as _torch  # noqa: PLC0415
+            import torch as _torch
 
             # bf16 tensor .numpy() crashes -- no numpy bf16 dtype.
             # Cast to fp32 before the original assign_data writes back.
@@ -486,7 +484,7 @@ def train_window(
                     return _original_fit_tra(dataset, *a, **kw)
 
             model.fit = _amp_fit
-            log.info("W%d: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
+            log.info("W%s: AMP enabled (bfloat16) + assign_data fp32 cast", window_id)
         _cuda_available = torch.cuda.is_available()
         if _cuda_available:
             torch.cuda.reset_peak_memory_stats()
@@ -500,19 +498,18 @@ def train_window(
                 _alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 _resv_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
                 _smi_after = _nvidia_smi_mem()
-                log.info("W%d: GPU peak — allocated: %.1f MB, reserved: %.1f MB, nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
+                log.info("W%s: GPU peak — allocated: %.1f MB, reserved: %.1f MB, "
+                    "nvidia-smi delta: %s MB (reportable peak ≈ reserved + 0.5GB context)",
                          window_id, _alloc_mb, _resv_mb,
                          _smi_after - _smi_before if _smi_before is not None and _smi_after is not None else "N/A")
     elif model_type == "densemble":
-        from qlib.contrib.model.double_ensemble import DEnsembleModel  # noqa: PLC0415
-
-        import numpy as np  # noqa: PLC0415
+        from qlib.contrib.model.double_ensemble import DEnsembleModel
 
         # DEnsembleModel has no seed param; best-effort via global np.random.seed.
         # Safe only under subprocess isolation (one train_window call per process).
         np.random.seed(effective_seed)
 
-        log.info("W%d: DEnsembleModel num_models=%d epochs=%d", window_id,
+        log.info("W%s: DEnsembleModel num_models=%d epochs=%d", window_id,
                  cfg_model.get("num_models", 6), cfg_model.get("epochs", 28))
         model = DEnsembleModel(
             base_model="gbm",
@@ -550,30 +547,28 @@ def train_window(
             lgb_kwargs["gpu_platform_id"] = cfg_model.get("gpu_platform_id", 0)
             lgb_kwargs["gpu_device_id"] = cfg_model.get("gpu_device_id", 0)
         num_boost_round = cfg_model.get("num_boost_round", 500)
-        log.info("W%d: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
+        log.info("W%s: LGB device=%s num_boost_round=%d", window_id, lgb_device, num_boost_round)
         model = LGBModel(**lgb_kwargs)
         model.fit(dataset, num_boost_round=num_boost_round)
 
     # Persist model.  TRA and ALSTM use torch.save; LGB uses pickle.
     models_dir = exp_dir / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / f"w{window_id}{CHECKPOINT_SUFFIXES[model_type]}"
     if model_type in ("alstm", "tra"):
-        import torch  # noqa: PLC0415
-
-        model_path = models_dir / f"w{window_id}.pt"
+        import torch
         torch.save(model, str(model_path))
     else:
-        model_path = models_dir / f"w{window_id}.pkl"
         model.to_pickle(path=str(model_path))
-    log.info("W%d: model saved -> %s", window_id, model_path)
+    log.info("W%s: model saved -> %s", window_id, model_path)
 
     # Write model metadata for staleness gate (10-03)
     try:
-        from ashare_lab.research.model_meta import write_model_meta  # noqa: PLC0415
+        from ashare_lab.research.model_meta import write_model_meta
 
         write_model_meta(model_path, window["train_end"], f"w{window_id}")
     except Exception as exc:
-        log.error("W%d: write_model_meta failed: %s", window_id, exc)
+        log.error("W%s: write_model_meta failed: %s", window_id, exc)
 
     # -----------------------------------------------------------------------
     # Predict on test set and extract labels.
@@ -612,7 +607,7 @@ def train_window(
             # Fetch raw labels from the underlying handler; Spearman rank-IC
             # is scale-invariant so raw (unprocessed) labels give identical
             # IC to z-score normalised learn-set labels.
-            from qlib.data.dataset.handler import DataHandlerLP  # noqa: PLC0415
+            from qlib.data.dataset.handler import DataHandlerLP
 
             raw = handler.fetch(col_set="label", data_key=DataHandlerLP.DK_R)
             # Handler MultiIndex order may be (instrument, datetime);
@@ -622,7 +617,7 @@ def train_window(
             label = raw.loc[true_test_start : window["test_end"]].iloc[:, 0]
 
     log.info(
-        "W%d: %d predictions after price filter, %d labels",
+        "W%s: %d predictions after price filter, %d labels",
         window_id,
         len(pred),
         len(label),
@@ -633,10 +628,19 @@ def train_window(
 
 if __name__ == "__main__":
     import argparse
+    import hashlib
+    import json
     import sys
 
+    from ashare_lab.config import load_config
+
     # Deferred import to avoid circular dependency (smoke_test imports train)
-    from ashare_lab.research.smoke_test import get_all_windows, get_window  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import (
+        get_all_windows,
+        get_live_window,
+        get_window,
+    )
+    from ashare_lab.research.windows import rebase_window
 
     parser = argparse.ArgumentParser(
         description="Walk-forward window training driver"
@@ -644,8 +648,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--exp-dir",
         type=Path,
-        default=Path(__file__).resolve().parent.parent.parent,
-        help="Experiment output directory (default: repo root)",
+        default=None,
+        help="Experiment output directory (required for date overrides; otherwise repo root)",
     )
     parser.add_argument(
         "--windows",
@@ -675,14 +679,67 @@ if __name__ == "__main__":
         action="store_true",
         help="Re-train windows whose model file already exists",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Train the live window instead: three rolling years ending on the "
+            "last trading day, no held-out period, written as wlive.pt"
+        ),
+    )
+    parser.add_argument(
+        "--train-end",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Move the window anchor: retrain with training data through this date. "
+            "Valid and test are re-derived from it; without it the scheduled "
+            "window is used unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--valid-months",
+        type=int,
+        default=None,
+        help="Validation calendar months (default: walk_forward.step_months).",
+    )
+    parser.add_argument(
+        "--test-months",
+        type=int,
+        default=None,
+        help="Test calendar months (default: walk_forward.step_months).",
+    )
     args = parser.parse_args()
+    rebased = any(value is not None for value in (args.train_end, args.valid_months, args.test_months))
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    if rebased:
+        if args.live or args.serve_now is not None:
+            parser.error("date overrides are research-only; --live and --serve-now cannot be rebased")
+        if args.exp_dir is None or args.exp_dir.resolve() == repo_root:
+            parser.error("date overrides require --exp-dir outside the repository root output")
+        if not args.windows or not args.windows.strip() or len(args.windows.split(",")) != 1:
+            parser.error("date overrides require exactly one explicit --windows ID")
+    if args.exp_dir is None:
+        args.exp_dir = repo_root
 
     if args.serve_now is not None and args.windows:
         log.error("--serve-now and --windows are mutually exclusive")
         sys.exit(2)
+    if args.live and (args.windows or args.serve_now is not None):
+        log.error("--live cannot be combined with --windows or --serve-now")
+        sys.exit(2)
 
     # Resolve windows
-    if args.serve_now is not None:
+    if args.live:
+        window = get_live_window()
+        selected = [window]
+        log.info(
+            "live window: train %s..%s, no held-out period (evaluation is "
+            "paper trading)",
+            window["train_start"], window["train_end"],
+        )
+    elif args.serve_now is not None:
         # get_all_windows stops at the last window whose test period has
         # started, so a freshly-trainable window is invisible to it. Ask
         # for the step directly.
@@ -692,7 +749,7 @@ if __name__ == "__main__":
             sys.exit(2)
         selected = [window]
         log.info(
-            "serve-now: step %d -> W%d train %s..%s",
+            "serve-now: step %d -> W%s train %s..%s",
             args.serve_now, window["window_id"],
             window["train_start"], window["train_end"],
         )
@@ -727,21 +784,64 @@ if __name__ == "__main__":
         log.error("empty window selection -- nothing to train")
         sys.exit(2)
 
-    # Train each window
+    experiment_contract = None
+    experiment_root = args.exp_dir.resolve()
+    if rebased:
+        source_window_id = selected[0]["window_id"]
+        window = rebase_window(selected[0], args.train_end, args.valid_months, args.test_months)
+        experiment_contract = {
+            "source_window_id": source_window_id,
+            "window": window,
+            "universe": args.universe,
+            "config": load_config(),
+        }
+        digest = hashlib.sha256(json.dumps(experiment_contract, sort_keys=True).encode()).hexdigest()[:16]
+        window["window_id"] = f"experiment-{digest}"
+        args.exp_dir = experiment_root / f"experiment-{digest}"
+        selected = [window]
+        log.info(
+            "rebased W%s: train %s..%s, valid %s..%s, test %s..%s",
+            window["window_id"], window["train_start"], window["train_end"],
+            window["valid_start"], window["valid_end"], window["test_start"], window["test_end"],
+        )
+
+    # Train each window. Reusing an experiment cannot change its provenance.
+    model_type = load_config().get("model", {}).get("type", "lgbm").lower()
+    if model_type not in CHECKPOINT_SUFFIXES:
+        parser.error(f"unknown model.type={model_type!r}")
+    suffix = CHECKPOINT_SUFFIXES[model_type]
     models_dir = args.exp_dir / "models"
+    if experiment_contract is not None:
+        manifest = models_dir / f"w{selected[0]['window_id']}.window.json"
+        checkpoint = models_dir / f"w{selected[0]['window_id']}{suffix}"
+        existing_outputs = list(models_dir.iterdir()) if models_dir.is_dir() else []
+        for path in (args.exp_dir, models_dir, manifest, checkpoint, *existing_outputs):
+            if path.is_symlink() or path.is_junction() or not path.resolve().is_relative_to(experiment_root):
+                raise ValueError(f"experiment output alias is not allowed: {path}")
+            if path.is_file() and path.stat().st_nlink > 1:
+                raise ValueError(f"experiment output alias is not allowed: {path}")
+        if manifest.exists():
+            if json.loads(manifest.read_text(encoding="utf-8")) != experiment_contract:
+                raise ValueError("existing experiment contract does not match; use a new output root")
+        elif checkpoint.exists():
+            raise ValueError("existing experiment checkpoint has no contract; use a new output root")
+        else:
+            models_dir.mkdir(parents=True, exist_ok=True)
+            with manifest.open("x", encoding="utf-8") as record:
+                record.write(json.dumps(experiment_contract, indent=2, sort_keys=True) + "\n")
     models_dir.mkdir(parents=True, exist_ok=True)
     trained = 0
     for window in selected:
         wid = window["window_id"]
-        model_path = models_dir / f"w{wid}.pt"
+        model_path = models_dir / f"w{wid}{suffix}"
         if model_path.exists() and not args.force:
-            log.info("W%d: model exists, skipping (use --force to re-train)", wid)
+            log.info("W%s: model exists, skipping (use --force to re-train)", wid)
             continue
         try:
             train_window(window, exp_dir=args.exp_dir, universe=args.universe)
             trained += 1
         except Exception as exc:
-            log.error("W%d: training failed: %s", wid, exc, exc_info=True)
+            log.error("W%s: training failed: %s", wid, exc, exc_info=True)
             sys.exit(1)
 
     log.info("trained %d/%d windows", trained, len(selected))

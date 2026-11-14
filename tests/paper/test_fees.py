@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ashare_lab.paper.fees import FeeResult, calculate_fees
+from ashare_lab.paper.fees import calculate_fees
 
 
 class TestCalculateFees:

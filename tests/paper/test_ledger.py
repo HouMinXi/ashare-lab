@@ -8,8 +8,7 @@ from pathlib import Path
 import pytest
 
 from ashare_lab.paper.ledger import (
-    IntegrityResult,
-    BackupResult,
+    _golden_period,
     bump_carry_days,
     check_db_integrity,
     cleanup_old_backups,
@@ -771,8 +770,6 @@ class TestGoldenBackup:
 
     def test_golden_backup_not_overwritten(self, db_path: Path, tmp_path: Path) -> None:
         """Existing golden backup is never overwritten."""
-        import datetime as dt
-
         conn = get_connection(db_path)
         init_schema(conn)
         conn.close()
@@ -780,7 +777,7 @@ class TestGoldenBackup:
         backup_dir = tmp_path / "backups"
         golden_dir = backup_dir / "golden"
         golden_dir.mkdir(parents=True)
-        existing = golden_dir / f"{dt.date.today().strftime('%Y-%m')}.db"
+        existing = golden_dir / f"{_golden_period()}.db"
         existing.write_bytes(b"original")
         existing.chmod(0o444)
 

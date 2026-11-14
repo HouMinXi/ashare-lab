@@ -80,6 +80,44 @@ def get_window(step: int) -> dict:
     }
 
 
+def get_live_window() -> dict:
+    """A production window: three rolling years ending on the last trading day.
+
+    There is no held-out period. The model is fitted on everything that exists,
+    which is the point -- the newest walk-forward window trains on data that is
+    months old by construction, because a window cannot end inside its own test
+    span. Quality for this artifact is judged by paper trading, not by a test
+    slice.
+
+    The test segment mirrors the validation span so the trainer has samples to
+    score at the end of a run. Both overlap the tail of training, so neither
+    number is out-of-sample and neither should be reported as if it were.
+    """
+    cfg = load_config()
+    wf = cfg["walk_forward"]
+    train_window_years: int | None = wf.get("train_window_years") or 3
+    step_months: int = wf["step_months"]
+
+    train_end = latest_trading_day()
+    rolling_start = train_end - relativedelta(years=train_window_years)
+    safety_floor = dt.date.fromisoformat(wf["train_start"])
+    train_start = max(rolling_start, safety_floor)
+
+    valid_start = train_end - relativedelta(months=step_months) + relativedelta(days=1)
+
+    return {
+        "step": -1,
+        "window_id": "live",
+        "train_start": str(train_start),
+        "train_end": str(train_end),
+        "valid_start": str(valid_start),
+        "valid_end": str(train_end),
+        "test_start": str(valid_start),
+        "test_end": str(train_end),
+        "is_complete": False,
+    }
+
+
 def get_all_windows() -> list[dict]:
     """Return all WindowDicts where test_start <= latest_trading_day().
 
@@ -121,14 +159,14 @@ def run_smoke_test(provider_uri: Path | None = None) -> dict:
             n_predictions (int): number of predictions after price filter
             ok (bool): rank_ic is finite and non-NaN
     """
-    import qlib  # noqa: PLC0415
-    from qlib.config import REG_CN  # noqa: PLC0415
-    from qlib.contrib.data.handler import Alpha158  # noqa: PLC0415
-    from qlib.contrib.model.gbdt import LGBModel  # noqa: PLC0415
-    from qlib.data.dataset import DatasetH  # noqa: PLC0415
-    from scipy.stats import spearmanr  # noqa: PLC0415
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.contrib.data.handler import Alpha158
+    from qlib.contrib.model.gbdt import LGBModel
+    from qlib.data.dataset import DatasetH
+    from scipy.stats import spearmanr
 
-    from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
 
     if provider_uri is None:
         provider_uri = DEFAULT_PROVIDER_URI

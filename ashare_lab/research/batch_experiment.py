@@ -1,6 +1,6 @@
 """Orchestrator for model matrix experiments.
 
-Runs on X500 (Linux), SSHes to GPU (admin@192.168.100.11) per-cell.
+Runs on W1 (Linux), SSHes to GPU (admin@192.168.100.11) per-cell.
 Each cell = one candidate config x one walk-forward window, executed
 via matrix_runner.py in a subprocess on the GPU host.
 
@@ -43,14 +43,14 @@ def ensure_gpu_online(
     Raises:
         RuntimeError: If machine does not come online within timeout.
     """
-    import time  # noqa: PLC0415
+    import time
 
     if _ping_ok(ip):
         log.info("GPU %s already online", ip)
         return
 
     try:
-        from wakeonlan import wake  # noqa: PLC0415
+        from wakeonlan import wake
         wake(mac, ip_address=_broadcast_for(ip))
         log.info("WOL sent to %s (%s)", ip, mac)
     except ImportError:
@@ -71,8 +71,8 @@ def ensure_gpu_online(
 
 def _broadcast_for(ip: str) -> str:
     """Derive broadcast address from local interface matching the target IP's subnet."""
-    import ipaddress  # noqa: PLC0415
-    import netifaces  # noqa: PLC0415
+    import ipaddress
+    import netifaces
 
     target = ipaddress.IPv4Address(ip)
     for iface in netifaces.interfaces():
@@ -105,8 +105,8 @@ def _ping_ok(ip: str) -> bool:
 
 def _wait_ssh(ip: str, port: int = 22, timeout: int = 60, poll: int = 3) -> None:
     """Poll until SSH port accepts connections."""
-    import socket  # noqa: PLC0415
-    import time  # noqa: PLC0415
+    import socket
+    import time
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -367,7 +367,7 @@ def _run_matrix_inner(
     jsonl_path = str(Path(output_dir) / "results.jsonl")
 
     # SCP baseline.yaml to GPU at start.
-    from ashare_lab.config import CONFIG_PATH  # noqa: PLC0415
+    from ashare_lab.config import CONFIG_PATH
     scp_config_to_gpu(str(CONFIG_PATH), gpu_host, gpu_repo)
 
     configs = discover_configs(configs_dir)
@@ -376,7 +376,7 @@ def _run_matrix_inner(
         return
 
     if windows is None:
-        from ashare_lab.research.smoke_test import get_all_windows  # noqa: PLC0415
+        from ashare_lab.research.smoke_test import get_all_windows
         all_wins = get_all_windows()
         windows = [w["window_id"] for w in all_wins]
 
@@ -465,7 +465,7 @@ def _run_matrix_inner(
                     record["model"] = seed_tag
 
                     # SCP artifacts BEFORE marking complete (W2-F2: a cell
-                    # is complete only when its parquets are on X500).
+                    # is complete only when its parquets are on W1).
                     pred_name = f"pred_w{wid}_seed{seed}.parquet"
                     scp_pred_from_gpu(
                         gpu_host, gpu_repo,
@@ -575,7 +575,7 @@ def _average_seeds(
     completed: set[tuple[str, int]],
 ) -> None:
     """Average predictions across seeds, recompute metrics, write _avg record."""
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
 
     avg_tag = f"{tag}_avg"
     if (avg_tag, wid) in completed:
@@ -607,15 +607,15 @@ def _average_seeds(
         return
     label = pd.read_parquet(labels_path)["label"]
 
-    from ashare_lab.research.metrics import (  # noqa: PLC0415
+    from ashare_lab.research.metrics import (
         daily_rank_ic,
         aggregate_window_metrics,
         compute_max_drawdown,
     )
-    from ashare_lab.research.smoke_test import get_window  # noqa: PLC0415
-    from ashare_lab.research.backtest import run_backtest  # noqa: PLC0415
-    from ashare_lab.config import load_config  # noqa: PLC0415
-    from datetime import datetime, timezone  # noqa: PLC0415
+    from ashare_lab.research.smoke_test import get_window
+    from ashare_lab.research.backtest import run_backtest
+    from ashare_lab.config import load_config
+    from datetime import datetime, timezone
 
     window = get_window(wid - 1)
     cfg = load_config()
@@ -677,7 +677,7 @@ def main() -> None:
         if args.windows else None
     )
 
-    from ashare_lab.config import PROJECT_ROOT  # noqa: PLC0415
+    from ashare_lab.config import PROJECT_ROOT
 
     run_matrix(
         configs_dir=args.configs_dir,

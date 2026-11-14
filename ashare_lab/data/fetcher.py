@@ -68,7 +68,10 @@ def _tushare_code_to_qlib(ts_code: str) -> str:
     return f"{exchange.lower()}{code}"
 
 
-def fetch_today_data(trade_date: str) -> dict[str, pd.DataFrame]:
+def fetch_today_data(
+    trade_date: str,
+    provider_uri: Path | None = None,
+) -> dict[str, pd.DataFrame]:
     """Fetch all stocks via tushare pro.daily() for one trading day.
 
     Args:
@@ -109,10 +112,149 @@ def fetch_today_data(trade_date: str) -> dict[str, pd.DataFrame]:
                     "volume": float(row["vol"]),
                     "factor": 1.0,
                     "change": float(row["pct_chg"]) / 100.0,
+                    # Restated previous close: its ratio to yesterday's raw
+                    # close is exactly the corporate action the factor absorbs.
+                    "pre_close": float(row["pre_close"]),
                 }
             ]
         )
-    return result
+    return _apply_store_basis(result, date_str, provider_uri)
+
+
+def _apply_store_basis(
+    rows: dict[str, pd.DataFrame],
+    trade_date: str,
+    provider_uri: Path | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Put today's raw prices on the adjustment basis the store already uses.
+
+    ``pro.daily`` returns unadjusted prices. The store holds forward-adjusted
+    ones (``close = raw * factor``, factor carried forward from the last dump),
+    so appending raw rows with ``factor`` 1.0 splits one series into two bases.
+    Yesterday's close is scaled by the cumulative factor and today's is not; the
+    gap is a corporate action read as a price move, and a stock with a factor of
+    0.07 posts a 1,300% day.
+
+    Each row's factor is the last stored factor times the corporate action
+    implied by ``pre_close``.
+
+    Raises:
+        RuntimeError: when a symbol has history that cannot be read, when a
+            symbol's factor cannot be computed, or when the batch looks
+            systematically wrong (see
+            :func:`ashare_lab.data.adjust.systemic_break`). Nothing is written in
+            those cases: a row on the wrong basis is worse than no row, because
+            the next run cannot tell it from a real price.
+    """
+    import datetime as dt
+    import math
+
+    from ashare_lab.data.adjust import (
+        BREAK_RETURN,
+        adjusted_return,
+        next_factor,
+        scale_prices,
+        systemic_break,
+    )
+    from ashare_lab.data.calendar import previous_trading_day
+    from ashare_lab.data.store_state import calendar, feature_dir, last_state
+    from ashare_lab.data.update import DEFAULT_PROVIDER_URI
+
+    uri = Path(provider_uri) if provider_uri is not None else DEFAULT_PROVIDER_URI
+    out: dict[str, pd.DataFrame] = {}
+    returns: dict[str, float] = {}
+    skipped: list[str] = []
+
+    # The session the store must already reach. Taken from the exchange, not
+    # from the store calendar: on the first run of a day the calendar gains the
+    # date only later, in _dump_bin_update, so a store-calendar comparison would
+    # never fire on the path it is meant to guard.
+    prev_session = previous_trading_day(dt.date.fromisoformat(trade_date)).isoformat()
+    stored = calendar(uri)
+    if stored and stored[-1] < prev_session:
+        raise RuntimeError(
+            f"store calendar ends {stored[-1]}, before {prev_session} (the session "
+            f"preceding {trade_date}); backfill the hole before appending"
+        )
+
+    for symbol, df in rows.items():
+        row = df.iloc[0].to_dict()
+        state = last_state(uri, symbol)
+        if state is None:
+            if feature_dir(uri, symbol).is_dir():
+                # Files exist but no readable row: the tail is unwritten or
+                # corrupt. Guessing factor 1.0 here is how the defect returns.
+                raise RuntimeError(
+                    f"{symbol}: feature files exist but hold no readable row; "
+                    "refusing to append on an unknown basis"
+                )
+            # A symbol with no directory at all is new: its series starts today,
+            # so factor 1.0 is its own basis rather than a contradiction.
+            out[symbol] = df
+            continue
+
+        prev, prev_date = state
+        if prev_date >= trade_date:
+            # The day is already stored for this symbol. Dropping it keeps the
+            # writer from touching a row the store already owns.
+            log.debug("%s already stored at %s; skipping", symbol, prev_date)
+            continue
+
+        # A symbol may lag the calendar because it was suspended -- its
+        # pre_close is then the last price it traded, so the ratio is one -- or
+        # because its own rows are missing for sessions it traded, in which case
+        # the ratio carries the missed move and would be written as an action.
+        # The two are indistinguishable from one day's data, so an unexplained
+        # gap is skipped and reported rather than absorbed.
+        if prev_date < prev_session:
+            drift = abs(prev.raw_close / float(row["pre_close"]) - 1.0)
+            if drift > 1e-3:
+                log.warning(
+                    "%s: stored history ends %s, before %s; skipping this row "
+                    "(implied move %.2f%% is not a corporate action)",
+                    symbol, prev_date, prev_session, drift * 100,
+                )
+                skipped.append(symbol)
+                continue
+
+        prices = {k: float(row[k]) for k in ("open", "high", "low", "close")}
+        for field, value in prices.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{symbol}: {field} is not a usable price ({value!r})")
+
+        factor = next_factor(prev, float(row["pre_close"]))
+        scaled = scale_prices(prices, factor)
+        new_row = dict(row)
+        new_row.update(scaled)
+        new_row["factor"] = factor
+        out[symbol] = pd.DataFrame([new_row])
+        returns[symbol] = adjusted_return(prev, scaled["close"])
+
+    # The share is over the whole day's fetch, not over the rows that survived
+    # the per-symbol checks: a targeted backfill carries only the laggards, so
+    # a denominator of survivors would call any such batch systemic.
+    # Only a full-market batch can say anything about the market: a targeted
+    # backfill carries exactly the laggards, so every row in it lags by design.
+    if len(rows) >= 1000 and len(skipped) / len(rows) > 0.05:
+        raise RuntimeError(
+            f"{len(skipped)} symbols lag the calendar by more than one session on "
+            f"{trade_date}; that is a store hole, not a suspension. Backfill first. "
+            f"First offenders: {', '.join(skipped[:5])}"
+        )
+
+    broken = systemic_break(returns)
+    if broken:
+        raise RuntimeError(
+            f"{len(broken)} of {len(returns)} symbols move more than "
+            f"{BREAK_RETURN:.0%} after adjustment on {trade_date}; refusing to write. "
+            f"First offenders: {', '.join(broken[:5])}"
+        )
+
+    # pre_close is scaffolding for the adjustment above; the frame that leaves
+    # this function keeps the CSV contract every caller already expects.
+    for symbol, df in out.items():
+        out[symbol] = df[_CSV_COLUMNS]
+    return out
 
 
 def fetch_cross_validation_sample(
@@ -132,7 +274,7 @@ def fetch_cross_validation_sample(
         Empty dict if akshare unavailable or all symbols fail.
     """
     try:
-        import akshare as ak  # noqa: PLC0415
+        import akshare as ak
     except ImportError:
         log.warning("akshare not available, skipping cross-validation")
         return {}

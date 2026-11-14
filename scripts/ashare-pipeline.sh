@@ -117,6 +117,13 @@ sync_code_to_gpu() {
     rm -rf "$STAGING"
     mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
     cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
+    # The retrain runs on this host too, and it imports train.py and the window
+    # helper train.py exports.  Leaving them out pinned the GPU at whatever
+    # version was deployed by hand: the 2026-11 retrain failed on a train.py
+    # that predated --serve-now by three months.
+    cp "$REPO/ashare_lab/research/train.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/smoke_test.py" "$STAGING/ashare_lab/research/"
+    cp "$REPO/ashare_lab/research/windows.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/model_meta.py" "$STAGING/ashare_lab/research/"
     cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
     # matrix_runner and matrix configs may not exist on fresh deploys.
@@ -185,10 +192,23 @@ try_gpu_inference() {
         'type H:\ollama\logs\gpu-last-consumer.txt 2>NUL' 2>/dev/null | tr -d '\r')
     gpu_restore_target=$(resolve_gpu_restore_target "$_llama_running" "$_last_consumer")
     echo "GPU consumer detected: $gpu_restore_target"
+    # The GPU is dedicated to this pipeline: leave it idle afterwards instead
+    # of handing it back to a serving process that would pin the whole card.
+    # This host has a single card and llama-server is what holds its memory,
+    # so the target has to be the one that stops llama-server as well.
+    # gpu-switch.bat's plain "training" stops only OllamaService and says so
+    # in its own echo, which would leave all 8 GiB pinned.
+    if [ "${ASHARE_GPU_DEDICATED:-1}" = "1" ]; then
+        echo "GPU dedicated to ashare, releasing card instead of restoring $gpu_restore_target"
+        gpu_restore_target=training-3080
+    fi
 
-    # W4: clear GPU for predict (stop ollama + llama-server)
-    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training' || \
-        echo "WARNING: gpu-switch training failed (non-fatal)"
+    # W4: clear GPU for predict. The comment below used to say this stops
+    # both, but plain "training" leaves llama-server holding the card, which
+    # is why predict kept falling back to GPU 1. Use the target that stops
+    # llama-server too.
+    ssh -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" 'H:\gpu-switch.bat training-3080' || \
+        echo "WARNING: gpu-switch training-3080 failed (non-fatal)"
 
     # Run predict.py on GPU
     local predict_rc=0

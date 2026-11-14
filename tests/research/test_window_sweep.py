@@ -135,9 +135,9 @@ class TestRunCellWiring:
     load path and window resolution run for real."""
 
     def test_overlay_and_turnover_reach_record(self, tmp_path, monkeypatch) -> None:
-        import ashare_lab.research.backtest as backtest_mod  # noqa: PLC0415
-        import ashare_lab.research.train as train_mod  # noqa: PLC0415
-        from ashare_lab.research import smoke_test as st  # noqa: PLC0415
+        import ashare_lab.research.backtest as backtest_mod
+        import ashare_lab.research.train as train_mod
+        from ashare_lab.research import smoke_test as st
 
         baseline = _load_baseline()
         candidate = {
@@ -210,8 +210,8 @@ class TestRunCellWiring:
     def test_turnover_key_omitted_when_unavailable(
         self, tmp_path, monkeypatch
     ) -> None:
-        import ashare_lab.research.backtest as backtest_mod  # noqa: PLC0415
-        import ashare_lab.research.train as train_mod  # noqa: PLC0415
+        import ashare_lab.research.backtest as backtest_mod
+        import ashare_lab.research.train as train_mod
 
         baseline = _load_baseline()
         candidate = {

@@ -17,6 +17,8 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from ashare_lab.paper.ledger import init_schema
 from ashare_lab.paper.pipeline import (
     timing_multiplier,
@@ -24,9 +26,20 @@ from ashare_lab.paper.pipeline import (
     _write_abc_artifact,
     _step12_book_b,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 
 # -- timing_multiplier -------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _cd_tmp_path(tmp_path, monkeypatch):
+    """Keep artifact writes inside tmp_path.
+
+    _write_abc_artifact builds a relative path, so without this the suite
+    writes fixture artifacts into the real experiments/control_books/
+    directory whenever it runs from a working checkout.
+    """
+    monkeypatch.chdir(tmp_path)
 
 class TestTimingMultiplier:
     def test_none_model_returns_one(self):
@@ -141,7 +154,7 @@ class TestABCArtifact:
 
         book_conn = sqlite3.connect(str(book_b_db))
         book_conn.row_factory = sqlite3.Row
-        _write_abc_artifact(ctx, book_conn, "none", 1.0)
+        _write_abc_artifact(ctx, book_conn, "none", 1.0, None)
         book_conn.close()
 
         artifact_path = Path("experiments/control_books/2026-07-25_none.json")
@@ -151,6 +164,9 @@ class TestABCArtifact:
         assert artifact["book_id"] == "none"
         assert artifact["nav_a"] == 300000.0
         assert artifact["m"] == 1.0
+        # the baseline arm is defined to run without a timing model, so its
+        # multiplier is not a fallback
+        assert artifact["m_degraded"] is None
 
 
 # -- Known-answer (R3) -------------------------------------------------------
@@ -314,41 +330,29 @@ class TestRunBookBPhase1Phase2:
 
     def _make_ctx(self, tmp_path, trade_date, pred_path):
         """Build a minimal DailyRunContext for _run_book_b."""
-        from ashare_lab.paper.pipeline import DailyRunContext
-
-        ctx = DailyRunContext.__new__(DailyRunContext)
-        ctx.trade_date = trade_date
-        ctx.db_path = tmp_path / "paper.db"
-        ctx.paper_cfg = {
-            "initial_cash": 300000.0, "topk": 15, "n_drop": 1,
-            "listing_min_days": 60,
-        }
-        ctx.config = {
-            "cost_model": {"risk_degree": 0.95},
-            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0, "exclude_close_above_cny": 300.0},
-            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
-        }
-        ctx.risk_result = MagicMock(
-            buying_halted=False, forced_sells={},
-            blocked_industries=set(), blocked_rebuys=set(),
-            topk_override=None, cooldown_entries={},
+        return make_daily_ctx(
+            trade_date=trade_date, db_path=tmp_path / "paper.db",
+            pred_path=pred_path,
+            paper_cfg={"initial_cash": 300000.0, "topk": 15, "n_drop": 1,
+                       "listing_min_days": 60},
+            config={
+                "cost_model": {"risk_degree": 0.95},
+                "universe": {"listing_min_days": 60,
+                             "min_avg_turnover_20d": 0.0,
+                             "exclude_close_above_cny": 300.0},
+                "carry_days": 3, "slippage": 0.001,
+                "volume_participation_pct": 0.05,
+            },
+            prices={"SH600519": {"close": 180.0}, "SH600520": {"close": 90.0}},
+            universe=["SH600519", "SH600520"],
+            market_data={
+                "SH600519": {"close": 180.0, "listing_days": 100,
+                             "avg_turnover_20d": 100_000_000.0},
+                "SH600520": {"close": 90.0, "listing_days": 100,
+                             "avg_turnover_20d": 100_000_000.0},
+            },
+            cash=300000.0, total_nav=300000.0, hedge_state=None,
         )
-        ctx.prices = {"SH600519": {"close": 180.0}}
-        ctx.pred_path = pred_path
-        ctx.universe_symbols = ["SH600519"]
-        ctx.ipo_listing_syms = set()
-        ctx.st_names = set()
-        ctx.market_data = {
-            "SH600519": {"close": 180.0, "listing_days": 100, "avg_turnover_20d": 100_000_000.0},
-        }
-        ctx.industry_map = {}
-        ctx.benchmarks = {"csi1000": 1.0}
-        ctx.hedge_state = None
-        ctx.hedge_symbols = set()
-        ctx.total_nav = 300000.0
-        ctx.current_positions = {}
-        ctx.cash = 300000.0
-        return ctx
 
     def test_phase1_settles_yesterday_phase2_generates_today(self, tmp_path):
         """_run_book_b Phase 1 settles d1 orders, Phase 2 inserts d2 orders.
@@ -388,14 +392,23 @@ class TestRunBookBPhase1Phase2:
         import pandas as pd
         pred_path = tmp_path / "predictions" / f"{d2}.parquet"
         pred_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
+        pd.DataFrame({"instrument": ["SH600519", "SH600520"],
+                      "score": [0.8, 0.7]}).to_parquet(pred_path)
 
         # Build ctx for d2
         ctx = self._make_ctx(tmp_path, d2, pred_path)
 
         # Patch next_trading_day to return d3, and generate_signals to return fixed data
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8, "SH600520": 0.7},
+            ),
+        ):
             _run_book_b(ctx)
 
         # Debug: check all orders
@@ -414,15 +427,21 @@ class TestRunBookBPhase1Phase2:
             assert row["status"] != "pending", \
                 f"d2 order should be settled, got status={row['status']}"
 
-        # Verify: d3 orders should exist and be pending (Phase 2)
+        # Phase 2 orders the free symbol, and only that symbol: SH600519 still
+        # has its d2 buy open as a carry, which retries on its own, so a second
+        # order would double the position if both fill.
         d3_orders = conn_check.execute(
-            "SELECT status FROM orders WHERE trade_date=?",
+            "SELECT symbol, status FROM orders WHERE trade_date=?",
             (d3,),
         ).fetchall()
-        assert len(d3_orders) > 0, "Phase 2 should have inserted d3 orders"
+        assert d3_orders, "Phase 2 should have inserted d3 orders"
+        assert [r["symbol"] for r in d3_orders] == ["SH600520"], (
+            f"Phase 2 ordered {[r['symbol'] for r in d3_orders]}"
+        )
         for row in d3_orders:
-            assert row["status"] == "pending", \
+            assert row["status"] == "pending", (
                 f"d3 order should be pending, got status={row['status']}"
+            )
 
         conn_check.close()
 
@@ -454,8 +473,16 @@ class TestRunBookBPhase1Phase2:
         pd.DataFrame({"instrument": ["SH600519"], "score": [0.8]}).to_parquet(pred_path)
 
         ctx = self._make_ctx(tmp_path, d2, pred_path)
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}) as mock_gs:
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8},
+            ) as mock_gs,
+        ):
             _run_book_b(ctx)
 
         mock_gs.assert_called_once_with(d2, pred_path=ctx.pred_path)
@@ -491,8 +518,16 @@ class TestRunBookBPhase1Phase2:
 
         ctx = self._make_ctx(tmp_path, d2, pred_path)
 
-        with unittest.mock.patch("ashare_lab.paper.pipeline.next_trading_day", return_value=dt.date.fromisoformat(d3)), \
-             unittest.mock.patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
+        with (
+            unittest.mock.patch(
+                "ashare_lab.paper.pipeline.next_trading_day",
+                return_value=dt.date.fromisoformat(d3),
+            ),
+            unittest.mock.patch(
+                "ashare_lab.paper.signal.generate_signals",
+                return_value={"SH600519": 0.8},
+            ),
+        ):
             _run_book_b(ctx)
 
         # Verify: no d2 orders to settle, but d3 orders generated

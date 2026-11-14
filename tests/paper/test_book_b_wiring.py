@@ -29,6 +29,7 @@ from ashare_lab.paper.pipeline import (
     _run_book_b,
     _step12_book_b,
 )
+from tests.paper.ctx_factory import make_daily_ctx
 
 
 @pytest.fixture(autouse=True)
@@ -47,60 +48,25 @@ def _clear_timing_cache():
 
 def _make_ctx(tmp_path, trade_date, pred_path, book_a_nav=1_000_000.0):
     """Build a minimal DailyRunContext for _run_book_b wiring tests."""
-    from ashare_lab.paper.pipeline import DailyRunContext
-
-    ctx = DailyRunContext.__new__(DailyRunContext)
-    ctx.trade_date = trade_date
-    ctx.db_path = tmp_path / "paper.db"
-    ctx.paper_cfg = {
-        "initial_cash": book_a_nav,
-        "topk": 15,
-        "n_drop": 1,
-        "listing_min_days": 60,
-        "turnover_cap": None,
-    }
-    ctx.config = {
-        "cost_model": {"risk_degree": 0.95},
-        "universe": {
-            "listing_min_days": 60,
-            "min_avg_turnover_20d": 0.0,
-            "exclude_close_above_cny": 300.0,
+    return make_daily_ctx(
+        trade_date=trade_date, db_path=tmp_path / "paper.db", pred_path=pred_path,
+        paper_cfg={"initial_cash": book_a_nav, "topk": 15, "n_drop": 1,
+                   "listing_min_days": 60, "turnover_cap": None},
+        config={
+            "cost_model": {"risk_degree": 0.95},
+            "universe": {"listing_min_days": 60, "min_avg_turnover_20d": 0.0,
+                         "exclude_close_above_cny": 300.0},
+            "carry_days": 3, "slippage": 0.001, "volume_participation_pct": 0.05,
         },
-        "carry_days": 3,
-        "slippage": 0.001,
-        "volume_participation_pct": 0.05,
-    }
-    ctx.risk_result = MagicMock(
-        buying_halted=False,
-        forced_sells={},
-        blocked_industries=set(),
-        blocked_rebuys=set(),
-        topk_override=None,
-        cooldown_entries={},
+        # volume must be present and positive, otherwise settle_buy_orders
+        # reads volume=0.0, flags the symbol suspended, and carries every
+        # buy order instead of filling it.
+        prices={"SH600519": {"close": 180.0, "volume": 10_000_000.0}},
+        universe=["SH600519"],
+        market_data={"SH600519": {"close": 180.0, "listing_days": 100,
+                                  "avg_turnover_20d": 100_000_000.0}},
+        cash=book_a_nav, total_nav=book_a_nav, hedge_state=None,
     )
-    # volume must be present and positive, otherwise settle_buy_orders
-    # reads volume=0.0, flags the symbol suspended, and carries every
-    # buy order instead of filling it.
-    ctx.prices = {"SH600519": {"close": 180.0, "volume": 10_000_000.0}}
-    ctx.pred_path = pred_path
-    ctx.universe_symbols = ["SH600519"]
-    ctx.ipo_listing_syms = set()
-    ctx.st_names = set()
-    ctx.market_data = {
-        "SH600519": {
-            "close": 180.0,
-            "listing_days": 100,
-            "avg_turnover_20d": 100_000_000.0,
-        },
-    }
-    ctx.industry_map = {}
-    ctx.benchmarks = {"csi1000": 1.0}
-    ctx.hedge_state = None
-    ctx.hedge_symbols = set()
-    ctx.total_nav = book_a_nav
-    ctx.current_positions = {}
-    ctx.cash = book_a_nav
-    return ctx
 
 
 def _init_prod_and_book_b_db(tmp_path, book_id="none", cash=1_000_000.0):
@@ -178,9 +144,9 @@ class TestBookIdParameterization:
         pred_path = _make_pred_path(tmp_path, trade_date)
         ctx = _make_ctx(tmp_path, trade_date, pred_path)
 
-        with patch("ashare_lab.paper.pipeline.timing_multiplier") as mock_m, \
+        with patch("ashare_lab.paper.pipeline.timing_multiplier_detail") as mock_m, \
              patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
-            mock_m.return_value = 0.5
+            mock_m.return_value = (0.5, None)
             _run_book_b(ctx, "n1")
 
         assert (tmp_path / "paper_b_n1.db").exists()
@@ -192,9 +158,9 @@ class TestBookIdParameterization:
         for book_id in ("n1", "n2", "n3"):
             _init_prod_and_book_b_db(tmp_path, book_id)
             ctx = _make_ctx(tmp_path, trade_date, pred_path)
-            with patch("ashare_lab.paper.pipeline.timing_multiplier") as mock_m, \
+            with patch("ashare_lab.paper.pipeline.timing_multiplier_detail") as mock_m, \
                  patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
-                mock_m.return_value = 0.5
+                mock_m.return_value = (0.5, None)
                 _run_book_b(ctx, book_id)
             mock_m.assert_called_once_with(trade_date, model=book_id)
             assert (tmp_path / f"paper_b_{book_id}.db").exists()
@@ -321,10 +287,11 @@ class TestR3Canary:
                 if side == "buy":
                     captured.append(target_qty)
 
-            with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=m), \
+            with patch("ashare_lab.paper.pipeline.timing_multiplier_detail", return_value=(m, None)), \
                  patch("ashare_lab.paper.pipeline.next_trading_day", return_value=next_td), \
                  patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}), \
-                 patch("ashare_lab.paper.pipeline.insert_order", side_effect=capture_insert_order):
+                 patch("ashare_lab.paper.pipeline.insert_order", side_effect=capture_insert_order), \
+                 patch("ashare_lab.paper.orders.insert_order", side_effect=capture_insert_order):
                 _run_book_b(ctx, "n1")
             return captured
 
@@ -432,9 +399,9 @@ class TestArtifactShape:
         model_m = {"none": 1.0, "n1": 0.5, "n2": 0.0, "n3": 1.0}
 
         def fake_timing_multiplier(trade_date, model):
-            return model_m[model]
+            return model_m[model], None
 
-        with patch("ashare_lab.paper.pipeline.timing_multiplier", side_effect=fake_timing_multiplier), \
+        with patch("ashare_lab.paper.pipeline.timing_multiplier_detail", side_effect=fake_timing_multiplier), \
              patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
             _step12_book_b(ctx)
 
@@ -452,7 +419,82 @@ class TestArtifactShape:
             assert "excess_b" in artifact
 
 
-# -- Contract 6: injection mapping --------------------------------------------
+# -- Contract 6: the artifact says whether m was computed or fallen back to ----
+
+class TestDegradationReasonReachesArtifact:
+    """A fallback 1.0 and a real 1.0 must not look the same on disk.
+
+    When the timing model fails, m falls back to 1.0, Book B becomes Book A,
+    and any comparison between the two reads as agreement. Gate 3's canary
+    passed for 39 days on exactly that.
+    """
+
+    def test_degraded_models_record_their_reason(self, tmp_path):
+        trade_date = "2026-07-25"
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        for book_id in ("none", "n1", "n2", "n3"):
+            _init_prod_and_book_b_db(tmp_path, book_id)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        # n1 and n3 fall back; n2 produces 0.5 for real; none is Book A by design
+        detail = {
+            "none": (1.0, None),
+            "n1": (1.0, "no_index_data"),
+            "n2": (0.5, None),
+            "n3": (1.0, "computation_error"),
+        }
+
+        with patch(
+            "ashare_lab.paper.pipeline.timing_multiplier_detail",
+            side_effect=lambda trade_date, model: detail[model],
+        ), patch(
+            "ashare_lab.paper.signal.generate_signals",
+            return_value={"SH600519": 0.8},
+        ):
+            _step12_book_b(ctx)
+
+        for book_id, (want_m, want_reason) in detail.items():
+            path = Path("experiments/control_books") / f"{trade_date}_{book_id}.json"
+            assert path.exists(), f"missing artifact for {book_id}"
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+            assert artifact["m"] == want_m, book_id
+            assert artifact["m_degraded"] == want_reason, book_id
+
+    def test_a_degraded_day_is_distinguishable_from_a_clean_one(self, tmp_path):
+        trade_date = "2026-07-25"
+        pred_path = _make_pred_path(tmp_path, trade_date)
+        for book_id in ("none", "n1", "n2", "n3"):
+            _init_prod_and_book_b_db(tmp_path, book_id)
+        ctx = _make_ctx(tmp_path, trade_date, pred_path)
+
+        # n1 fell back to 1.0, n3 genuinely scored 1.0: same number, different day
+        detail = {
+            "none": (1.0, None),
+            "n1": (1.0, "date_not_in_series"),
+            "n2": (1.0, None),
+            "n3": (1.0, None),
+        }
+
+        with patch(
+            "ashare_lab.paper.pipeline.timing_multiplier_detail",
+            side_effect=lambda trade_date, model: detail[model],
+        ), patch(
+            "ashare_lab.paper.signal.generate_signals",
+            return_value={"SH600519": 0.8},
+        ):
+            _step12_book_b(ctx)
+
+        def read(book_id):
+            path = Path("experiments/control_books") / f"{trade_date}_{book_id}.json"
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        fell_back, scored = read("n1"), read("n3")
+        assert fell_back["m"] == scored["m"] == 1.0
+        assert fell_back["m_degraded"] == "date_not_in_series"
+        assert scored["m_degraded"] is None
+
+
+# -- Contract 7: injection mapping --------------------------------------------
 
 class TestInjectionMapping:
     """Documentation-only mapping of PM bug-injection sites to tests.
@@ -469,6 +511,15 @@ class TestInjectionMapping:
 
     def test_injection_c_three_fetches_covered_by_memo(self):
         """(c) fetch called 3x -> TestMemoization::test_three_books_one_fetch FAILS."""
+
+    def test_injection_d_dropped_reason_covered_by_degradation(self):
+        """(d) stop passing m_degraded into _write_abc_artifact ->
+        TestDegradationReasonReachesArtifact::test_degraded_models_record_their_reason
+        FAILS, and so does every other test that reaches this step, because
+        the argument is required and its omission raises TypeError at the call
+        site. It was briefly optional, and then a forgotten argument wrote
+        exactly what a clean day writes -- visible only to a test that runs
+        the real step."""
 
 
 # -- Contract 7: Day-0 bootstrap scrub --------------------------------------
@@ -514,7 +565,7 @@ class TestBootstrapScrub:
         pred_path = _make_pred_path(tmp_path, trade_date)
         ctx = _make_ctx(tmp_path, trade_date, pred_path)
 
-        with patch("ashare_lab.paper.pipeline.timing_multiplier", return_value=1.0), \
+        with patch("ashare_lab.paper.pipeline.timing_multiplier_detail", return_value=(1.0, None)), \
              patch("ashare_lab.paper.pipeline.next_trading_day", return_value=next_td), \
              patch("ashare_lab.paper.signal.generate_signals", return_value={"SH600519": 0.8}):
             _run_book_b(ctx, "none")

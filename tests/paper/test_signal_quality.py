@@ -5,19 +5,12 @@ Contract items 1-12 + 11b backfill guard.
 from __future__ import annotations
 
 import json
-import math
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from ashare_lab.paper.signal_quality import (
-    _MIN_REFERENCE_FILES,
-    _N_BUCKETS,
-    _PSI_THRESHOLD,
-    _REFERENCE_DAYS,
     compute_psi,
     load_reference_scores,
     signal_quality_psi_step,

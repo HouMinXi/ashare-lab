@@ -777,5 +777,7 @@ def test_gate_callsite_uses_meta_json(monkeypatch, tmp_path):
     sidecar = json.loads(
         (tmp_path / "predictions" / "2021-12-01.meta.json").read_text()
     )
-    assert sidecar["model_age_source"] == "meta.json"
+    # The source names which meta.json field anchored the age -- trained_at when
+    # present, train_date otherwise -- so both readings start with "meta.json".
+    assert sidecar["model_age_source"].startswith("meta.json")
     assert sidecar["model_train_date"] == fresh

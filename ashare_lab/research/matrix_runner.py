@@ -83,7 +83,7 @@ def run_cell(
         completed_at) plus an optional ``turnover`` key holding the mean
         of the backtest turnover column (omitted when unavailable).
     """
-    import numpy as np  # noqa: PLC0415
+    import numpy as np
 
     with open(config_path) as f:
         candidate = yaml.safe_load(f)
@@ -132,15 +132,15 @@ def run_cell(
         if seed is not None:
             np.random.seed(seed)
             try:
-                import torch  # noqa: PLC0415
+                import torch
                 torch.manual_seed(seed)
             except ImportError:
                 pass
 
-        from ashare_lab.research.smoke_test import get_window  # noqa: PLC0415
-        from ashare_lab.research.train import train_window  # noqa: PLC0415
-        from ashare_lab.research.backtest import run_backtest  # noqa: PLC0415
-        from ashare_lab.research.metrics import (  # noqa: PLC0415
+        from ashare_lab.research.smoke_test import get_window
+        from ashare_lab.research.train import train_window
+        from ashare_lab.research.backtest import run_backtest
+        from ashare_lab.research.metrics import (
             daily_rank_ic,
             aggregate_window_metrics,
             compute_max_drawdown,
@@ -156,11 +156,11 @@ def run_cell(
         # Save labels (identical across seeds -- skip if exists).
         labels_path = out / f"labels_w{window_id}.parquet"
         if not labels_path.exists():
-            import pandas as pd  # noqa: PLC0415
+            import pandas as pd
             pd.DataFrame({"label": label}).to_parquet(labels_path)
 
         # Save predictions.
-        import pandas as pd  # noqa: PLC0415
+        import pandas as pd
         pred_name = (
             f"pred_w{window_id}_seed{seed}.parquet"
             if seed is not None

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 from ashare_lab.paper.pipeline import append_ic_history

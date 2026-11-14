@@ -1,4 +1,5 @@
-import sys, os
+import sys
+import os
 qmt_root = r"H:\国金证券QMT量化终端"
 xt_path = os.path.join(qmt_root, "bin.x64", "Lib", "site-packages")
 sys.path.insert(0, xt_path)

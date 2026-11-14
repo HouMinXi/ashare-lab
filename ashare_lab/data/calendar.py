@@ -26,10 +26,22 @@ def is_trading_day(date: dt.date) -> bool:
     return cal.is_session(ts)
 
 
+def market_today(now: dt.datetime | None = None) -> dt.date:
+    """Today's date on the exchange, not on the machine.
+
+    ``now`` is injectable so a test can pin the instant instead of replacing the
+    datetime module.
+    """
+    moment = now if now is not None else dt.datetime.now(TZ_SHANGHAI)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=TZ_SHANGHAI)
+    return moment.astimezone(TZ_SHANGHAI).date()
+
+
 def latest_trading_day(as_of: dt.date | None = None) -> dt.date:
     """Most recent completed trading day on or before *as_of* (default: today Shanghai)."""
     if as_of is None:
-        as_of = dt.datetime.now(TZ_SHANGHAI).date()
+        as_of = market_today()
     cal = _get_calendar()
     ts = pd.Timestamp(as_of)
     if ts > cal.last_session:

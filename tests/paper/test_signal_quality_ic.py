@@ -6,23 +6,15 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from ashare_lab.paper.signal_quality import (
-    _IC_THRESHOLD,
-    _MIN_INSTRUMENTS,
-    _ROLLING_WINDOW,
     SignalQualityError,
-    compute_forward_returns,
     lagged_ic_for_date,
     load_reference_scores,
-    rolling_lagged_ic,
     signal_quality_ic_step,
 )
 
@@ -110,88 +102,6 @@ def test_date_pin():
     assert cursor.isoformat() == "2026-07-30"
 
 
-# ---------------------------------------------------------------------------
-# 7. rolling_lagged_ic: 19 -> (None, 19); 20 -> (mean, 20)
-# ---------------------------------------------------------------------------
-def test_rolling_lagged_ic_insufficient(tmp_path):
-    for i in range(19):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    mean, n = rolling_lagged_ic(tmp_path, "2026-08-01")
-    assert mean is None
-    assert n == 19
-
-
-def test_rolling_lagged_ic_sufficient(tmp_path):
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    mean, n = rolling_lagged_ic(tmp_path, "2026-08-01")
-    assert mean is not None
-    assert n == 20
-    assert abs(mean - (-0.05)) < 1e-10
-
-
-# ---------------------------------------------------------------------------
-# 8. Integration: sidecar on t-5 + alert when mean < 0.01
-# ---------------------------------------------------------------------------
-def test_ic_step_alert(tmp_path):
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    scores = list(range(100))
-    pd.DataFrame({"instrument": instruments, "score": scores}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    # Non-constant returns correlated with scores -> real IC
-    rng = np.random.default_rng(42)
-    returns = pd.Series(
-        [s / 100.0 + rng.normal(0, 0.1) for s in scores],
-        index=instruments,
-    )
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    ctx.pred_path = tmp_path / f"{trade_date}.parquet"
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=returns), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert", return_value=True) as mock_alert:
-        signal_quality_ic_step(ctx)
-    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
-    assert "lagged_ic_t5" in sidecar
-    assert sidecar["lagged_ic_t5"] is not None  # Real IC computed
-    assert sidecar["lagged_ic_t5_n"] == 100
-    mock_alert.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# 9. ASHARE_SQ_DRYRUN=1: computation runs, alert NOT sent
-# ---------------------------------------------------------------------------
-def test_ic_step_dryrun(tmp_path):
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert", return_value=True) as mock_alert, \
-         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False):
-        signal_quality_ic_step(ctx)
-    mock_alert.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 9b. Backfill guard
-# ---------------------------------------------------------------------------
 def test_ic_step_backfill_guard(tmp_path):
     ctx = MagicMock()
     ctx.steps = {"settle", "signal"}
@@ -223,20 +133,6 @@ def test_ic_step_fail_open(tmp_path):
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_error" in sidecar
     assert sidecar["lagged_ic_t5"] is None  # stale value cleared on error
-
-
-# ---------------------------------------------------------------------------
-# 11. rolling_lagged_ic: corrupt JSON skipped
-# ---------------------------------------------------------------------------
-def test_rolling_lagged_ic_corrupt(tmp_path):
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        if i == 5:
-            (tmp_path / f"{date}.meta.json").write_text("not valid json{")
-        else:
-            (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    mean, n = rolling_lagged_ic(tmp_path, "2026-08-01")
-    assert n == 19
 
 
 def test_lagged_ic_empty_forward_returns(tmp_path):
@@ -280,58 +176,6 @@ def test_ic_step_stale_guard(tmp_path):
     mock_cfr.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# 14. Alert send failure -> fail-open (ic_step)
-# ---------------------------------------------------------------------------
-def test_ic_step_alert_send_failure(tmp_path):
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": -0.05}))
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert", return_value=False) as mock_alert:
-        signal_quality_ic_step(ctx)
-    mock_alert.assert_called_once()
-    sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
-    assert "lagged_ic_t5" in sidecar  # IC still recorded despite alert failure
-    assert sidecar["lagged_ic_t5"] is None  # constant returns -> no rank IC
-    assert sidecar["lagged_ic_t5_n"] == 100
-
-
-# ---------------------------------------------------------------------------
-# 15. No alert when rolling mean >= threshold (ic_step)
-# ---------------------------------------------------------------------------
-def test_ic_step_no_alert(tmp_path):
-    t5_date = "2026-07-30"
-    trade_date = "2026-08-06"
-    instruments = [f"SH{i:06d}" for i in range(100)]
-    pd.DataFrame({"instrument": instruments, "score": list(range(100))}).to_parquet(tmp_path / f"{t5_date}.parquet")
-    # Rolling mean = 0.05 > _IC_THRESHOLD (0.01) -> no alert
-    for i in range(20):
-        date = f"2026-07-{i+1:02d}"
-        (tmp_path / f"{date}.meta.json").write_text(json.dumps({"lagged_ic_t5": 0.05}))
-    ctx = MagicMock()
-    ctx.steps = None
-    ctx.trade_date = trade_date
-    ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert:
-        signal_quality_ic_step(ctx)
-    mock_alert.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 16. Generic exception in ic_step -> fail-open (not just SignalQualityError)
-# ---------------------------------------------------------------------------
 def test_ic_step_fail_open_generic_exception(tmp_path):
     t5_date = "2026-07-30"
     trade_date = "2026-08-06"
@@ -368,9 +212,14 @@ def test_ic_step_subprocess_timeout(tmp_path):
     ctx.steps = None
     ctx.trade_date = trade_date
     ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", side_effect=SignalQualityError("subprocess timeout")), \
-         patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False):
+    with (
+        patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path),
+        patch(
+            "ashare_lab.paper.signal_quality.compute_forward_returns",
+            side_effect=SignalQualityError("subprocess timeout"),
+        ),
+        patch.dict("os.environ", {"ASHARE_SQ_DRYRUN": "1"}, clear=False),
+    ):
         signal_quality_ic_step(ctx)
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())
     assert "lagged_ic_error" in sidecar
@@ -413,9 +262,14 @@ def test_ic_step_insufficient_rolling_window(tmp_path):
     ctx.steps = None
     ctx.trade_date = trade_date
     ctx.predictions_date_str = trade_date
-    with patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path), \
-         patch("ashare_lab.paper.signal_quality.compute_forward_returns", return_value=pd.Series([0.01] * 100, index=instruments)), \
-         patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert:
+    with (
+        patch("ashare_lab.paper.signal_quality.PREDICTIONS_DIR", tmp_path),
+        patch(
+            "ashare_lab.paper.signal_quality.compute_forward_returns",
+            return_value=pd.Series([0.01] * 100, index=instruments),
+        ),
+        patch("ashare_lab.paper.signal_quality.send_bridge_alert") as mock_alert,
+    ):
         signal_quality_ic_step(ctx)
     mock_alert.assert_not_called()
     sidecar = json.loads((tmp_path / f"{t5_date}.meta.json").read_text())

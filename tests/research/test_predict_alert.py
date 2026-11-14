@@ -19,7 +19,7 @@ def _make_predict_env(tmp_path: Path, window_id: int = 11,
                       use_copy: bool = False):
     """Set up a minimal environment for testing the fallback logic.
 
-    Production layout (X500):
+    Production layout (W1):
       models/latest.pt -> w10.pt   (symlink)
       models/w10.pt                (actual model)
       models/w11.pt                (missing = shelved)
@@ -215,3 +215,142 @@ def test_copy_layout_differing_content_alerts(mock_alert, tmp_path):
 
     mock_alert.assert_called_once()
     assert "w11.pt missing" in mock_alert.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Staleness alert: a pinned model is a standing decision, not a daily incident
+# ---------------------------------------------------------------------------
+
+def test_pin_sets_the_deliberate_flag(tmp_path):
+    """Resolving to the pinned model records that the choice was deliberate.
+
+    This is what lets the staleness check tell "nobody retrained" apart from
+    "we chose this model on purpose".
+    """
+    from ashare_lab.research import predict
+
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10", latest_target="w10.pt", window_exists=False)
+    windows = [{"window_id": 11, "test_start": "2025-01-01",
+                "test_end": "2025-06-30", "train_start": "2022-01-01",
+                "train_end": "2024-12-31"}]
+
+    with patch("ashare_lab.research.predict._send_alert"):
+        predict._resolve_model_path("2025-03-15", None, windows, cfg, models)
+
+    assert predict._LAST_RESOLUTION["deliberate"] is True
+
+
+def test_pin_flag_follows_content_and_resets(tmp_path):
+    """The pin is a property of the loaded bytes, and it must not stick.
+
+    A sticky True would silence a genuine staleness alert on a later trade
+    date, so resolving a model that is NOT the pinned content must clear it.
+    """
+    from ashare_lab.research import predict
+
+    predict._LAST_RESOLUTION["deliberate"] = True
+
+    # Window model present but its bytes differ from the pinned model.
+    # The helper writes both files with identical text, so rewrite the
+    # window file (the one this resolution loads) to differ.
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10", latest_target="w10.pt",
+                                    window_exists=True)
+    (models / "w11.pt").write_bytes(b"a different model entirely")
+
+    windows = [{"window_id": 11, "test_start": "2025-01-01",
+                "test_end": "2025-06-30", "train_start": "2022-01-01",
+                "train_end": "2024-12-31"}]
+
+    with patch("ashare_lab.research.predict._send_alert"):
+        predict._resolve_model_path("2025-03-15", None, windows, cfg, models)
+
+    assert predict._LAST_RESOLUTION["deliberate"] is False, (
+        "loading content that is not the pin must clear the flag"
+    )
+
+
+def test_explicit_model_path_that_is_the_pin_is_recognized(tmp_path):
+    """An explicit model_path skips the fallback branch entirely.
+
+    The pin must still be recognized, because it is a property of the bytes
+    that were loaded, not of which branch resolved the path.
+    """
+    from ashare_lab.research import predict
+
+    predict._LAST_RESOLUTION["deliberate"] = False
+
+    models, cfg = _make_predict_env(tmp_path, window_id=11,
+                                    expected="w10", latest_target="w10.pt", window_exists=False)
+    windows = [{"window_id": 11, "test_start": "2025-01-01",
+                "test_end": "2025-06-30", "train_start": "2022-01-01",
+                "train_end": "2024-12-31"}]
+
+    # Hand the resolver the pinned file directly, bypassing fallback.
+    with patch("ashare_lab.research.predict._send_alert"):
+        predict._resolve_model_path(
+            "2025-03-15", models / "w10.pt", windows, cfg, models)
+
+    assert predict._LAST_RESOLUTION["deliberate"] is True, (
+        "an explicit path whose content is the pin must set the flag"
+    )
+
+
+def test_staleness_alert_is_gated_on_the_pin_flag():
+    """The staleness block must read the flag, not page unconditionally.
+
+    Pinned deployments are old by definition; paging daily about one teaches
+    the operator to ignore the channel.
+    """
+    import inspect
+
+    from ashare_lab.research import predict
+
+    body = inspect.getsource(predict.predict_for_date)
+    stale_at = body.index("MODEL STALE")
+    after = body[stale_at:]
+    alert_at = after.index("_send_alert")
+    between = after[:alert_at]
+
+    assert "if not pinned:" in between, (
+        "the stale _send_alert must sit behind the pin check; "
+        "without it every run pages about a deliberate deployment"
+    )
+
+
+def test_staleness_counts_from_training_not_from_the_data_cutoff(tmp_path):
+    """A model retrained today over a window ending months ago is fresh.
+
+    train_date is the training window's cutoff -- 2026-06-30 for the newest
+    walk-forward window -- so measuring from it reported a model written
+    minutes earlier as 131 days stale, which is the number the 2026-11-07
+    retrain produced on its first prediction.
+    """
+    from datetime import date
+
+    from ashare_lab.research.predict import _model_age_days
+
+    p = tmp_path / "w12.pt"
+    p.write_bytes(b"model bytes")
+    meta = {"train_date": "2026-06-30", "trained_at": "2026-11-08T02:30:13+08:00"}
+
+    age, source = _model_age_days(meta, p, date(2026, 11, 8))
+
+    assert age == 0
+    assert source == "meta.json(trained_at)"
+
+
+def test_staleness_falls_back_to_train_date_then_mtime(tmp_path):
+    from datetime import date
+
+    from ashare_lab.research.predict import _model_age_days
+
+    p = tmp_path / "w1.pt"
+    p.write_bytes(b"model bytes")
+
+    age, source = _model_age_days({"train_date": "2026-06-01"}, p, date(2026, 6, 11))
+    assert (age, source) == (10.0, "meta.json(train_date)")
+
+    age, source = _model_age_days(None, p, date(2026, 6, 11))
+    assert source.startswith("mtime-fallback")

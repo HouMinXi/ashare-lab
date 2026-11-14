@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import sqlite3
 import json
 import subprocess
 import sys
@@ -34,7 +35,6 @@ from ashare_lab.data.calendar import (
 from ashare_lab.paper.adjust import check_and_apply_adjustfactor
 from ashare_lab.paper.engine import (
     get_limit_threshold,
-    round_lots,
     settle_day,
 )
 from ashare_lab.paper.hedge import (
@@ -51,6 +51,7 @@ from ashare_lab.paper.ipo import (
     detect_board_type,
     determine_ipo_sell_date,
 )
+from ashare_lab.paper.orders import place_buys
 from ashare_lab.paper.ledger import (
     bump_carry_days,
     bump_suspension_carry_days,
@@ -71,6 +72,7 @@ from ashare_lab.paper.ledger import (
     log_settle_change,
     record_nav,
     record_run,
+    settlement_gaps,
     open_pipeline_run,
     close_pipeline_run,
     set_cooldown,
@@ -308,7 +310,7 @@ def _fetch_ipo_calendar(listing_date: str) -> list[dict]:
     becomes a no-op).
     """
     try:
-        import requests  # noqa: PLC0415
+        import requests
     except ImportError:
         logger.warning("requests not installed, IPO calendar unavailable")
         return []
@@ -510,8 +512,8 @@ def _step1_init(ctx: DailyRunContext) -> None:
     ctx.conn = get_connection(ctx.db_path)
     init_schema(ctx.conn)
     try:
-        import qlib  # noqa: PLC0415
-        from ashare_lab.data.update import DEFAULT_PROVIDER_URI  # noqa: PLC0415
+        import qlib
+        from ashare_lab.data.update import DEFAULT_PROVIDER_URI
         qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
     except Exception:
         pass  # qlib not installed or already initialized
@@ -568,8 +570,8 @@ def _try_baostock_fallback(ctx: DailyRunContext, chenditc_exc: Exception) -> int
     Returns 0 on success, 1 on stale (no gap), 2 on failure.
     """
     try:
-        from ashare_lab.data.fallback import gap_fill  # noqa: PLC0415
-        from ashare_lab.data.calendar import previous_trading_day  # noqa: PLC0415
+        from ashare_lab.data.fallback import gap_fill
+        from ashare_lab.data.calendar import previous_trading_day
         start_date = previous_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
         rc = gap_fill(start_date, ctx.trade_date)
         if rc == 0:
@@ -602,7 +604,7 @@ def _step3_data_update(ctx: DailyRunContext) -> int:
 
     # If fetch-today already populated qlib data for this trade_date,
     # skip the chenditc refresh entirely.
-    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI, daily_refresh  # noqa: PLC0415
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI, daily_refresh
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     if cal_last and cal_last >= ctx.trade_date:
         logger.info("qlib data already covers %s (cal=%s), skipping chenditc", ctx.trade_date, cal_last)
@@ -631,8 +633,8 @@ def _gate_data_completeness(ctx: DailyRunContext) -> None:
     ).fetchone()[0]
     if last_run is None or last_run >= ctx.trade_date:
         return  # first run or backfill
-    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI  # noqa: PLC0415
-    from ashare_lab.data.calendar import trading_days_between  # noqa: PLC0415
+    from ashare_lab.data.update import _read_calendar_last_date, DEFAULT_PROVIDER_URI
+    from ashare_lab.data.calendar import trading_days_between
     cal_last = _read_calendar_last_date(DEFAULT_PROVIDER_URI)
     expected = trading_days_between(
         dt.date.fromisoformat(last_run) + dt.timedelta(days=1),
@@ -659,7 +661,7 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
     }
 
     # Load persistent risk state (state machine)
-    from ashare_lab.paper.risk_state import (  # noqa: PLC0415
+    from ashare_lab.paper.risk_state import (
         RiskState,
         ensure_shadow_log_table,
         load_risk_state,
@@ -702,10 +704,53 @@ def _step4_load_state(ctx: DailyRunContext) -> None:
         ctx.is_soft_reduced = False
 
 
+def _daily_change(close: float, ref_close: float | None, stored: float) -> float:
+    """The session's move computed from two stored closes.
+
+    The stored ``$change`` is the vendor's own pct field, and it disagrees with
+    the prices on ex-dividend rows: sz300980 on 2026-09-30 stored -30.2% against
+    an actual -3.0%, which reads as limit-down and blocks a sell that the market
+    would have filled. Two closes from the same store cannot disagree with each
+    other, so the ratio wins whenever both are usable.
+    """
+    if ref_close is None or not (ref_close > 0) or not (close > 0):
+        return stored
+    return close / ref_close - 1.0
+
+
+def _price_row(pdata: dict, symbol: str, st_names: set[str]) -> dict:
+    """Turn one fetched qlib row into the record settle consumes.
+
+    qlib's ``$close`` is normalised (IPO day = 1.0); dividing by ``$factor``
+    recovers the CNY price used for NAV and sizing. The move comes from two
+    closes rather than the stored ``$change``, see ``_daily_change``.
+    """
+    raw_factor = pdata.get("factor")
+    if raw_factor is None:
+        # Price may be normalised but real CNY cannot be recovered. Do not
+        # claim "adjusted": the sanity gate has to see this.
+        logger.warning(
+            "Factor missing for %s, using raw qlib close=%.4f", symbol, pdata["close"],
+        )
+        factor = 1.0
+        adjusted = False
+    else:
+        factor = max(raw_factor, 1e-8)
+        adjusted = True
+    return {
+        "close": pdata["close"] / factor,
+        "change": _daily_change(pdata["close"], pdata.get("ref_close"), pdata["change"]),
+        "volume": pdata["volume"],
+        "factor": raw_factor if raw_factor is not None else 1.0,
+        "adjusted": adjusted,
+        "threshold": get_limit_threshold(symbol, st_names),
+    }
+
+
 def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
     """Fetch universe, prices, benchmarks, industry map.  Return 2 on qlib import failure."""
     try:
-        from qlib.data import D  # noqa: PLC0415
+        from qlib.data import D
     except ImportError as exc:
         logger.error("qlib not available, cannot run pipeline")
         record_run(ctx.conn, ctx.trade_date, "error")
@@ -752,7 +797,7 @@ def _step5_fetch_prices_and_universe(ctx: DailyRunContext) -> int:
 
     # 5c. ST names -- always runs (local CSV cache, no network).
     # ST status determines limit threshold (5% vs 10%) used by settle_day.
-    from ashare_lab.data.validator import _ST_PATTERN  # noqa: PLC0415
+    from ashare_lab.data.validator import _ST_PATTERN
     st_cached = _load_st_cache(ctx.trade_date, ctx.fetch_symbols)
     if st_cached is not None:
         ctx.st_names = st_cached
@@ -781,13 +826,14 @@ qlib.init(provider_uri=str(DEFAULT_PROVIDER_URI))
 from qlib.data import D
 syms = json.loads(sys.argv[1])
 td = sys.argv[2]
-raw = D.features(instruments=syms, fields=["$close","$change","$volume","$factor"],
+raw = D.features(instruments=syms, fields=["$close","Ref($close,1)","$change","$volume","$factor"],
                  start_time=td, end_time=td)
 if raw is not None and not raw.empty:
     out = {}
     for idx, row in raw.iterrows():
         inst = idx[0] if isinstance(idx, tuple) else str(idx)
-        out[str(inst)] = {"close": float(row.get("$close",0)), "change": float(row.get("$change",0)),
+        out[str(inst)] = {"close": float(row.get("$close",0)), "ref_close": float(row.get("Ref($close,1)",0)),
+                          "change": float(row.get("$change",0)),
                           "volume": float(row.get("$volume",0)), "factor": float(row.get("$factor",1.0))}
     print(json.dumps(out))
 else:
@@ -811,28 +857,7 @@ else:
                             break
                     # qlib $close is normalized (IPO day=1.0); divide by $factor
                     # to recover actual CNY price for NAV and order sizing.
-                    _raw_factor = pdata.get("factor")
-                    if _raw_factor is None:
-                        # Factor missing: price may be normalized but we
-                        # cannot recover real CNY. Log warning, do NOT set
-                        # adjusted=True so the sanity gate can flag it.
-                        logger.warning(
-                            "Factor missing for %s, using raw qlib close=%.4f",
-                            matched, pdata["close"],
-                        )
-                        _factor = 1.0
-                        _adjusted = False
-                    else:
-                        _factor = max(_raw_factor, 1e-8)
-                        _adjusted = True
-                    ctx.prices[matched] = {
-                        "close": pdata["close"] / _factor,
-                        "change": pdata["change"],
-                        "volume": pdata["volume"],
-                        "factor": _raw_factor if _raw_factor is not None else 1.0,
-                        "adjusted": _adjusted,
-                        "threshold": get_limit_threshold(matched, ctx.st_names),
-                    }
+                    ctx.prices[matched] = _price_row(pdata, matched, ctx.st_names)
                 logger.info("fetched %d prices via subprocess", len(ctx.prices))
             else:
                 logger.warning("D.features subprocess failed: rc=%d stderr=%s",
@@ -990,7 +1015,7 @@ print(json.dumps(result))
         return -1
 
     # 5g-0. build suffix -> symbol reverse-lookup (O(1) matching, no nested loop)
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
     suffix_to_sym = {}
     for sym in priced_symbols:
         suffix = sym[-6:] if len(sym) > 6 else sym
@@ -1093,7 +1118,7 @@ def _gate_price_sanity(ctx: DailyRunContext) -> None:
     """Halt if prices look like normalized (qlib $close) or wrong-year data."""
     if ctx.steps == {"signal"}:
         return
-    import math  # noqa: PLC0415
+    import math
     suspicious = 0
     for sym, pdata in ctx.prices.items():
         close = pdata.get("close")
@@ -1232,11 +1257,15 @@ def _step8_settle(ctx: DailyRunContext) -> int | None:
         ).fetchall()
     topk_symbols = {r["symbol"] for r in topk_rows}
 
+    # ORDER BY id is the order SQLite already gave this query; asking
+    # for it keeps settlement off the accident of how rows landed,
+    # since cash is consumed as the list is walked
     pending_orders = [
         dict(r) for r in ctx.conn.execute(
             "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
             "suspension_carry_day FROM orders "
-            "WHERE status IN ('pending','carry') AND trade_date <= ?",
+            "WHERE status IN ('pending','carry') AND trade_date <= ? "
+            "ORDER BY id",
             (ctx.trade_date,),
         ).fetchall()
     ]
@@ -1336,7 +1365,7 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
 
     # Persist shadow log if present
     if ctx.risk_result.shadow_log is not None:
-        from ashare_lab.paper.risk_state import log_shadow_transition  # noqa: PLC0415
+        from ashare_lab.paper.risk_state import log_shadow_transition
         log_shadow_transition(
             ctx.conn, ctx.trade_date,
             ctx.risk_result.shadow_log.get("old_flags", {}),
@@ -1346,7 +1375,7 @@ def _step9_risk_checks(ctx: DailyRunContext) -> None:
 
     # Persist new risk state (F1: save every run, both modes)
     if ctx.risk_result.shadow_log is not None and "new_state" in ctx.risk_result.shadow_log:
-        from ashare_lab.paper.risk_state import RiskState, save_risk_state  # noqa: PLC0415
+        from ashare_lab.paper.risk_state import RiskState, save_risk_state
         new_state = RiskState(ctx.risk_result.shadow_log["new_state"])
         new_lockdown = ctx.risk_result.shadow_log.get("new_lockdown_enter_date")
         ctx.risk_state = new_state
@@ -1391,7 +1420,7 @@ def _step9b_hedge_sleeve(ctx: DailyRunContext) -> None:
 
     next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
 
-  
+
     ctx.conn.execute(
         "DELETE FROM orders WHERE trade_date=? AND source='hedge' AND status='pending'",
         (next_td_str,),
@@ -1444,8 +1473,10 @@ def _step9c_nav_hedge_split(ctx: DailyRunContext) -> None:
     )
 
 
-def timing_multiplier(trade_date: str, model: str = "none") -> float:
-    """Return the timing multiplier m for the given trade date and model.
+def timing_multiplier_detail(
+    trade_date: str, model: str = "none"
+) -> tuple[float, str | None]:
+    """Return the timing multiplier m and why it fell back, if it did.
 
     m scales top-k target weights at order generation (cash allocation),
     not signal scores.  Supported values: {0, 0.5, 1.0}.
@@ -1456,27 +1487,36 @@ def timing_multiplier(trade_date: str, model: str = "none") -> float:
       "n2"   = 20d realized volatility percentile
       "n3"   = drawdown state map
 
+    A bare m of 1.0 cannot be interpreted on its own: a model can legitimately
+    return 1.0 for "stay fully invested", and every failure path also falls
+    back to 1.0.  Treating the two as the same number makes a comparison
+    against Book A look clean precisely when the timing model contributed
+    nothing, so the reason is reported alongside the value.
+
     Args:
         trade_date: ISO date string (YYYY-MM-DD).
         model: Model identifier.
 
     Returns:
-        Float multiplier in {0, 0.5, 1.0}.
+        (m, degraded) where m is in {0, 0.5, 1.0} and degraded is None for a
+        value the model actually produced, or a short reason string when 1.0
+        is a fallback.  model="none" is Book A's design, not a degradation,
+        so it reports None.
     """
     if model == "none":
-        return 1.0
+        return 1.0, None
 
     if model not in ("n1", "n2", "n3"):
         logger.warning("Unknown timing model %r, defaulting to m=1.0", model)
-        return 1.0
+        return 1.0, "unknown_model"
 
     try:
         closes = _fetch_csi1000_closes_for_timing(trade_date)
         if closes is None or closes.empty:
             logger.warning("[timing] No CSI1000 data for %s, m=1.0", trade_date)
-            return 1.0
+            return 1.0, "no_index_data"
 
-        from ashare_lab.research.timing_nulls import (  # noqa: PLC0415
+        from ashare_lab.research.timing_nulls import (
             ma_trend_multiplier,
             vol_percentile_multiplier,
             drawdown_state_multiplier,
@@ -1494,15 +1534,24 @@ def timing_multiplier(trade_date: str, model: str = "none") -> float:
                 "[timing] trade_date %s not in m series (model=%s), m=1.0",
                 trade_date, model,
             )
-            return 1.0
+            return 1.0, "date_not_in_series"
 
         m = float(m_series.loc[trade_date])
         logger.info("[timing] %s on %s: m=%.1f", model, trade_date, m)
-        return m
+        return m, None
 
     except Exception:
         logger.warning("[timing] %s failed for %s, m=1.0", model, trade_date, exc_info=True)
-        return 1.0
+        return 1.0, "computation_error"
+
+
+def timing_multiplier(trade_date: str, model: str = "none") -> float:
+    """Return the timing multiplier m, discarding the degradation reason.
+
+    Callers that record or compare multipliers want timing_multiplier_detail
+    so that a fallback 1.0 stays distinguishable from a real one.
+    """
+    return timing_multiplier_detail(trade_date, model)[0]
 
 
 def _fetch_csi1000_closes_for_timing(trade_date: str):
@@ -1515,7 +1564,7 @@ def _fetch_csi1000_closes_for_timing(trade_date: str):
     The result is memoized per trade_date for the process lifetime so
     that multiple Book B ledgers share a single fetch.
     """
-    import pandas as pd  # noqa: PLC0415
+    import pandas as pd
 
     cache = getattr(_fetch_csi1000_closes_for_timing, "_cache", None)
     if cache is None:
@@ -1628,7 +1677,7 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             # predictions are unaffected, but we log and flag it for
             # the report.
             ic_val = meta.get("ic")
-            import math as _math  # noqa: PLC0415
+            import math as _math
             if ic_val is None or (isinstance(ic_val, float) and _math.isnan(ic_val)):
                 logger.warning(
                     "Pipeline: model IC is unavailable (nan) for %s. "
@@ -1704,6 +1753,9 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
     if effective_topk <= 0:
         target_value = 0.0
         buy_syms = []
+        # place_buys receives this as an argument, so it is evaluated even when
+        # the branch above empties the list.
+        equity_nav = 0.0
     else:
         if ctx.hedge_state and ctx.hedge_state.active:
             equity_nav = ctx.total_nav * ctx.hedge_state.equity_target_pct
@@ -1721,7 +1773,9 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
             desired_sell_qty[s] = forced_sells[s]
 
     next_td_str = next_trading_day(dt.date.fromisoformat(ctx.trade_date)).isoformat()
-    for s in sell_set:
+    # sorted, not set order: settlement reads pending orders by rowid,
+    # so the insert order decides which sell fills first
+    for s in sorted(sell_set):
         already = ctx.conn.execute(
             "SELECT COALESCE(SUM(target_qty), 0) FROM orders "
             "WHERE symbol=? AND side='sell' AND status IN ('pending','carry')",
@@ -1731,53 +1785,17 @@ def _step10_signal_generation(ctx: DailyRunContext) -> int:
         if to_insert > 0:
             insert_order(ctx.conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
 
-    # L3: Apply turnover budget cap to discretionary rotation buys
-    from ashare_lab.paper.turnover import (
-        cap_rotation_buys, load_turnover_ramp, save_turnover_ramp,
-        check_ramp_activation, reset_turnover_ramp,
+    buy_syms, target_value, _ = place_buys(
+        ctx.conn,
+        buy_syms=buy_syms,
+        target_value=target_value,
+        prices=ctx.prices,
+        equity_nav=equity_nav,
+        positions=ctx.current_positions,
+        paper_cfg=ctx.paper_cfg,
+        next_td_str=next_td_str,
+        trade_date=ctx.trade_date,
     )
-    turnover_cfg = ctx.paper_cfg.get("turnover_cap")
-    if turnover_cfg and buy_syms and equity_nav > 0:
-        ramp_state = load_turnover_ramp(ctx.conn)
-        # Check ramp activation (cold start / re-entry)
-        invested_threshold = ctx.paper_cfg.get("turnover_ramp_invested_ratio", 0.30)
-        if check_ramp_activation(equity_nav, ctx.current_positions, invested_threshold):
-            if not ramp_state.get("active", False):
-                ramp_state["active"] = True
-                ramp_state["k"] = 0
-                ramp_state["entry_date"] = ctx.trade_date
-                logger.info("[turnover] ramp activated on %s (invested_ratio < %.0f%%)",
-                            ctx.trade_date, invested_threshold * 100)
-        else:
-            if ramp_state.get("active", False):
-                reset_turnover_ramp(ctx.conn)
-                ramp_state = {"entry_date": None, "k": 0, "active": False}
-                logger.info("[turnover] ramp deactivated (invested_ratio >= %.0f%%)",
-                            invested_threshold * 100)
-        ramp_state["ramp_cap"] = ctx.paper_cfg.get("turnover_ramp_cap", 0.50)
-        ramp_state["ramp_days"] = ctx.paper_cfg.get("turnover_ramp_days", 5)
-        buy_syms, target_value, effective_cap, ramp_state = cap_rotation_buys(
-            buy_syms, target_value, ctx.prices, equity_nav, turnover_cfg, ramp_state,
-        )
-        # Advance ramp day counter
-        if ramp_state.get("active", False):
-            save_turnover_ramp(ctx.conn, ramp_state.get("entry_date", ctx.trade_date),
-                               ramp_state.get("k", 0) + 1)
-            ctx.conn.commit()
-
-    for s in buy_syms:
-        close_price = ctx.prices.get(s, {}).get("close")
-        if (
-            not close_price
-            or close_price <= 0
-            or (isinstance(close_price, float) and close_price != close_price)
-        ):
-            logger.warning("Skip buy %s: invalid close price %s", s, close_price)
-            continue
-        target_qty = round_lots(target_value / close_price, "buy")
-        if target_qty <= 0:
-            continue
-        insert_order(ctx.conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
 
     return -1
 
@@ -1831,7 +1849,7 @@ def _step11_ipo_processing(ctx: DailyRunContext) -> None:
         if pos.get("buy_date", "") == ctx.trade_date:
             continue
         try:
-            from qlib.data import D as D_ipo  # noqa: PLC0415
+            from qlib.data import D as D_ipo
             chg_df = D_ipo.features(
                 instruments=[sym], fields=["$change"],
                 start_time=pos["buy_date"], end_time=ctx.trade_date,
@@ -1917,8 +1935,18 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
     ctx.conn.commit()
 
+    # Settled first, then snapshot. Carry-forward anchors on the newest
+    # settled run, so a backup taken before this row is written restores to
+    # a book that looks one day behind and re-opens a position this day
+    # sold. A failed backup is already non-fatal here, so there is nothing
+    # to gain from holding the row back.
+    record_run(ctx.conn, ctx.trade_date, "settled")
+    ctx.conn.commit()
+
     # Integrity gate: check DB health before backup
-    backup_dir = PROJECT_ROOT / "backups"
+    # beside the ledger, not beside the project: a run pointed at some
+    # other ledger must not write into, or prune, the real one's backups
+    backup_dir = ctx.db_path.parent / "backups"
     backup_path = backup_dir / f"paper_{ctx.trade_date}.db"
 
     backup_result = hot_backup_with_integrity(ctx.db_path, backup_path)
@@ -1934,9 +1962,6 @@ def _step12_backup_and_finalize(ctx: DailyRunContext) -> None:
 
     # Monthly golden backup (immutable, never cleaned up)
     create_golden_backup(ctx.db_path, backup_dir)
-
-    record_run(ctx.conn, ctx.trade_date, "settled")
-    ctx.conn.commit()
 
 
 # Single source of truth for the Book B shadow ledger ids: the m=1.0
@@ -2005,7 +2030,7 @@ def _step12_book_b(ctx: DailyRunContext) -> None:
 
 def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
     """Book B implementation.  Isolated for testability."""
-    m = timing_multiplier(ctx.trade_date, model=book_id)
+    m, m_degraded = timing_multiplier_detail(ctx.trade_date, model=book_id)
 
     # Open Book B database
     db_dir = ctx.db_path.parent if ctx.db_path else Path("data")
@@ -2014,15 +2039,15 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # Day 0 bootstrap: copy production DB
         _bootstrap_book_b(ctx.db_path, book_b_path)
 
-    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_connection
     book_conn = get_connection(book_b_path)
     try:
         # Load Book B state
-        from ashare_lab.paper.ledger import (  # noqa: PLC0415
+        from ashare_lab.paper.ledger import (
             get_latest_positions, get_latest_cash, get_cooldowns,
             delete_expired_cooldowns, get_positions_for_date, record_run,
         )
-        from ashare_lab.paper.risk import manage_trailing_cooldown  # noqa: PLC0415
+        from ashare_lab.paper.risk import manage_trailing_cooldown
         book_positions = get_latest_positions(book_conn)
         book_cash = get_latest_cash(book_conn, ctx.paper_cfg["initial_cash"])
         book_cooldown = get_cooldowns(book_conn)
@@ -2032,13 +2057,16 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         # PHASE 1: Settle yesterday's Book B orders (T+1)
         # Must happen BEFORE computing NAV/signals/target_value,
         # mirroring Book A's flow: _step8_settle -> _step10_signals.
-        from ashare_lab.paper.engine import round_lots, settle_day  # noqa: PLC0415
+        from ashare_lab.paper.engine import settle_day
 
+        # ORDER BY id for the same reason as the main book: settlement
+        # walks this list and spends cash as it goes
         pending_orders = [
             dict(r) for r in book_conn.execute(
                 "SELECT id, symbol, side, target_qty, carry_day, reset_count, "
                 "suspension_carry_day FROM orders "
-                "WHERE status IN ('pending','carry') AND trade_date <= ?",
+                "WHERE status IN ('pending','carry') AND trade_date <= ? "
+                "ORDER BY id",
                 (ctx.trade_date,),
             ).fetchall()
         ]
@@ -2061,12 +2089,18 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         ) + book_cash
 
         # Generate Book B orders (same signals, m-scaled target)
-        from ashare_lab.paper.signal import (  # noqa: PLC0415
+        from ashare_lab.paper.signal import (
             generate_signals, filter_candidates, topk_dropout_orders,
         )
 
         signals = generate_signals(ctx.trade_date, pred_path=ctx.pred_path)
-        candidate_syms = [s for s in signals if s in ctx.universe_symbols and s not in ctx.ipo_listing_syms and s not in ctx.st_names]
+        candidate_syms = [
+            s
+            for s in signals
+            if s in ctx.universe_symbols
+            and s not in ctx.ipo_listing_syms
+            and s not in ctx.st_names
+        ]
         filtered_syms = filter_candidates(
             candidate_syms, ctx.market_data,
             ctx.config.get("universe", {}).get("listing_min_days", 60),
@@ -2100,6 +2134,7 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         if effective_topk <= 0:
             target_value = 0.0
             buy_syms = []
+            equity_nav = 0.0
         else:
             equity_nav = book_total_nav
             target_value = (equity_nav * ctx.config["cost_model"]["risk_degree"] * m) / effective_topk
@@ -2117,53 +2152,28 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
             else:
                 desired_sell_qty[s] = forced_sells[s]
 
-        for s in sell_set:
+        # sorted, not set order: settlement reads pending orders by
+        # rowid, so the insert order decides which fills first
+        for s in sorted(sell_set):
             to_insert = desired_sell_qty[s]
             if to_insert > 0:
                 insert_order(book_conn, next_td_str, s, "sell", to_insert, None, "pending", 0, ctx.trade_date)
 
-        # L3: Apply turnover budget cap (Book B has own ramp state in own DB)
-        from ashare_lab.paper.turnover import (
-            cap_rotation_buys as _cap_buys_b,
-            load_turnover_ramp as _load_ramp_b,
-            save_turnover_ramp as _save_ramp_b,
-            check_ramp_activation as _check_ramp_b,
-            reset_turnover_ramp as _reset_ramp_b,
+        buy_syms, target_value, _ = place_buys(
+            book_conn,
+            buy_syms=buy_syms,
+            target_value=target_value,
+            prices=ctx.prices,
+            equity_nav=equity_nav,
+            positions=book_positions,
+            paper_cfg=ctx.paper_cfg,
+            next_td_str=next_td_str,
+            trade_date=ctx.trade_date,
+            label="book B",
         )
-        turnover_cfg_b = ctx.paper_cfg.get("turnover_cap")
-        if turnover_cfg_b and buy_syms and equity_nav > 0:
-            ramp_b = _load_ramp_b(book_conn)
-            inv_thresh_b = ctx.paper_cfg.get("turnover_ramp_invested_ratio", 0.30)
-            if _check_ramp_b(equity_nav, book_positions, inv_thresh_b):
-                if not ramp_b.get("active", False):
-                    ramp_b["active"] = True
-                    ramp_b["k"] = 0
-                    ramp_b["entry_date"] = ctx.trade_date
-            else:
-                if ramp_b.get("active", False):
-                    _reset_ramp_b(book_conn)
-                    ramp_b = {"entry_date": None, "k": 0, "active": False}
-            ramp_b["ramp_cap"] = ctx.paper_cfg.get("turnover_ramp_cap", 0.50)
-            ramp_b["ramp_days"] = ctx.paper_cfg.get("turnover_ramp_days", 5)
-            buy_syms, target_value, _, ramp_b = _cap_buys_b(
-                buy_syms, target_value, ctx.prices, equity_nav, turnover_cfg_b, ramp_b,
-            )
-            if ramp_b.get("active", False):
-                _save_ramp_b(book_conn, ramp_b.get("entry_date", ctx.trade_date),
-                             ramp_b.get("k", 0) + 1)
-                book_conn.commit()
-
-        for s in buy_syms:
-            close_price = ctx.prices.get(s, {}).get("close")
-            if not close_price or close_price <= 0:
-                continue
-            target_qty = round_lots(target_value / close_price, "buy")
-            if target_qty <= 0:
-                continue
-            insert_order(book_conn, next_td_str, s, "buy", target_qty, None, "pending", 0, ctx.trade_date)
 
         # Write A/B/C artifact
-        _write_abc_artifact(ctx, book_conn, book_id, m)
+        _write_abc_artifact(ctx, book_conn, book_id, m, m_degraded)
 
         book_conn.commit()
 
@@ -2172,7 +2182,12 @@ def _run_book_b(ctx: DailyRunContext, book_id: str = "none") -> None:
         record_run(book_conn, ctx.trade_date, "settled")
         book_conn.commit()
 
-        logger.info("[book_b] completed for %s (m=%.1f, book_id=%s)", ctx.trade_date, m, book_id)
+        logger.info(
+            "[book_b] completed for %s (m=%.1f%s, book_id=%s)",
+            ctx.trade_date, m,
+            f" degraded={m_degraded}" if m_degraded else "",
+            book_id,
+        )
     finally:
         book_conn.close()
 
@@ -2188,10 +2203,10 @@ def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
     carry rows keep their original trade_date, which is already <= today,
     so a date filter would miss them.
     """
-    import shutil  # noqa: PLC0415
+    import shutil
     shutil.copy2(prod_db_path, book_b_path)
 
-    from ashare_lab.paper.ledger import get_connection  # noqa: PLC0415
+    from ashare_lab.paper.ledger import get_connection
     conn = get_connection(book_b_path)
     try:
         conn.execute(
@@ -2204,9 +2219,24 @@ def _bootstrap_book_b(prod_db_path: Path, book_b_path: Path) -> None:
     logger.info("[book_b] bootstrapped %s -> %s", prod_db_path, book_b_path)
 
 
-def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float) -> None:
-    """Write daily A/B/C comparison artifact to experiments/control_books/."""
-    from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash  # noqa: PLC0415
+def _write_abc_artifact(
+    ctx: DailyRunContext,
+    book_conn,
+    book_id: str,
+    m: float,
+    m_degraded: str | None,
+) -> None:
+    """Write daily A/B/C comparison artifact to experiments/control_books/.
+
+    m_degraded records why m fell back to 1.0, or None when the timing model
+    produced the value.  Without it a reader cannot tell a day the model
+    scored from a day it failed on, and both look like full investment.
+
+    It has no default on purpose: a forgotten argument would write exactly
+    what a clean day writes, so the omission has to fail at the call site
+    rather than wait for a test to notice.
+    """
+    from ashare_lab.paper.ledger import get_positions_for_date, get_latest_cash
 
     # Book A NAV (from production)
     nav_a = ctx.total_nav
@@ -2237,6 +2267,7 @@ def _write_abc_artifact(ctx: DailyRunContext, book_conn, book_id: str, m: float)
         "excess_a": round(excess_a, 6),
         "excess_b": round(excess_b, 6),
         "m": m,
+        "m_degraded": m_degraded,
     }
     artifact_path = artifact_dir / f"{ctx.trade_date}_{book_id}.json"
     # Atomic write via same-directory temp + rename: a crashed writer must
@@ -2330,7 +2361,7 @@ def _step15_graduation(ctx: DailyRunContext) -> None:
     if stale_flag == "1":
         return
     try:
-        from ashare_lab.paper.graduation import check_graduation, notify_graduation  # noqa: PLC0415
+        from ashare_lab.paper.graduation import check_graduation, notify_graduation
         passed, stats = check_graduation(ctx.conn)
         logger.info(
             "Graduation gate: passed=%s rate=%.1f%% days_remaining=%d",
@@ -2568,7 +2599,7 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
         return
 
     ic_val = meta.get("lagged_ic_t5")
-    import math as _math  # noqa: PLC0415
+    import math as _math
     if ic_val is None:
         logger.debug("IC history: lagged_ic_t5 missing for %s", t5_date)
         return
@@ -2620,7 +2651,7 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
         logger.info("IC history: recorded %s -> %s", t5_date, ic_str)
 
     entries.sort(key=lambda e: e[0])
-    entries = entries[-30:]
+    entries = entries[-60:]
 
     tmp_path = history_path.with_suffix(".tsv.tmp")
     with tmp_path.open("w") as f:
@@ -2632,6 +2663,33 @@ def append_ic_history(pred_path: Path, trade_date: str) -> None:
 # ------------------------------------------------------------------
 # Status query
 # ------------------------------------------------------------------
+
+
+
+def _status_gaps(conn: sqlite3.Connection) -> list[dict]:
+    """Return settlement gaps for display, or an empty list if the scan fails.
+
+    Display-only: an unreadable date or a broken calendar must not take the
+    status command down, and nothing here writes to the ledger.
+    """
+    try:
+        settled_range = conn.execute(
+            "SELECT MIN(trade_date), MAX(trade_date) FROM runs WHERE status = 'settled'"
+        ).fetchone()
+        if not settled_range or not settled_range[0] or not settled_range[1]:
+            return []
+        from ashare_lab.data.calendar import trading_days_between
+        days = [
+            day.isoformat()
+            for day in trading_days_between(
+                dt.date.fromisoformat(settled_range[0]),
+                dt.date.fromisoformat(settled_range[1]),
+            )
+        ]
+    except Exception:
+        logger.warning("settlement gap scan skipped", exc_info=True)
+        return []
+    return settlement_gaps(conn, days)
 
 
 def get_status() -> dict:
@@ -2661,6 +2719,8 @@ def get_status() -> dict:
         "WHERE status IN ('pending','carry')"
     ).fetchone()[0]
 
+    gaps = _status_gaps(conn)
+
     return {
         "last_trade_date": last_run["trade_date"] if last_run else None,
         "run_status": last_run["status"] if last_run else None,
@@ -2668,4 +2728,6 @@ def get_status() -> dict:
         "cash": float(nav_row["cash"]) if nav_row else None,
         "position_count": pos_count,
         "pending_orders": pending_count,
+        "gaps": gaps,
+        "gap_count": len(gaps),
     }

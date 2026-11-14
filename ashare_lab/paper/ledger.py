@@ -506,6 +506,36 @@ def is_day_settled(conn: sqlite3.Connection, trade_date: str) -> bool:
     return row is not None
 
 
+def settlement_gaps(
+    conn: sqlite3.Connection, calendar_days: list[str]
+) -> list[dict]:
+    """Trading days between the first and last settled day that are not settled.
+
+    A missing day is not automatically an error: the pipeline leaves stale days
+    retryable, so the run status says why the day has no NAV. What this prevents
+    is the day disappearing from view entirely.
+
+    *calendar_days* comes from the caller, which keeps this function free of a
+    calendar dependency and testable in memory.
+    """
+    settled = {
+        row[0]
+        for row in conn.execute(
+            "SELECT trade_date FROM runs WHERE status = 'settled'"
+        )
+    }
+    if not settled:
+        return []
+    first, anchor = min(settled), max(settled)
+    # runs is keyed by trade_date (one row per day), so no ordering is needed.
+    statuses = dict(conn.execute("SELECT trade_date, status FROM runs"))
+    return [
+        {"date": day, "status": statuses.get(day, "no_run_record")}
+        for day in calendar_days
+        if first < day < anchor and day not in settled
+    ]
+
+
 def force_reset_day(conn: sqlite3.Connection, trade_date: str) -> None:
     """Idempotently undo a settled day so it can be re-run.
 
@@ -576,6 +606,27 @@ def force_reset_day(conn: sqlite3.Connection, trade_date: str) -> None:
 # Order helpers
 # ---------------------------------------------------------------------------
 
+def symbols_with_buy_in_flight(
+    conn: sqlite3.Connection, symbols: list[str] | set[str]
+) -> set[str]:
+    """Symbols that already have a pending or carried buy order.
+
+    An unfilled buy still represents the position it was sized for. Ordering
+    the same symbol again doubles the exposure when both fill.
+    """
+    wanted = list(symbols)
+    if not wanted:
+        return set()
+    placeholders = ",".join("?" * len(wanted))
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM orders "
+        "WHERE side='buy' AND status IN ('pending','carry') "
+        f"AND symbol IN ({placeholders})",
+        wanted,
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
 def insert_order(
     conn: sqlite3.Connection,
     trade_date: str,
@@ -587,20 +638,27 @@ def insert_order(
     carry_day: int,
     created_run_date: str,
     source: str = "signal",
+    *,
+    cancel_reason: str | None = None,
 ) -> int:
     """Insert an order row; return the new rowid.
 
     *created_at* is computed internally (UTC ISO-8601).
+
+    *cancel_reason* tags an order created by a specific mechanism rather
+    than by a signal, so that mechanism can recognise its own work later.
+    It stays NULL for ordinary orders, which is what settlement matches on.
     """
     created_at = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO orders "
         "(trade_date, symbol, side, target_qty, price, status, "
-        " carry_day, created_run_date, source, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " carry_day, created_run_date, source, created_at, cancel_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             trade_date, symbol, side, target_qty, price,
             status, carry_day, created_run_date, source, created_at,
+            cancel_reason,
         ),
     )
     return cur.lastrowid  # type: ignore[return-value]
@@ -1116,6 +1174,17 @@ def hot_backup_with_integrity(
     )
 
 
+def _golden_period() -> str:
+    """Month the golden snapshot belongs to, on the exchange clock.
+
+    A host west of Shanghai turns the month over later than the exchange, which
+    would file the first session of a month under the previous month.
+    """
+    from ashare_lab.data.calendar import market_today
+
+    return market_today().strftime("%Y-%m")
+
+
 def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     """Create a monthly golden backup (immutable, chmod 444).
 
@@ -1125,7 +1194,7 @@ def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     Returns the path if created, None if already exists or integrity failed.
     """
     golden_dir = backup_dir / "golden"
-    golden_path = golden_dir / f"{date.today().strftime('%Y-%m')}.db"
+    golden_path = golden_dir / f"{_golden_period()}.db"
 
     if golden_path.exists():
         logger.debug("Golden backup already exists: %s", golden_path)
@@ -1154,12 +1223,62 @@ def create_golden_backup(db_path: Path, backup_dir: Path) -> Path | None:
     return golden_path
 
 
+def _backup_data_extent(backup_path: Path) -> str:
+    """Return the latest trade date a backup actually contains.
+
+    An empty string means the file holds no ledger history, whether because
+    the table is absent, unreadable, or simply has no rows.  Used to order
+    restore candidates, so the answer only needs to be comparable, not
+    precise.
+    """
+    try:
+        conn = sqlite3.connect(
+            backup_path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+    except (sqlite3.Error, OSError, ValueError):
+        return ""
+    try:
+        row = conn.execute("SELECT MAX(trade_date) FROM nav").fetchone()
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else ""
+
+
+def _rank_restore_candidates(paths: list[Path]) -> list[tuple[Path, str]]:
+    """Order restore candidates by the history they hold, newest first.
+
+    Filename order alone is not safe: a snapshot of the wrong file lands under
+    a perfectly good name, and sorting by name hands it back ahead of a
+    complete backup.  Ties and empty backups fall back to filename order so a
+    single fresh backup is still returned when it is all there is.
+
+    Returns (path, extent) pairs.  Each candidate is read exactly once and its
+    answer carried, because this runs on a recovery path where the system is
+    already in trouble and every open is against a file that may be damaged.
+    """
+    extents = [(path, _backup_data_extent(path)) for path in paths]
+    ranked = sorted(extents, key=lambda pair: (pair[1], pair[0].name), reverse=True)
+    if len(ranked) > 1 and not any(extent for _, extent in ranked):
+        # Reading history from every candidate failed, so this ordering is
+        # filename order again -- the exact behaviour that let an empty
+        # snapshot outrank a populated one. Worth a word: a renamed ledger
+        # table would land here with no other symptom.
+        logger.warning(
+            "No restore candidate reports any ledger history; "
+            "ranking %d candidates by filename only",
+            len(ranked),
+        )
+    return ranked
+
+
 def find_best_backup(backup_dir: Path, target_date: str | None = None) -> Path | None:
     """Find the best available backup by priority.
 
     Priority:
     1. Daily backup for target_date (if provided)
-    2. Most recent daily backup passing integrity check
+    2. Daily backup holding the most recent history, passing integrity check
     3. Golden backup for current month (last resort)
 
     Returns the path to the best backup, or None if nothing found.
@@ -1174,23 +1293,26 @@ def find_best_backup(backup_dir: Path, target_date: str | None = None) -> Path |
             if check.is_healthy:
                 return exact
 
-    # Priority 2: most recent daily backup passing integrity
-    daily_backups = sorted(
-        backup_dir.glob("paper_*.db"),
-        key=lambda f: f.name,
-        reverse=True,
-    )
-    for bp in daily_backups:
+    # Priority 2: the daily backup carrying the most history.  Integrity only
+    # proves the file is well formed, so the ordering has to look at content.
+    for bp, extent in _rank_restore_candidates(list(backup_dir.glob("paper_*.db"))):
         check = check_db_integrity(bp)
         if check.is_healthy:
+            logger.info(
+                "Selected backup %s (history through %s)",
+                bp.name, extent or "no ledger rows",
+            )
             return bp
 
     # Priority 3: golden backup
     if golden_dir.exists():
-        golden_files = sorted(golden_dir.glob("*.db"), reverse=True)
-        for gp in golden_files:
+        for gp, extent in _rank_restore_candidates(list(golden_dir.glob("*.db"))):
             check = check_db_integrity(gp)
             if check.is_healthy:
+                logger.info(
+                    "Selected golden backup %s (history through %s)",
+                    gp.name, extent or "no ledger rows",
+                )
                 return gp
 
     return None

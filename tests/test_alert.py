@@ -106,3 +106,35 @@ class TestOutboundChannel:
         assert "ilinkai.weixin.qq.com" not in src
         assert "qqbot" in src
         assert "hermes" in src.lower() or "HERMES" in src
+
+
+class TestTheIntervalUsesTheExchangeDay:
+    """A host west of the exchange is a day behind for part of its afternoon; the
+    stamp must not be written or read in that other day."""
+
+    def test_the_stamp_records_the_exchange_day(self, tmp_path, monkeypatch):
+        sentinel = date.today() + timedelta(days=10)
+        monkeypatch.setattr(_alert_mod, "_exchange_today", lambda: sentinel)
+
+        stamp = tmp_path / "s.stamp"
+        _write_stamp(str(stamp))
+
+        assert stamp.read_text() == sentinel.isoformat()
+
+    def test_the_interval_is_measured_from_the_exchange_day(self, tmp_path, monkeypatch):
+        sentinel = date.today() + timedelta(days=10)
+        monkeypatch.setattr(_alert_mod, "_exchange_today", lambda: sentinel)
+
+        stamp = tmp_path / "old.stamp"
+        stamp.write_text((sentinel - timedelta(days=7)).isoformat())
+
+        assert _should_alert(str(stamp)) is True
+
+    def test_a_stamp_from_the_exchange_today_suppresses(self, tmp_path, monkeypatch):
+        sentinel = date.today() + timedelta(days=10)
+        monkeypatch.setattr(_alert_mod, "_exchange_today", lambda: sentinel)
+
+        stamp = tmp_path / "now.stamp"
+        stamp.write_text(sentinel.isoformat())
+
+        assert _should_alert(str(stamp)) is False
