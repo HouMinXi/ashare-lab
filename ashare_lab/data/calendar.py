@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import exchange_calendars as xcals
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 EXCHANGE_ID = "XSHG"
@@ -18,10 +21,37 @@ def _get_calendar() -> xcals.ExchangeCalendar:
     return xcals.get_calendar(EXCHANGE_ID)
 
 
+_CALENDAR_RUNWAY_DAYS = 60
+_runway_warned = False
+
+
+def _warn_on_short_runway(cal, as_of: dt.date) -> None:
+    """Say so while there is still time to update the packaged calendar."""
+    global _runway_warned
+    if _runway_warned:
+        return
+    remaining = (cal.last_session.date() - as_of).days
+    if remaining < _CALENDAR_RUNWAY_DAYS:
+        _runway_warned = True
+        log.warning(
+            "exchange calendar ends %s, %d days after %s; update "
+            "exchange_calendars before the next session past it",
+            cal.last_session.date(), remaining, as_of,
+        )
+
+
 def is_trading_day(date: dt.date) -> bool:
     cal = _get_calendar()
     ts = pd.Timestamp(date)
-    if ts < cal.first_session or ts > cal.last_session:
+    _warn_on_short_runway(cal, date)
+    if ts > cal.last_session:
+        # Past the packaged calendar every weekday looks like a holiday, so a
+        # stale calendar would silently skip every session instead of failing.
+        raise RuntimeError(
+            f"exchange calendar ends at {cal.last_session.date()}; {date} is "
+            "beyond it, so the calendar data needs updating"
+        )
+    if ts < cal.first_session:
         return False
     return cal.is_session(ts)
 
@@ -44,8 +74,12 @@ def latest_trading_day(as_of: dt.date | None = None) -> dt.date:
         as_of = market_today()
     cal = _get_calendar()
     ts = pd.Timestamp(as_of)
+    _warn_on_short_runway(cal, as_of)
     if ts > cal.last_session:
-        return cal.last_session.date()
+        raise RuntimeError(
+            f"exchange calendar ends at {cal.last_session.date()}; {as_of} is "
+            "beyond it, so the calendar data needs updating"
+        )
     if ts < cal.first_session:
         raise ValueError(
             f"as_of {as_of} predates calendar start {cal.first_session.date()}"
