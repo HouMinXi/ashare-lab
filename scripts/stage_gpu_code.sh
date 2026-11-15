@@ -76,7 +76,10 @@ fi
 # The bytes come from the working tree, not from the commit, so a dirty tree
 # must not be reported under a clean commit id.
 revision=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
-if [ "$revision" != unknown ] && ! git -C "$REPO" diff --quiet -- ashare_lab configs 2>/dev/null; then
+# status --porcelain reports staged edits, unstaged edits, deletions and
+# untracked files alike; diff --quiet sees only the unstaged half.
+if [ "$revision" != unknown ] \
+    && [ -n "$(git -C "$REPO" status --porcelain -- ashare_lab configs scripts/deploy_verify.py 2>/dev/null)" ]; then
     revision="$revision-dirty"
 fi
 if ! { printf '# revision %s\n' "$revision"

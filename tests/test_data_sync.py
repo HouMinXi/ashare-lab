@@ -269,7 +269,8 @@ class TestStagingScript:
         manifest = staging / "deploy-manifest.sha256"
         header = manifest.read_text().splitlines()[0]
         assert header.startswith("# revision "), header
-        # The tree here has uncommitted edits, so the id must say so.
+        # This worktree ships uncommitted edits, so the id must say so.
+        assert header.endswith("-dirty"), header
         assert len(header.split()[-1].removesuffix("-dirty")) == 40, header
         listed = {
             line.split(None, 1)[1].strip()
@@ -1162,3 +1163,44 @@ def test_staging_refuses_a_symlinked_staging_directory(tmp_path):
     assert result.returncode == 1
     assert "symbolic link" in result.stderr
     assert (data / "keep.txt").read_text() == "keep\n"
+
+
+def test_the_manifest_revision_marks_a_dirty_tree(tmp_path):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    for name in ("ashare_lab", "configs", "scripts"):
+        (repo / name).mkdir()
+    (repo / "ashare_lab" / "m.py").write_text("x = 1\n")
+    (repo / "configs" / "c.yaml").write_text("a: 1\n")
+    (repo / "scripts" / "deploy_verify.py").write_text("print(1)\n")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+           "PATH": "/usr/bin:/bin"}
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True,
+                   capture_output=True, env=env, text=True)
+
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+
+    def header_for(mutate):
+        mutate()
+        out = tmp_path / "stage"
+        result = subprocess.run(["bash", str(stage), str(repo), str(out)],
+                                capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return (out / "deploy-manifest.sha256").read_text().splitlines()[0]
+
+    clean = header_for(lambda: None)
+    assert not clean.endswith("-dirty"), clean
+
+    def staged_only():
+        (repo / "ashare_lab" / "m.py").write_text("x = 2\n")
+        subprocess.run(["git", "add", "ashare_lab/m.py"], cwd=repo, check=True,
+                       capture_output=True, env=env)
+
+    staged = header_for(staged_only)
+    assert staged.endswith("-dirty"), staged
+
+    (repo / "ashare_lab" / "extra.py").write_text("y = 1\n")
+    untracked = header_for(lambda: None)
+    assert untracked.endswith("-dirty"), untracked

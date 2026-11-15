@@ -105,3 +105,58 @@ def test_the_code_sync_leaves_no_errexit_behind(tmp_path):
     result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)
 
     assert "ALIVE" in result.stdout, result.stdout + result.stderr
+
+
+def _git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", *args],
+        cwd=cwd, check=True, capture_output=True, text=True,
+    )
+
+
+def _pipeline_function():
+    source = (ROOT / "scripts" / "ashare-pipeline.sh").read_text()
+    start = source.index("sync_code_to_gpu() {")
+    return source[start: source.index("\n}\n", start) + 3]
+
+
+def test_a_tree_behind_its_upstream_is_refused(tmp_path):
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(seed)], check=True, capture_output=True)
+    (seed / "ashare_lab").mkdir()
+    (seed / "ashare_lab" / "m.py").write_text("x = 1\n")
+    _git("add", "-A", cwd=seed)
+    _git("commit", "-qm", "one", cwd=seed)
+    _git("push", "-q", "origin", "HEAD:main", cwd=seed)
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "main", str(bare), str(clone)],
+        check=True, capture_output=True,
+    )
+
+    # A commit lands upstream after the clone; the clone now ships stale code.
+    (seed / "ashare_lab" / "m.py").write_text("x = 2\n")
+    _git("commit", "-qam", "two", cwd=seed)
+    _git("push", "-q", "origin", "HEAD:main", cwd=seed)
+
+    script = tmp_path / "sync.sh"
+    script.write_text(
+        "set -uo pipefail\n"
+        f"REPO={shlex.quote(str(clone))}\n"
+        f"RECEIVER={shlex.quote(str(tmp_path / 'r'))}\n"
+        "GPU_USER=fixture\nGPU_HOST=fixture\n"
+        'scp() { return 0; }\n'
+        'ssh() { return 0; }\n'
+        'timeout() { shift; "$@"; }\n'
+        + _pipeline_function()
+        + "\nsync_code_to_gpu\necho \"RC=$?\"\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=120)
+
+    assert "behind its upstream" in result.stderr, result.stdout + result.stderr
+    assert "RC=1" in result.stdout

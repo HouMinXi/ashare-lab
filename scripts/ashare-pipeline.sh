@@ -114,6 +114,21 @@ fi
 
 sync_code_to_gpu() {
     local STAGING="/tmp/gpu-deploy"
+
+    # A tree behind its upstream ships code nobody reviewed: the manifest
+    # certifies those bytes and every later check passes.
+    if git -C "$REPO" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        if git -C "$REPO" fetch --quiet origin 2>/dev/null; then
+            local behind
+            behind=$(git -C "$REPO" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+            if [ "${behind:-0}" -gt 0 ]; then
+                echo "ERROR: $REPO is $behind commits behind its upstream; pull before shipping" >&2
+                return 1
+            fi
+        else
+            echo "WARNING: could not fetch $REPO; shipping its current tree" >&2
+        fi
+    fi
     if ! bash "$REPO/scripts/stage_gpu_code.sh" "$REPO" "$STAGING"; then
         return 1
     fi

@@ -31,7 +31,7 @@ def _warn_on_short_runway(cal, as_of: dt.date) -> None:
     if _runway_warned:
         return
     remaining = (cal.last_session.date() - as_of).days
-    if remaining < _CALENDAR_RUNWAY_DAYS:
+    if 0 <= remaining < _CALENDAR_RUNWAY_DAYS:
         _runway_warned = True
         log.warning(
             "exchange calendar ends %s, %d days after %s; update "
