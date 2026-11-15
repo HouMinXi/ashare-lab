@@ -264,8 +264,9 @@ class TestFinalizeArtifacts:
 
         assert dest == fake_models_dir / "latest.pkl"
         assert dest.is_symlink()
-        # Symlink should resolve to w7.pkl (highest numbered).
-        assert os.path.realpath(dest) == str(models_dir / "w7.pkl")
+        # Symlink should resolve to w7.pkl (highest numbered). Both sides are
+        # resolved because the test root itself can sit behind a symlink.
+        assert os.path.realpath(dest) == os.path.realpath(models_dir / "w7.pkl")
         # Content should match w7.pkl (b"dummy7"), not w3 or backup.
         assert dest.read_bytes() == b"dummy7"
 

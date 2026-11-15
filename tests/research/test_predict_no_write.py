@@ -121,9 +121,9 @@ def test_router_transport_is_used_when_configured():
 
     assert seen == {"method": "router", "training": False}
     # The backbone carries the row's own level (108 on the live session) into
-    # all four columns; the routing stub emits [level, level + 1], and the
-    # transport adds 5 to their mean.
-    assert float(frame["score"].iloc[0]) == pytest.approx(108.0 + 0.5 + 5.0)
+    # all four hidden columns; the routing stub sums them (4 x 108) and emits
+    # [4L, 4L + 1]; the transport adds 5 to their mean.
+    assert float(frame["score"].iloc[0]) == pytest.approx(4 * 108.0 + 0.5 + 5.0)
 
 
 def test_an_unfitted_model_is_refused():
@@ -186,6 +186,6 @@ def test_every_admitted_instrument_is_scored_exactly_once():
     assert len(frame) == view._diagnostics["admitted"]
     assert set(frame.index.get_level_values("instrument")) == {"A", "B", "C"}
     # The rows must stay paired with their instruments: A < B < C by level.
-    scores = frame["score"].droplevel("datetime").sort_index()
-    assert list(scores.index) == ["A", "B", "C"]
+    # Sorting first would assert only that sorting sorts.
+    scores = frame["score"].droplevel("datetime")
     assert scores.loc["A"] < scores.loc["B"] < scores.loc["C"]

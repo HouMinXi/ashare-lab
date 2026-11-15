@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -13,6 +14,22 @@ import pytest
 
 class _DatasetObserved(Exception):
     pass
+
+
+def _skip_unless_training_stack() -> None:
+    """The probes below run Qlib in a child process of this interpreter.
+
+    Qlib's model wrappers import torch, so both have to be present in the
+    interpreter that runs this file; where they are not, the probes cannot run
+    at all and say so instead of failing on an import.
+    """
+    missing = [name for name in ("qlib", "torch")
+               if importlib.util.find_spec(name) is None]
+    if missing:
+        pytest.skip(
+            "needs " + " and ".join(missing)
+            + "; run this file where the training stack is installed"
+        )
 
 
 def _real_dataset_case(tmp_path, model_type):
@@ -113,7 +130,10 @@ def test_cli_forwards_zero_validation_to_the_validator(tmp_path, monkeypatch):
 def _run_dataset_probe(tmp_path, *args, timeout=60):
     # A fresh process uses the installed Qlib, not stubs from test collection.
     root = Path(__file__).resolve().parents[2]
-    env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1", MLFLOW_ALLOW_FILE_STORE="true",
+    # Keep whatever PYTHONPATH the caller had: a stack installed nowhere but
+    # on the path is still reachable from the child.
+    path = str(root) + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")
+    env = dict(os.environ, PYTHONPATH=path, PYTHONDONTWRITEBYTECODE="1", MLFLOW_ALLOW_FILE_STORE="true",
                OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", NUMBA_CACHE_DIR=str(tmp_path / "numba"))
     result = subprocess.run(
         [sys.executable, "-B", str(Path(__file__).resolve()), str(tmp_path), *args],
@@ -124,6 +144,7 @@ def _run_dataset_probe(tmp_path, *args, timeout=60):
 
 @pytest.mark.parametrize("model_type", ["tra", "alstm"])
 def test_time_series_scores_test_dates_but_keeps_preceding_features(tmp_path, model_type):
+    _skip_unless_training_stack()
     _run_dataset_probe(tmp_path, model_type)
 
 
@@ -202,11 +223,13 @@ def _label_population_case(tmp_path, model_type, available, label_case=None):
 @pytest.mark.parametrize("model_type", ["tra", "alstm", "lgbm", "densemble"])
 @pytest.mark.parametrize("available", [False, True])
 def test_missing_forward_labels_refuse_before_building_a_model(tmp_path, model_type, available):
+    _skip_unless_training_stack()
     _run_dataset_probe(tmp_path, model_type, str(int(available)))
 
 
 @pytest.mark.parametrize("label_case", ["imputed", "disjoint", "infinite"])
 def test_finite_labels_must_match_on_same_sample(tmp_path, label_case):
+    _skip_unless_training_stack()
     _run_dataset_probe(tmp_path, "lgbm", "0", label_case)
 
 
@@ -304,6 +327,7 @@ class _ModelObserved(Exception):
     ("densemble", "alpha360", "tail"),
 ])
 def test_file_backed_score_requires_finite_labels(tmp_path, model_type, handler_name, population):
+    _skip_unless_training_stack()
     _run_dataset_probe(tmp_path, "provider", model_type, handler_name, population, timeout=90)
 
 
