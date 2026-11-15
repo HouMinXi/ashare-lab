@@ -89,3 +89,22 @@ def test_a_date_past_the_packaged_calendar_is_refused():
         is_trading_day(beyond)
     with pytest.raises(RuntimeError, match="calendar data needs updating"):
         latest_trading_day(beyond)
+
+
+def test_every_entry_point_reports_a_calendar_that_ran_out_the_same_way():
+    import datetime as dt
+
+    from ashare_lab.data import calendar as cal_mod
+
+    cal = cal_mod._get_calendar()
+    last = cal.last_session.date()
+    beyond = last + dt.timedelta(days=4)
+
+    for call in (
+        lambda: cal_mod.next_trading_day(last),
+        lambda: cal_mod.previous_trading_day(beyond),
+        lambda: cal_mod.trading_days_between(last, beyond),
+        lambda: cal_mod.latest_trading_day(beyond),
+    ):
+        with pytest.raises(RuntimeError, match="calendar data needs updating"):
+            call()

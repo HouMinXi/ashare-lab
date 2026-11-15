@@ -70,7 +70,10 @@ def _live_view():
 
 class _Backbone(torch.nn.Module):
     def forward(self, data):
-        return torch.zeros(len(data), 4)
+        # Carry the last timestep of the first feature through, so a score can
+        # only match its own instrument's row.
+        level = data[:, -1, 0].unsqueeze(1)
+        return level.repeat(1, 4)
 
 
 class _Routing(torch.nn.Module):
@@ -117,9 +120,10 @@ def test_router_transport_is_used_when_configured():
     frame = predict_without_memory_write(_model(transport), view)
 
     assert seen == {"method": "router", "training": False}
-    # The stub routing layer emits two expert columns [0, 1]; the transport
-    # adds 5 to their mean, so every row scores 5.5.
-    assert float(frame["score"].iloc[0]) == pytest.approx(5.5)
+    # The backbone carries the row's own level (108 on the live session) into
+    # all four columns; the routing stub emits [level, level + 1], and the
+    # transport adds 5 to their mean.
+    assert float(frame["score"].iloc[0]) == pytest.approx(108.0 + 0.5 + 5.0)
 
 
 def test_an_unfitted_model_is_refused():
@@ -133,10 +137,11 @@ def test_an_unfitted_model_is_refused():
 
 def _multi_frame(dates, full, short):
     rows, idx = [], []
-    for inst in full:
+    for rank, inst in enumerate(full):
         for s in range(len(dates)):
             idx.append((dates[s], inst))
-            rows.append([100.0 + s, 10.0 + s, 1.0 + s])
+            # Each name carries its own level so a permuted score is visible.
+            rows.append([100.0 * (rank + 1) + s, 10.0 + s, 1.0 + s])
     for inst in short:
         for s in range(len(dates) - 2, len(dates)):
             idx.append((dates[s], inst))
@@ -180,3 +185,7 @@ def test_every_admitted_instrument_is_scored_exactly_once():
     assert view._diagnostics["insufficient_own_history"] == 1
     assert len(frame) == view._diagnostics["admitted"]
     assert set(frame.index.get_level_values("instrument")) == {"A", "B", "C"}
+    # The rows must stay paired with their instruments: A < B < C by level.
+    scores = frame["score"].droplevel("datetime").sort_index()
+    assert list(scores.index) == ["A", "B", "C"]
+    assert scores.loc["A"] < scores.loc["B"] < scores.loc["C"]

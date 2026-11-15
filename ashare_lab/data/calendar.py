@@ -90,10 +90,20 @@ def latest_trading_day(as_of: dt.date | None = None) -> dt.date:
     return prev.date()
 
 
+def _require_in_range(cal, moment: pd.Timestamp, what: str) -> None:
+    """Every entry point reports the same way once the package runs out."""
+    if moment > cal.last_session:
+        raise RuntimeError(
+            f"exchange calendar ends at {cal.last_session.date()}; {what} is "
+            "beyond it, so the calendar data needs updating"
+        )
+
+
 def trading_days_between(
     start: dt.date, end: dt.date
 ) -> list[dt.date]:
     cal = _get_calendar()
+    _require_in_range(cal, pd.Timestamp(end), f"{end}")
     sessions = cal.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))
     return [s.date() for s in sessions]
 
@@ -101,6 +111,14 @@ def trading_days_between(
 def next_trading_day(date: dt.date) -> dt.date:
     cal = _get_calendar()
     ts = pd.Timestamp(date)
+    _require_in_range(cal, ts, f"{date}")
+    if ts >= cal.last_session:
+        # The input is inside the package; the answer is not. Say so the way
+        # every other entry point does instead of leaking the library's error.
+        raise RuntimeError(
+            f"exchange calendar ends at {cal.last_session.date()}; there is no "
+            f"session after {date}, so the calendar data needs updating"
+        )
     if cal.is_session(ts):
         return cal.session_offset(ts, 1).date()
     nxt = cal.next_open(ts).normalize()
@@ -110,6 +128,7 @@ def next_trading_day(date: dt.date) -> dt.date:
 def previous_trading_day(date: dt.date) -> dt.date:
     cal = _get_calendar()
     ts = pd.Timestamp(date)
+    _require_in_range(cal, ts, f"{date}")
     if cal.is_session(ts):
         return cal.session_offset(ts, -1).date()
     prev = cal.previous_close(ts).normalize()
