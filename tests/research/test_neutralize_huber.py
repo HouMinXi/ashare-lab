@@ -22,15 +22,28 @@ import pytest
 from scipy.stats import spearmanr
 
 # Stub qlib.data module so deferred imports resolve without a real qlib installation.
-if "qlib" not in sys.modules:
-    _qlib = types.ModuleType("qlib")
-    _qlib_data = types.ModuleType("qlib.data")
-    _qlib_data.D = MagicMock()
-    _qlib.data = _qlib_data
-    sys.modules["qlib"] = _qlib
-    sys.modules["qlib.data"] = _qlib_data
+@pytest.fixture(autouse=True, scope="module")
+def _qlib_stub():
+    """Stub qlib only while this module's tests run.
 
-from ashare_lab.research.neutralize import (
+    A stub installed at import time outlives the module and breaks collection
+    of every later module that imports the real package.
+    """
+    added = []
+    if "qlib" not in sys.modules:
+        _qlib = types.ModuleType("qlib")
+        _qlib_data = types.ModuleType("qlib.data")
+        _qlib_data.D = MagicMock()
+        _qlib.data = _qlib_data
+        sys.modules["qlib"] = _qlib
+        sys.modules["qlib.data"] = _qlib_data
+        added = ["qlib", "qlib.data"]
+    yield
+    for name in added:
+        sys.modules.pop(name, None)
+
+
+from ashare_lab.research.neutralize import (  # noqa: E402
     huber_m_estimator,
     neutralize_predictions,
 )

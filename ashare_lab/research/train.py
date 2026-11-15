@@ -54,6 +54,34 @@ ALPHA158_WARMUP_START = "2017-01-01"
 CHECKPOINT_SUFFIXES = {"lgbm": ".pkl", "densemble": ".pkl", "alstm": ".pt", "tra": ".pt"}
 
 
+def amp_assignment_cast(dataset):
+    """Cast a batch to fp32 before the memory write, on the class.
+
+    bf16 tensors have no NumPy dtype, so ``assign_data`` has to convert them
+    first. The conversion lives on the class because every prepared view
+    copies the root's ``__dict__``; an instance-level patch travels to the
+    view but keeps calling the root. The stock dataset tolerates that today,
+    and the admitted dataset refuses it, so the cast is installed where a
+    view cannot lose it.
+    """
+    import torch
+
+    base = dataset.__class__
+    if getattr(base, "_amp_assignment", False):
+        return dataset
+
+    class _AmpDataset(base):
+        _amp_assignment = True
+
+        def assign_data(self, index, vals):
+            if isinstance(vals, torch.Tensor):
+                vals = vals.float()
+            return super().assign_data(index, vals)
+
+    dataset.__class__ = _AmpDataset
+    return dataset
+
+
 def apply_price_filter(
     pred,
     test_start: str,
@@ -466,16 +494,7 @@ def train_window(
         if cfg_model.get("use_amp", False):
             import torch as _torch
 
-            # bf16 tensor .numpy() crashes -- no numpy bf16 dtype.
-            # Cast to fp32 before the original assign_data writes back.
-            _orig_assign = dataset.assign_data
-
-            def _safe_assign(index, vals):
-                if isinstance(vals, _torch.Tensor):
-                    vals = vals.float()
-                return _orig_assign(index, vals)
-
-            dataset.assign_data = _safe_assign
+            amp_assignment_cast(dataset)
 
             _original_fit_tra = model.fit
 

@@ -23,13 +23,26 @@ import pytest
 # Qlib stub
 # ---------------------------------------------------------------------------
 
-if "qlib" not in sys.modules:
-    _qlib = types.ModuleType("qlib")
-    _qlib_data = types.ModuleType("qlib.data")
-    _qlib_data.D = MagicMock()
-    _qlib.data = _qlib_data
-    sys.modules["qlib"] = _qlib
-    sys.modules["qlib.data"] = _qlib_data
+@pytest.fixture(autouse=True, scope="module")
+def _qlib_stub():
+    """Stub qlib only while this module runs.
+
+    A module-level stub outlives the tests that need it and breaks every later
+    module that imports the real package, so it is installed here and removed
+    on the way out.
+    """
+    added = []
+    if "qlib" not in sys.modules:
+        _qlib = types.ModuleType("qlib")
+        _qlib_data = types.ModuleType("qlib.data")
+        _qlib_data.D = MagicMock()
+        _qlib.data = _qlib_data
+        sys.modules["qlib"] = _qlib
+        sys.modules["qlib.data"] = _qlib_data
+        added = ["qlib", "qlib.data"]
+    yield
+    for name in added:
+        sys.modules.pop(name, None)
 
 
 # ---------------------------------------------------------------------------

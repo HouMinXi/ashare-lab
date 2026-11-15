@@ -26,22 +26,44 @@ import pytest
 # sys.modules stubs for torch / qlib (installed before each test)
 # ---------------------------------------------------------------------------
 
+def _fake_handler():
+    """A handler stub with real principal tables and a label column."""
+    handler = MagicMock()
+    dates = pd.to_datetime(["2021-11-29", "2021-11-30", "2021-12-01"])
+    index = pd.MultiIndex.from_product(
+        [dates, ["SH600000", "SH600001", "SH600002"]],
+        names=["datetime", "instrument"],
+    )
+    handler._learn = pd.DataFrame(
+        {
+            ("feature", "f0"): np.arange(len(index), dtype=float),
+            ("label", "LABEL0"): np.arange(len(index), dtype=float),
+        },
+        index=index,
+    )
+    handler.setup_data = MagicMock()
+    return handler
+
+
 def _install_fake_modules():
     """Populate sys.modules with stubs so deferred imports never hit torch.
 
     Returns a cleanup function that removes the injected modules.
     """
+    # Each name is replaced by a fresh stub and the previous entry is put back
+    # on cleanup. Reusing whatever is already in sys.modules would let this
+    # module overwrite a real torch's Tensor/load for every later test.
     injected = []
 
     def _ensure(name, attrs=None):
-        if name not in sys.modules:
-            mod = ModuleType(name)
-            if attrs:
-                for k, v in attrs.items():
-                    setattr(mod, k, v)
-            sys.modules[name] = mod
-            injected.append(name)
-        return sys.modules[name]
+        previous = sys.modules.get(name)
+        mod = ModuleType(name)
+        if attrs:
+            for k, v in attrs.items():
+                setattr(mod, k, v)
+        sys.modules[name] = mod
+        injected.append((name, previous))
+        return mod
 
     # torch
     torch_mod = _ensure("torch")
@@ -59,17 +81,50 @@ def _install_fake_modules():
     _ensure("qlib.contrib")
     _ensure("qlib.contrib.data")
     qlib_handler = _ensure("qlib.contrib.data.handler")
-    qlib_handler.Alpha158 = MagicMock()
+    qlib_handler.Alpha158 = MagicMock(side_effect=lambda **kw: _fake_handler())
+
+    # The adapter reads the retained master rows off the handler and needs a
+    # calendar and the raw labels, so it is stubbed whole rather than having
+    # its qlib imports resolve through the fakes above.
+    seq = _ensure("ashare_lab.research.sequence_dataset")
+
+    class _Admission:
+        def __init__(self, *, start, end, purpose, outcome_cutoff):
+            self.start = start
+            self.end = end
+            self.purpose = purpose
+            self.outcome_cutoff = outcome_cutoff
+
+    seq.SegmentAdmission = _Admission
+    seq.ContainedMTSDatasetH = MagicMock()
+    _view = MagicMock()
+    _view._diagnostics = {
+        "input_in_range": 3,
+        "insufficient_own_history": 0,
+        "calendar_gap": 0,
+        "admitted": 3,
+    }
+    seq.ContainedMTSDatasetH.return_value.prepare.return_value = _view
 
     qlib_dataset = _ensure("qlib.contrib.data.dataset")
     qlib_dataset.MTSDatasetH = MagicMock()
+
+    # The live predictor asks the provider for its session calendar.
+    qlib_data = _ensure("qlib.data")
+    qlib_data.D = MagicMock()
+    qlib_data.D.calendar.return_value = pd.DatetimeIndex(
+        ["2021-11-29", "2021-11-30", "2021-12-01"]
+    )
 
     # qlib.init
     sys.modules["qlib"].init = MagicMock()
 
     def cleanup():
-        for name in reversed(injected):
-            sys.modules.pop(name, None)
+        for name, previous in reversed(injected):
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
     return cleanup
 
@@ -129,13 +184,10 @@ def _stub_model(pred_df):
     """Return a mock model whose .predict() returns pred_df."""
     model = MagicMock()
     model.predict.return_value = pred_df
-    # Deliberately do NOT set _writer so the shim test can verify it.
-    if hasattr(model, "_writer"):
-        del model._writer
     return model
 
 
-def _apply_patches(monkeypatch, tmp_path, windows=None, pred_df=None):
+def _apply_patches(monkeypatch, tmp_path, windows=None, pred_df=None, diagnostics=None):
     """Wire up all patches for predict_for_date.
 
     Patches ashare_lab.config constants and stubs get_all_windows,
@@ -194,6 +246,22 @@ def _apply_patches(monkeypatch, tmp_path, windows=None, pred_df=None):
         tmp_path / "qlib_data",
     )
 
+    # The no-write inference entry is exercised in its own test; here the
+    # model stub answers for it so the pipeline wiring stays under test.
+    if diagnostics is not None:
+        # Read the stub out of sys.modules: if the real module was imported
+        # earlier in the session, the package attribute still points at it.
+        _dataset_module = sys.modules["ashare_lab.research.sequence_dataset"]
+        _dataset_module.ContainedMTSDatasetH.return_value.prepare.return_value._diagnostics = diagnostics
+
+    import ashare_lab.research.predict as _predict_module
+
+    monkeypatch.setattr(
+        _predict_module,
+        "predict_without_memory_write",
+        lambda model, data_set: model.predict(data_set, segment="test"),
+    )
+
     # Wire torch.load to return our stub model (via sys.modules stub).
     sys.modules["torch"].load = MagicMock(
         side_effect=lambda path, **kw: model
@@ -218,6 +286,9 @@ def _apply_patches(monkeypatch, tmp_path, windows=None, pred_df=None):
 @pytest.fixture(autouse=True)
 def _fake_heavy_modules():
     """Install fake torch/qlib modules for all tests in this module."""
+    # Drop any module cached by an earlier test so the patch applied inside
+    # _apply_patches lands on the object this test goes on to import.
+    sys.modules.pop("ashare_lab.research.predict", None)
     cleanup = _install_fake_modules()
     yield
     cleanup()
@@ -265,18 +336,6 @@ class TestPredictForDate:
 
         # Only rows for trade_date, not the extra prior day.
         assert len(df) == len(instruments)
-
-    def test_writer_shim_applied(self, monkeypatch, tmp_path):
-        """model._writer must be set to None unconditionally."""
-        trade_date = "2021-12-01"
-        pred_df = _make_pred_df(trade_date)
-        model, _ = _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
-
-        from ashare_lab.research.predict import predict_for_date
-
-        predict_for_date(trade_date)
-
-        assert model._writer is None
 
     def test_blend_tra_ntra_called_with_correct_args(
         self, monkeypatch, tmp_path
@@ -445,7 +504,9 @@ class TestMissingDate:
 
         from ashare_lab.research.predict import predict_for_date
 
-        with pytest.raises(ValueError, match="no predictions"):
+        # The count check runs before the blend, so a day with no rows at all
+        # is refused as an admission mismatch instead of reaching the blend.
+        with pytest.raises(ValueError, match="scored 0 rows for"):
             predict_for_date(trade_date)
 
 
@@ -484,7 +545,11 @@ class TestNonFiniteDrop:
             {"score": scores, "label": np.zeros(4)}, index=idx
         )
 
-        _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+        _apply_patches(
+            monkeypatch, tmp_path, pred_df=pred_df,
+            diagnostics={"input_in_range": 2, "insufficient_own_history": 0,
+                         "calendar_gap": 0, "admitted": 2},
+        )
 
         from ashare_lab.research.predict import predict_for_date
 
@@ -781,3 +846,143 @@ def test_gate_callsite_uses_meta_json(monkeypatch, tmp_path):
     # present, train_date otherwise -- so both readings start with "meta.json".
     assert sidecar["model_age_source"].startswith("meta.json")
     assert sidecar["model_train_date"] == fresh
+
+
+def test_excluded_instruments_are_warned_about_and_recorded(monkeypatch, tmp_path, caplog):
+    trade_date = "2021-12-01"
+    # A live view covers one session, so the stub prediction does too.
+    pred_df = _make_pred_df(trade_date)
+    pred_df = pred_df.loc[pred_df.index.get_level_values(0) == pd.Timestamp(trade_date)]
+    _apply_patches(
+        monkeypatch,
+        tmp_path,
+        pred_df=pred_df,
+        diagnostics={
+            "input_in_range": 5,
+            "insufficient_own_history": 1,
+            "calendar_gap": 1,
+            "admitted": 3,
+        },
+    )
+
+    from ashare_lab.research.predict import predict_for_date
+
+    with caplog.at_level("WARNING"):
+        out = predict_for_date(trade_date)
+
+    assert "2 of 5 instruments not admitted" in caplog.text
+    sidecar = json.loads(out.with_suffix(".meta.json").read_text())
+    assert sidecar["admission"]["input_in_range"] == 5
+    assert sidecar["admission"]["admitted"] == 3
+    # Three admitted, three rows scored: nothing is lost in the funnel.
+    assert sidecar["funnel"] == {
+        "admitted": 3,
+        "scored": 3,
+        "after_blend": 3,
+        "after_finite_filter": 3,
+    }
+    assert sidecar["admission_rule"]["purpose"] == "live"
+
+
+def test_rows_outside_the_provider_calendar_are_refused(monkeypatch, tmp_path):
+    trade_date = "2021-12-01"
+    pred_df = _make_pred_df(trade_date)
+    _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+    from ashare_lab.research.predict import predict_for_date
+
+    sys.modules["qlib.data"].D.calendar.return_value = pd.DatetimeIndex(
+        ["2021-11-29", "2021-11-30"]
+    )
+
+    with pytest.raises(RuntimeError, match="outside the provider calendar"):
+        predict_for_date(trade_date)
+
+
+def _apply_dropping_blend(monkeypatch, tmp_path, drop_in_blend=0, nan_scores=0):
+    """Patch the blend to drop rows, so the funnel has something to count."""
+    trade_date = "2021-12-01"
+    pred_df = _make_pred_df(trade_date)
+    pred_df = pred_df.loc[pred_df.index.get_level_values(0) == pd.Timestamp(trade_date)]
+    _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+    def dropping_blend(pred, window, **kwargs):
+        kept = pred.iloc[: len(pred) - drop_in_blend] if drop_in_blend else pred.copy()
+        kept = kept.astype(float).copy()
+        if nan_scores:
+            kept.iloc[:nan_scores] = np.nan
+        kept.name = "score"
+        return kept
+
+    monkeypatch.setattr("ashare_lab.research.blend.blend_tra_ntra", dropping_blend)
+
+
+def test_a_row_lost_in_the_blend_is_counted(monkeypatch, tmp_path, caplog):
+    _apply_dropping_blend(monkeypatch, tmp_path, drop_in_blend=1)
+
+    from ashare_lab.research.predict import predict_for_date
+
+    with caplog.at_level("WARNING"):
+        out = predict_for_date("2021-12-01")
+
+    funnel = json.loads(out.with_suffix(".meta.json").read_text())["funnel"]
+    assert funnel["scored"] == 3
+    assert funnel["after_blend"] == 2
+    assert funnel["after_finite_filter"] == 2
+    assert "rows lost inside the funnel" in caplog.text
+
+
+def test_a_non_finite_score_is_counted_separately(monkeypatch, tmp_path, caplog):
+    _apply_dropping_blend(monkeypatch, tmp_path, nan_scores=1)
+
+    from ashare_lab.research.predict import predict_for_date
+
+    with caplog.at_level("WARNING"):
+        out = predict_for_date("2021-12-01")
+
+    funnel = json.loads(out.with_suffix(".meta.json").read_text())["funnel"]
+    assert funnel["scored"] == 3
+    assert funnel["after_blend"] == 3
+    assert funnel["after_finite_filter"] == 2
+    assert "rows lost inside the funnel" in caplog.text
+
+
+def test_the_live_path_goes_through_the_no_write_entry(monkeypatch, tmp_path):
+    trade_date = "2021-12-01"
+    pred_df = _make_pred_df(trade_date)
+    pred_df = pred_df.loc[pred_df.index.get_level_values(0) == pd.Timestamp(trade_date)]
+    model, _ = _apply_patches(monkeypatch, tmp_path, pred_df=pred_df)
+
+    import ashare_lab.research.predict as predict_module
+
+    calls = []
+
+    def spy(m, data_set):
+        calls.append(1)
+        return m.predict(data_set, segment="test")
+
+    monkeypatch.setattr(predict_module, "predict_without_memory_write", spy)
+
+    from ashare_lab.research.predict import predict_for_date
+
+    predict_for_date(trade_date)
+
+    # The live view refuses writes, so the stock entry cannot be used: the
+    # no-write entry must be the one that runs.
+    assert calls == [1]
+
+
+def test_a_score_count_that_differs_from_admission_is_refused(monkeypatch, tmp_path):
+    trade_date = "2021-12-01"
+    pred_df = _make_pred_df(trade_date)
+    pred_df = pred_df.loc[pred_df.index.get_level_values(0) == pd.Timestamp(trade_date)].iloc[:3]
+    _apply_patches(
+        monkeypatch, tmp_path, pred_df=pred_df,
+        diagnostics={"input_in_range": 10, "insufficient_own_history": 0,
+                     "calendar_gap": 0, "admitted": 10},
+    )
+
+    from ashare_lab.research.predict import predict_for_date
+
+    with pytest.raises(ValueError, match="scored 3 rows for 10 admitted"):
+        predict_for_date(trade_date)

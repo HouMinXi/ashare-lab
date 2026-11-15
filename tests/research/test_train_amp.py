@@ -81,36 +81,69 @@ class TestAmpBfloat16NotFloat16:
 
 
 class TestAssignDataFp32Cast:
-    """bf16 tensor passed to assign_data is cast to fp32 before original."""
+    """The cast is installed on the class, so prepared views inherit it."""
 
     def test_assign_data_fp32_cast(self):
         torch = pytest.importorskip("torch", reason="torch not installed on this host")
+        from ashare_lab.research.train import amp_assignment_cast
 
-        original_assign = MagicMock()
-        dataset = MagicMock()
-        dataset.assign_data = original_assign
+        class _Dataset:
+            def __init__(self):
+                self.calls = []
 
-        cfg_model = {"use_amp": True}
+            def __copy__(self):
+                clone = self.__class__.__new__(self.__class__)
+                clone.__dict__ = self.__dict__.copy()
+                return clone
 
-        if cfg_model.get("use_amp", False):
-            _orig_assign = dataset.assign_data
+            def assign_data(self, index, vals):
+                self.calls.append((index, vals))
 
-            def _safe_assign(index, vals):
-                if isinstance(vals, torch.Tensor):
-                    vals = vals.float()
-                return _orig_assign(index, vals)
+        root = _Dataset()
+        amp_assignment_cast(root)
 
-            dataset.assign_data = _safe_assign
+        # A view prepared after the swap carries the cast; this is the path
+        # training takes, where every view is created inside fit().
+        view = root.__copy__()
+        view.assign_data([7], torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16))
 
-        # Pass a bf16 tensor
-        bf16_tensor = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
-        dataset.assign_data("idx", bf16_tensor)
+        assert view.calls[0][0] == [7]
+        assert view.calls[0][1].dtype == torch.float32
 
-        # Original should have received fp32
-        args = original_assign.call_args
-        assert args[0][0] == "idx"
-        received_tensor = args[0][1]
-        assert received_tensor.dtype == torch.float32
+    def test_an_instance_patch_stays_bound_to_the_root(self):
+        torch = pytest.importorskip("torch", reason="torch not installed on this host")
+
+        class _Dataset:
+            def __init__(self):
+                self.calls = []
+                self.writer = None
+
+            def __copy__(self):
+                clone = self.__class__.__new__(self.__class__)
+                clone.__dict__ = self.__dict__.copy()
+                return clone
+
+            def assign_data(self, index, vals):
+                if self.writer is not None:
+                    raise ValueError("a root is a preparation container")
+                self.calls.append((index, vals))
+
+        dataset = _Dataset()
+        dataset.writer = object()
+        original = dataset.assign_data
+
+        def _instance_patch(index, vals):
+            return original(index, vals)
+
+        dataset.assign_data = _instance_patch
+        view = dataset.__copy__()
+
+        # A view copies the instance attribute, but the patch still closes
+        # over the root, so the write is refused instead of reaching the
+        # shared memory. This is the failure the class-level cast avoids.
+        with pytest.raises(ValueError, match="preparation container"):
+            view.assign_data([7], torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16))
+        assert view.calls == []
 
 
 class TestAssignDataPatchOnlyForTra:

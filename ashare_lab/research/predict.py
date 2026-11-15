@@ -454,6 +454,58 @@ def _resolve_model_path(
     return model_path, window
 
 
+def predict_without_memory_write(model, data_set):
+    """Run TRA inference over a prepared view without the loss-memory store.
+
+    Stock ``TRAModel.predict`` calls ``test_epoch``, which stores each batch's
+    loss into the dataset before returning the rows. A live view refuses every
+    write by contract. The store is only read by later endpoints, and a live
+    view covers one session that evaluates as a single batch, so the same
+    forward pass returns the same rows with no write at all. The row assembly
+    below mirrors ``test_epoch`` including its index restoration.
+    """
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    if not model.fitted:
+        raise ValueError("model is not fitted yet!")
+    model.model.eval()
+    model.tra.eval()
+    data_set.eval()
+
+    frames = []
+    for batch in data_set:
+        data, state = batch["data"], batch["state"]
+        label, count = batch["label"], batch["daily_count"]
+        with torch.no_grad():
+            hidden = model.model(data)
+            all_preds, choice, prob = model.tra(hidden, state)
+        if model.transport_method != "none":
+            _loss, pred, _store, _weights = model.transport_fn(
+                all_preds,
+                label,
+                choice,
+                prob,
+                state.mean(dim=1),
+                count,
+                model.transport_method,
+                model.alpha,
+                training=False,
+            )
+        else:
+            pred = all_preds.mean(dim=1)
+        values = np.c_[pred.cpu().numpy(), label.cpu().numpy(), all_preds.cpu().numpy()]
+        columns = ["score", "label"] + [f"score_{d}" for d in range(all_preds.shape[1])]
+        frames.append(pd.DataFrame(values, index=batch["index"], columns=columns))
+
+    preds = pd.concat(frames, axis=0)
+    preds.index = data_set.restore_index(preds.index)
+    preds.index = preds.index.swaplevel()
+    preds.sort_index(inplace=True)
+    return preds
+
+
 def predict_for_date(
     trade_date: str,
     model_path: Path | None = None,
@@ -492,8 +544,12 @@ def predict_for_date(
     import qlib
     from qlib.config import C as _QlibC
     from qlib.config import REG_CN
+    from qlib.data import D
     from qlib.contrib.data.handler import Alpha158
-    from qlib.contrib.data.dataset import MTSDatasetH
+    from ashare_lab.research.sequence_dataset import (
+        ContainedMTSDatasetH,
+        SegmentAdmission,
+    )
 
     from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI
@@ -583,33 +639,102 @@ def predict_for_date(
         learn_processors=learn_processors,
     )
 
-    # -- 4. MTSDatasetH (single-day test segment) -------------------------
-    dataset = MTSDatasetH(
+    # -- 4. ContainedMTSDatasetH (one live session) -----------------------
+    # Alpha158 materialises its tables in its constructor; the adapter needs
+    # them to admit endpoints.
+    learned = handler._learn
+    if learned is None:
+        raise RuntimeError("Alpha158 did not materialise its learn table")
+    # The admission calendar is the provider's session calendar, not the union
+    # of dates that happen to carry rows: a hole that removes a session for
+    # every instrument must read as a calendar gap, not as two consecutive
+    # sessions.
+    observed = pd.DatetimeIndex(learned.index.get_level_values("datetime"))
+    calendar = pd.DatetimeIndex(
+        D.calendar(start_time=observed.min(), end_time=observed.max(), freq="day")
+    )
+    stray = observed.unique().difference(calendar)
+    if len(stray):
+        raise RuntimeError(
+            "handler rows fall outside the provider calendar "
+            f"(first few: {[str(d.date()) for d in stray[:5]]}); the calendar is stale "
+            "relative to the data"
+        )
+    # The trade date's forward return does not exist yet. A NaN label is
+    # fine for a live admission, which never waits for label maturity.
+    # The adapter's parameter is called raw_labels and it only reads
+    # finiteness off these values, but what the handler carries here is the
+    # processed label column.
+    label_column = next(c for c in learned.columns if c[0] == "label")
+    processed_labels = learned[label_column].swaplevel().sort_index()
+    live_day = pd.Timestamp(trade_date)
+    dataset = ContainedMTSDatasetH(
         handler=handler,
-        segments={"test": (trade_date, trade_date)},
+        segments={
+            "test": SegmentAdmission(
+                start=live_day,
+                end=live_day,
+                purpose="live",
+                outcome_cutoff=live_day,
+            )
+        },
+        calendar=calendar,
+        raw_labels=processed_labels,
         seq_len=step_len,
         num_states=num_states,
-        memory_mode="sample",
         batch_size=-1,
         shuffle=True,
     )
 
-    # -- 5. Load model + writer shim --------------------------------------
+    # -- 5. Load model -----------------------------------------------------
     model = torch.load(str(model_path), weights_only=False)
-    # qlib drops the TensorBoard SummaryWriter when pickling TRAModel;
-    # test_epoch references self._writer and the epoch>=0 guard is never
-    # reached because predict calls test_epoch(-1). Set unconditionally
-    # so inference never crashes on a missing or broken writer.
-    model._writer = None
-
     # -- 6. Predict --------------------------------------------------------
-    pred_df = model.predict(dataset, segment="test")
+    # ``model.predict`` stores each batch's loss in dataset memory, and a live
+    # view refuses writes by design; this entry returns the same rows without
+    # the store.
+    try:
+        live_view = dataset.prepare("test")
+    except ValueError as exc:
+        if "admits no endpoint" in str(exc):
+            raise ValueError(
+                f"{exc}: no endpoint on {trade_date} passes the admission rule "
+                f"(seq_len={step_len}); one missing session breaks every window "
+                "that spans it, so check the provider data for a hole"
+            ) from exc
+        raise
+    admission = dict(live_view._diagnostics)
+    excluded = admission["input_in_range"] - admission["admitted"]
+    if excluded:
+        log.warning(
+            "predict %s: %d of %d instruments not admitted "
+            "(%d without enough own history, %d across a calendar gap)",
+            trade_date,
+            excluded,
+            admission["input_in_range"],
+            admission["insufficient_own_history"],
+            admission["calendar_gap"],
+        )
+    pred_df = predict_without_memory_write(model, live_view)
     pred = pred_df["score"]
+    # Count the live session only: the adapter answers for one day, but a
+    # model that returns more would otherwise inflate the funnel.
+    scored_rows = int(
+        (pred.index.get_level_values(0) == pd.Timestamp(trade_date)).sum()
+    )
+    if scored_rows != admission["admitted"]:
+        # The adapter admits a set and returns one row per member. A different
+        # count is an assembly defect; refuse before the blend spends the day
+        # fetching factors for a cross-section nobody admitted.
+        raise ValueError(
+            f"scored {scored_rows} rows for {admission['admitted']} admitted "
+            f"instruments on {trade_date}"
+        )
 
     # -- 7. Blend (reuse, locked 0.60/0.40) --------------------------------
     # Let any blend exception PROPAGATE: the file contract says score IS the
     # locked blend, so writing raw TRA scores would violate it. No fallback.
     blended = blend_tra_ntra(pred, window)
+    blended_rows = int(len(blended[blended.index.get_level_values(0) == pd.Timestamp(trade_date)]))
 
     # -- 8. Extract trade_date rows, drop non-finite -----------------------
     ts = pd.Timestamp(trade_date)
@@ -620,7 +745,23 @@ def predict_for_date(
         )
 
     day = blended.loc[ts]
+    finite_rows = int(np.isfinite(day.to_numpy(dtype=float)).sum())
     day = day[np.isfinite(day.to_numpy(dtype=float))]
+    funnel = {
+        "admitted": admission["admitted"],
+        "scored": scored_rows,
+        "after_blend": blended_rows,
+        "after_finite_filter": finite_rows,
+    }
+    if blended_rows != scored_rows or finite_rows != blended_rows:
+        # Blend and the finite filter legitimately drop instruments, but the
+        # written file is then narrower than the admitted universe.
+        log.warning(
+            "predict %s: rows lost inside the funnel %s; the written file is "
+            "narrower than the admitted universe",
+            trade_date,
+            funnel,
+        )
 
     if day.empty:
         raise ValueError(
@@ -718,6 +859,15 @@ def predict_for_date(
         "window_id": window_id,
         "produced_at": datetime.now(timezone.utc).isoformat(),
         "n_instruments": len(df),
+        "admission": admission,
+        "funnel": funnel,
+        "admission_rule": {
+            "purpose": "live",
+            "seq_len": step_len,
+            "calendar_start": str(calendar[0].date()),
+            "calendar_end": str(calendar[-1].date()),
+            "label_rule": "not consulted for a live admission",
+        },
         "model_age_days": round(model_age_days, 1),
         "model_age_source": age_source,
         "ic": ic_value,

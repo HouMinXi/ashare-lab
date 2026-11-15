@@ -14,17 +14,30 @@ import numpy as np
 import pandas as pd
 import pytest
 
-# Ensure qlib.data.D is mockable even when qlib is not installed.
-# Create a stub qlib.data module so deferred imports resolve to our mock.
-if "qlib" not in sys.modules:
-    _qlib = types.ModuleType("qlib")
-    _qlib_data = types.ModuleType("qlib.data")
-    _qlib_data.D = MagicMock()
-    _qlib.data = _qlib_data
-    sys.modules["qlib"] = _qlib
-    sys.modules["qlib.data"] = _qlib_data
+# qlib is imported inside the functions under test, so the stub only has to
+# exist while the tests in this module run.
+@pytest.fixture(autouse=True, scope="module")
+def _qlib_stub():
+    """Stub qlib only while this module's tests run.
 
-from ashare_lab.research.regime import (
+    A stub installed at import time outlives the module and breaks collection
+    of every later module that imports the real package.
+    """
+    added = []
+    if "qlib" not in sys.modules:
+        _qlib = types.ModuleType("qlib")
+        _qlib_data = types.ModuleType("qlib.data")
+        _qlib_data.D = MagicMock()
+        _qlib.data = _qlib_data
+        sys.modules["qlib"] = _qlib
+        sys.modules["qlib.data"] = _qlib_data
+        added = ["qlib", "qlib.data"]
+    yield
+    for name in added:
+        sys.modules.pop(name, None)
+
+
+from ashare_lab.research.regime import (  # noqa: E402
     apply_regime_filter,
     calibrate_thresholds,
     compute_regime_signals,

@@ -14,12 +14,20 @@ import pickle
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
-from qlib.contrib.data.dataset import MTSDatasetH
-from qlib.data.dataset.handler import DataHandler, DataHandlerLP
+torch = pytest.importorskip("torch", reason="torch not installed on this host")
+handler_module = pytest.importorskip(
+    "qlib.data.dataset.handler", reason="qlib not installed on this host"
+)
+DataHandler = handler_module.DataHandler
+DataHandlerLP = handler_module.DataHandlerLP
+pytest.importorskip("qlib.contrib.data.dataset", reason="qlib not installed on this host")
+from qlib.contrib.data.dataset import MTSDatasetH  # noqa: E402
 
-from ashare_lab.research.sequence_dataset import ContainedMTSDatasetH, SegmentAdmission
+from ashare_lab.research.sequence_dataset import (  # noqa: E402
+    ContainedMTSDatasetH,
+    SegmentAdmission,
+)
 
 DATES = pd.bdate_range("2020-03-02", periods=9)
 LABEL = ("label", "LABEL0")
@@ -1167,3 +1175,27 @@ def test_successful_prepare_preserves_written_memory(setup_counter):
     child = again._prepare_seg(slice(DATES[4], DATES[5]))
     assert root._memory.tobytes() == written
     assert child._memory.tobytes() == written
+
+
+def test_a_class_level_cast_reaches_prepared_views(setup_counter):
+    from ashare_lab.research.train import amp_assignment_cast
+
+    root = build(sessions(9), {"window": admission(2, 6, cutoff=8)})
+    amp_assignment_cast(root)
+    view = root.prepare("window")
+    # bf16 has no NumPy dtype, so only the installed cast can land this write.
+    view.assign_data(np.array([4]), torch.tensor([[1.5, -2.5]], dtype=torch.bfloat16))
+    assert root._memory[4].tolist() == [1.5, -2.5]
+
+
+def test_an_instance_level_cast_leaves_views_bound_to_the_root(setup_counter):
+    root = build(sessions(9), {"window": admission(2, 6, cutoff=8)})
+    original = root.assign_data
+
+    def _safe_assign(index, vals):
+        return original(index, vals)
+
+    root.assign_data = _safe_assign
+    view = root.prepare("window")
+    with pytest.raises(ValueError, match="preparation container"):
+        view.assign_data(np.array([4]), np.ones((1, 2)))

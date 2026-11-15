@@ -20,26 +20,45 @@ import pandas as pd
 import pytest
 
 # ---------------------------------------------------------------------------
-# Qlib stub (must precede any ashare_lab import that touches qlib)
+# Qlib stub (installed for this module's tests only)
 # ---------------------------------------------------------------------------
 
-if "qlib" not in sys.modules:
-    _qlib = types.ModuleType("qlib")
-    _qlib_data = types.ModuleType("qlib.data")
-    _qlib_data.D = MagicMock()
-    _qlib.data = _qlib_data
-    sys.modules["qlib"] = _qlib
-    sys.modules["qlib.data"] = _qlib_data
+@pytest.fixture(autouse=True, scope="module")
+def _qlib_stub():
+    """Stub qlib only while this module's tests run.
 
-    _qlib_contrib = types.ModuleType("qlib.contrib")
-    _qlib_contrib_eval = types.ModuleType("qlib.contrib.evaluate")
-    _qlib_contrib_strategy = types.ModuleType("qlib.contrib.strategy")
-    _qlib_contrib_eval.backtest_daily = MagicMock()
-    _qlib_contrib_strategy.TopkDropoutStrategy = MagicMock()
-    _qlib.contrib = _qlib_contrib
-    sys.modules["qlib.contrib"] = _qlib_contrib
-    sys.modules["qlib.contrib.evaluate"] = _qlib_contrib_eval
-    sys.modules["qlib.contrib.strategy"] = _qlib_contrib_strategy
+    A stub installed at import time outlives the module and breaks collection
+    of every later module that imports the real package.
+    """
+    added = []
+    if "qlib" not in sys.modules:
+        _qlib = types.ModuleType("qlib")
+        _qlib_data = types.ModuleType("qlib.data")
+        _qlib_data.D = MagicMock()
+        _qlib.data = _qlib_data
+        _qlib_contrib = types.ModuleType("qlib.contrib")
+        _qlib_contrib_eval = types.ModuleType("qlib.contrib.evaluate")
+        _qlib_contrib_strategy = types.ModuleType("qlib.contrib.strategy")
+        _qlib_contrib_eval.backtest_daily = MagicMock()
+        _qlib_contrib_strategy.TopkDropoutStrategy = MagicMock()
+        _qlib_contrib.evaluate = _qlib_contrib_eval
+        _qlib_contrib.strategy = _qlib_contrib_strategy
+        _qlib.contrib = _qlib_contrib
+        sys.modules["qlib"] = _qlib
+        sys.modules["qlib.data"] = _qlib_data
+        sys.modules["qlib.contrib"] = _qlib_contrib
+        sys.modules["qlib.contrib.evaluate"] = _qlib_contrib_eval
+        sys.modules["qlib.contrib.strategy"] = _qlib_contrib_strategy
+        added = [
+            "qlib",
+            "qlib.data",
+            "qlib.contrib",
+            "qlib.contrib.evaluate",
+            "qlib.contrib.strategy",
+        ]
+    yield
+    for name in added:
+        sys.modules.pop(name, None)
 
 
 # ---------------------------------------------------------------------------

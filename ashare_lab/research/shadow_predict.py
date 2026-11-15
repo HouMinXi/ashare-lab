@@ -190,14 +190,15 @@ def shadow_predict_for_date(
             import torch
 
             model = torch.load(str(model_path), weights_only=False)
-            # TRA writer shim (same as predict.py)
-            if hasattr(model, "_writer"):
-                model._writer = None
         else:
             import pickle
 
             with open(model_path, "rb") as mf:
                 model = pickle.load(mf)
+
+        # qlib reads _writer before it checks the epoch, and an older or foreign
+        # checkpoint may not carry the attribute at all.
+        model._writer = None
 
         pred_raw = model.predict(dataset, segment="test")
 
