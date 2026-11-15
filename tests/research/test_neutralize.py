@@ -186,7 +186,7 @@ class TestComputeStyleFactors:
             mock_D.features.return_value = mock_df
             from ashare_lab.research.neutralize import compute_style_factors
 
-            with pytest.raises(RuntimeError, match="no value on 2024-01-15"):
+            with pytest.raises(RuntimeError, match="no value between 2024-01-15 and 2024-01-15"):
                 compute_style_factors(
                     instruments=instruments,
                     start_time="2024-01-15",
@@ -312,3 +312,35 @@ class TestNeutralizePredictions:
         assert isinstance(result, pd.Series)
         assert len(result) == 50
         assert not result.isna().any()
+
+    def test_a_dead_factor_refuses_across_a_range_too(self):
+        """A walk-forward must not silently zero-fill a factor either.
+
+        Measured before this guard: 18 of 60 sessions in one validation window
+        had an all-NaN momentum column, every one of them filled with zero.
+        """
+        dates = pd.bdate_range("2024-01-15", periods=3)
+        instruments = ["SH600000", "SH600001"]
+        idx = pd.MultiIndex.from_product(
+            [dates, instruments], names=["datetime", "instrument"]
+        )
+        mock_df = pd.DataFrame(
+            {
+                "$close": 10.0,
+                "$volume": 1e6,
+                "Std($close, 20)/Mean($close, 20)": 0.05,
+                "$close/Ref($close, 20) - 1": np.nan,
+            },
+            index=idx,
+        )
+
+        with patch("qlib.data.D") as mock_D:
+            mock_D.features.return_value = mock_df
+            from ashare_lab.research.neutralize import compute_style_factors
+
+            with pytest.raises(RuntimeError, match="momentum"):
+                compute_style_factors(
+                    instruments=instruments,
+                    start_time="2024-01-15",
+                    end_time="2024-01-17",
+                )

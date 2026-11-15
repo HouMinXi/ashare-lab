@@ -299,9 +299,14 @@ def _protect_live_ledger(monkeypatch):
 _STACK_SKIPS: list[str] = []
 
 
+_STACK_MARKERS = ("training stack", "torch", "qlib")
+
+
 def _note_stack_skip(report) -> None:
+    """Recognise a skip for want of the training stack, whoever emitted it."""
     longrepr = str(getattr(report, "longrepr", "") or "")
-    if "where the training stack is installed" in longrepr:
+    lowered = longrepr.lower()
+    if any(marker in lowered for marker in _STACK_MARKERS):
         _STACK_SKIPS.append(str(getattr(report, "nodeid", "")) or longrepr[:200])
 
 

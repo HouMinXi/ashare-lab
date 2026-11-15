@@ -553,7 +553,8 @@ def predict_for_date(
 
     from ashare_lab.config import MODELS_DIR, PREDICTIONS_DIR, load_config
     from ashare_lab.data.update import DEFAULT_PROVIDER_URI
-    from ashare_lab.research.blend import blend_tra_ntra
+    from ashare_lab.research.blend import TRA_WEIGHT, blend_tra_ntra
+    from ashare_lab.research.neutralize import STYLE_FACTOR_FIELDS
     from ashare_lab.research.smoke_test import get_all_windows
     from ashare_lab.research.train import ALPHA158_WARMUP_START
 
@@ -870,6 +871,13 @@ def predict_for_date(
         },
         "model_age_days": round(model_age_days, 1),
         "model_age_source": age_source,
+        # The score is only reproducible if the estimator is named with it:
+        # a factor definition changed once and every stored IC silently became
+        # a mixture of two different functions.
+        "estimator": {
+            "blend_tra_weight": TRA_WEIGHT,
+            "style_factors": list(STYLE_FACTOR_FIELDS),
+        },
         "ic": ic_value,
         "diversity": diversity.tier2_metrics,
     }

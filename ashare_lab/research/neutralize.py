@@ -97,6 +97,16 @@ def huber_m_estimator(
 _MIN_INSTRUMENTS = 30
 
 
+STYLE_FACTOR_FIELDS = (
+    "$close",
+    "$volume",
+    "Std($close, 20)/Mean($close, 20)",
+    # A negative Ref looks forward: Ref($close, -20) is the close twenty
+    # sessions from now, which is a future return and unavailable live.
+    "$close/Ref($close, 20) - 1",
+)
+
+
 def compute_style_factors(
     instruments: list[str],
     start_time: str,
@@ -126,14 +136,7 @@ def compute_style_factors(
     """
     from qlib.data import D
 
-    fields = [
-        "$close",
-        "$volume",
-        "Std($close, 20)/Mean($close, 20)",
-        # A negative Ref looks forward: Ref($close, -20) is the close twenty
-        # sessions from now, which is a future return and unavailable live.
-        "$close/Ref($close, 20) - 1",
-    ]
+    fields = list(STYLE_FACTOR_FIELDS)
 
     raw = D.features(
         instruments=instruments,
@@ -169,17 +172,16 @@ def compute_style_factors(
         index=raw.index,
     )
 
-    # A single-date call is the live path: a factor with no value anywhere in
-    # the cross-section cannot be estimated, and zero-filling it below would
-    # quietly neutralize against a different set of factors than the one the
-    # blend was validated on.
-    if pd.Timestamp(start_time) == pd.Timestamp(end_time):
-        dead = [name for name in factors.columns if factors[name].isna().all()]
-        if dead:
-            raise RuntimeError(
-                f"style factors {dead} have no value on {end_time}; the "
-                "provider has too little history to neutralize this day"
-            )
+    # A factor with no value at all cannot be estimated, and zero-filling it
+    # below would quietly neutralize against a different set of factors than
+    # the one the blend was validated on — live, where the day has no future
+    # data, and in a walk-forward, where 18 of 60 sessions once went that way.
+    dead = [name for name in factors.columns if factors[name].isna().all()]
+    if dead:
+        raise RuntimeError(
+            f"style factors {dead} have no value between {start_time} and "
+            f"{end_time}; the provider has too little history to neutralize"
+        )
 
     # Cross-sectional z-score normalization per date.
     grouped = factors.groupby(level="datetime")

@@ -25,12 +25,15 @@ from ashare_lab.research.neutralize import (
 
 log = logging.getLogger(__name__)
 
+# The Phase 2.1 lock: 60 percent raw TRA, 40 percent neutralized TRA.
+TRA_WEIGHT = 0.60
+
 
 def blend_tra_ntra(
     pred: pd.Series,
     window: dict,
     *,
-    tra_weight: float = 0.60,
+    tra_weight: float = TRA_WEIGHT,
 ) -> pd.Series:
     """Blend raw TRA predictions with style-neutralized predictions.
 

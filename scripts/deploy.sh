@@ -91,7 +91,8 @@ sort -u -o ~/.ssh/known_hosts ~/.ssh/known_hosts
 if ssh -o ConnectTimeout=5 -o BatchMode=yes "${GPU_USER}@${GPU_HOST}" "echo ok" >/dev/null 2>&1; then
     echo "  GPU SSH reachable"
 else
-    echo "  GPU SSH not reachable (non-fatal -- may be powered off)"
+    echo "  GPU SSH not reachable -- host setup continues, but the code" \
+         "deploy below will be recorded as failed"
 fi
 
 # ---- Section 7: SCP predict.py + deps to GPU (staging dir, no remote mkdir -p) ----
