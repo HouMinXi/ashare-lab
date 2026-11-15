@@ -294,3 +294,44 @@ def _protect_live_ledger(monkeypatch):
         return real_unlink(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "unlink", guarded_unlink)
+
+
+_STACK_SKIPS: list[str] = []
+
+
+def _note_stack_skip(report) -> None:
+    longrepr = str(getattr(report, "longrepr", "") or "")
+    if "where the training stack is installed" in longrepr:
+        _STACK_SKIPS.append(str(getattr(report, "nodeid", "")) or longrepr[:200])
+
+
+def pytest_runtest_logreport(report):
+    if report.skipped:
+        _note_stack_skip(report)
+
+
+def pytest_collectreport(report):
+    if report.skipped:
+        _note_stack_skip(report)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A skipped training check is invisible unless someone asks for it.
+
+    With ASHARE_REQUIRE_STACK=1 the run is claiming to have exercised the
+    training path, so any such skip turns the session red.
+    """
+    import os
+
+    if os.environ.get("ASHARE_REQUIRE_STACK", "").strip().lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        return
+    if not _STACK_SKIPS:
+        return
+    print(
+        "\nASHARE_REQUIRE_STACK is set but these checks were skipped:",
+        *sorted(set(_STACK_SKIPS)),
+        sep="\n  ",
+    )
+    session.exitstatus = 1

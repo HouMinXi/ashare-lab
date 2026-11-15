@@ -18,12 +18,10 @@ import pytest
 from tests.stack import require
 
 torch = require("torch")
-handler_module = pytest.importorskip(
-    "qlib.data.dataset.handler", reason="qlib not installed on this host"
-)
+handler_module = require("qlib.data.dataset.handler")
 DataHandler = handler_module.DataHandler
 DataHandlerLP = handler_module.DataHandlerLP
-pytest.importorskip("qlib.contrib.data.dataset", reason="qlib not installed on this host")
+require("qlib.contrib.data.dataset")
 from qlib.contrib.data.dataset import MTSDatasetH  # noqa: E402
 
 from ashare_lab.research.sequence_dataset import (  # noqa: E402
