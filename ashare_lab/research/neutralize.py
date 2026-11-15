@@ -150,10 +150,12 @@ def compute_style_factors(
             f"no price rows on {end_time}; the provider has no bar for that day"
         )
     if raw is None or raw.empty:
-        log.warning("compute_style_factors: no data returned from D.features")
-        return pd.DataFrame(
-            columns=["size", "volatility", "momentum"],
-            index=pd.MultiIndex.from_tuples([], names=["datetime", "instrument"]),
+        # An empty answer means the provider has no rows at all for this range,
+        # so no day in it can be neutralized; returning an empty frame let the
+        # caller blend raw scores under a name that says otherwise.
+        raise RuntimeError(
+            f"no price rows between {start_time} and {end_time}; the provider "
+            "has no data for that range"
         )
 
     # Ensure index order is (datetime, instrument) for consistency.
@@ -163,7 +165,10 @@ def compute_style_factors(
     # Compute raw factors.
     close = raw["$close"]
     volume = raw["$volume"]
-    size_raw = np.log(close * volume)
+    # log(0) is -inf, which survives the per-date check below and then poisons
+    # the cross-sectional mean and std for that session.
+    turnover = (close * volume).where(close * volume > 0)
+    size_raw = np.log(turnover)
     volatility_raw = raw["Std($close, 20)/Mean($close, 20)"]
     momentum_raw = raw["$close/Ref($close, 20) - 1"]
 
@@ -182,7 +187,10 @@ def compute_style_factors(
     # on. Checking the whole range at once misses the commonest shape: the
     # first sessions of a window, where the factor has no history yet.
     per_date = factors.groupby(level="datetime").apply(
-        lambda day: [name for name in factors.columns if day[name].isna().all()],
+        lambda day: [
+            name for name in factors.columns
+            if not np.isfinite(day[name].to_numpy(dtype=float, na_value=np.nan)).any()
+        ],
         include_groups=False,
     )
     dead = per_date[per_date.map(len) > 0]

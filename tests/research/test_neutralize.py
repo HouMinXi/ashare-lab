@@ -379,3 +379,19 @@ class TestNeutralizePredictions:
                     start_time="2024-01-15",
                     end_time="2024-01-18",
                 )
+
+    def test_zero_volume_is_not_a_usable_size_factor(self, synthetic_50_stocks):
+        """log(0) is -inf, which is not a missing value to isna()."""
+        _pred, mock_df, instruments = synthetic_50_stocks
+        mock_df["$volume"] = 0.0
+
+        with patch("qlib.data.D") as mock_D:
+            mock_D.features.return_value = mock_df
+            from ashare_lab.research.neutralize import compute_style_factors
+
+            with pytest.raises(RuntimeError, match="size"):
+                compute_style_factors(
+                    instruments=instruments,
+                    start_time="2024-01-15",
+                    end_time="2024-01-15",
+                )

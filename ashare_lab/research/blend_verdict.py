@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ashare_lab.config import load_config
 from ashare_lab.research.blend import TRA_WEIGHT, blend_tra_ntra
+from ashare_lab.research.neutralize import STYLE_FACTOR_FIELDS
 from ashare_lab.research.rolling import run_full_walk_forward
 from ashare_lab.research.verdict import build_verdict, write_verdict
 
@@ -84,6 +85,13 @@ def run_blend_verdict(
         gate_config=gate_config,
         failed_windows=failed_windows,
     )
+
+    # A verdict is only comparable with another one measured by the same
+    # estimator; name it, or a pre-fix and a post-fix verdict look identical.
+    verdict["estimator"] = {
+        "blend_tra_weight": tra_weight,
+        "style_factors": list(STYLE_FACTOR_FIELDS),
+    }
 
     # Write verdict.json.
     if results_dir is None:

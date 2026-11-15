@@ -59,8 +59,11 @@ def run_full_walk_forward(
         signal_transform: Optional callable (pred, window) -> pred that
             transforms raw predictions before IC/backtest. When None,
             behavior is byte-identical to the untransformed pipeline.
-            Exceptions are caught per-window: raw pred is kept, the window
-            ID is recorded in transform_failures, and a warning is logged.
+            A window whose transform raises keeps the raw pred and is
+            recorded; at the end of the run any recorded transform failure
+            raises, because a verdict built from a mixture of transformed and
+            raw windows describes neither.
+        Per-window errors are caught and logged with full tracebacks.
 
     Returns:
         Tuple of (window_results, failed_windows).
@@ -72,8 +75,9 @@ def run_full_walk_forward(
             training/backtest. Empty list when all windows succeed.
 
     Raises:
-        RuntimeError: When zero windows complete or fewer than min_windows
-            succeed. Prevents silent empty/partial verdicts.
+        RuntimeError: When zero windows complete, fewer than min_windows
+            succeed, or any window's signal_transform failed (the verdict
+            would otherwise mix transformed and raw scores).
     """
     cfg = load_config()
     min_windows: int = cfg["walk_forward"]["min_windows"]

@@ -56,13 +56,17 @@ TRADE_DATE=$(python3 -c "
 from ashare_lab.data.calendar import latest_trading_day
 import datetime as dt
 print(latest_trading_day(dt.date.today()))
-") || { echo "ERROR: failed to resolve trade date"; exit 1; }
+") || { echo "ERROR: failed to resolve trade date"
+    python3 "$REPO/scripts/alert.py" "1" "calendar" "0" "$STDERR_LOG" || true
+    exit 1; }
 
 IS_TRADING=$(python3 -c "
 from ashare_lab.data.calendar import is_trading_day
 import datetime as dt
 print(is_trading_day(dt.date.today()))
-") || { echo "ERROR: failed to check trading day"; exit 1; }
+") || { echo "ERROR: failed to check trading day"
+    python3 "$REPO/scripts/alert.py" "1" "calendar" "0" "$STDERR_LOG" || true
+    exit 1; }
 
 # Validate TRADE_DATE format (guard against Python stderr leaking into var)
 if ! [[ "$TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then

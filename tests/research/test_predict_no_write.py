@@ -189,3 +189,47 @@ def test_every_admitted_instrument_is_scored_exactly_once():
     # Sorting first would assert only that sorting sorts.
     scores = frame["score"].droplevel("datetime")
     assert scores.loc["A"] < scores.loc["B"] < scores.loc["C"]
+
+
+def test_a_multi_batch_view_is_refused():
+    """Skipping the loss store is only valid for a single batch.
+
+    qlib reads the store back when it builds a later batch's state, so a second
+    batch would be scored against zeros without saying so.
+    """
+    from ashare_lab.research.predict import predict_without_memory_write
+
+    instruments = ["A", "B", "C"]
+    handler = DataHandlerLP.from_df(_multi_frame(DATES, ("A", "B", "C"), ()))
+    root = ContainedMTSDatasetH(
+        handler,
+        {
+            "test": SegmentAdmission(
+                start=DATES[8], end=DATES[8], purpose="live", outcome_cutoff=DATES[8]
+            )
+        },
+        calendar=DATES,
+        raw_labels=_multi_labels(DATES, instruments),
+        seq_len=3,
+        num_states=2,
+    )
+    view = _TwoBatchVersion(root.prepare("test"))
+
+    with pytest.raises(RuntimeError, match="must evaluate as one batch"):
+        predict_without_memory_write(_model(), view)
+
+
+class _TwoBatchVersion:
+    """A view that claims to evaluate as more than one batch."""
+
+    def __init__(self, view):
+        self._view = view
+
+    def __len__(self):
+        return 2
+
+    def __iter__(self):
+        return iter(self._view)
+
+    def eval(self):
+        return self._view.eval()

@@ -470,6 +470,14 @@ def predict_without_memory_write(model, data_set):
 
     if not model.fitted:
         raise ValueError("model is not fitted yet!")
+    # Skipping the store is only equivalent when every row is scored from the
+    # same single batch: qlib reads it back when it builds a later batch's
+    # state, so a second batch would be scored against zeros.
+    if len(data_set) != 1:
+        raise RuntimeError(
+            f"the live view must evaluate as one batch, got {len(data_set)}; "
+            "scoring it without the loss store would not match TRAModel.predict"
+        )
     model.model.eval()
     model.tra.eval()
     data_set.eval()
