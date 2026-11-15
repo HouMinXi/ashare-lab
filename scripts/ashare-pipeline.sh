@@ -116,19 +116,42 @@ sync_code_to_gpu() {
     local STAGING="/tmp/gpu-deploy"
 
     # A tree behind its upstream ships code nobody reviewed: the manifest
-    # certifies those bytes and every later check passes.
-    if git -C "$REPO" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-        if git -C "$REPO" fetch --quiet origin 2>/dev/null; then
-            local behind
-            behind=$(git -C "$REPO" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
-            if [ "${behind:-0}" -gt 0 ]; then
-                echo "ERROR: $REPO is $behind commits behind its upstream; pull before shipping" >&2
-                return 1
-            fi
-        else
-            echo "WARNING: could not fetch $REPO; shipping its current tree" >&2
-        fi
+    # certifies those bytes and every later check passes. Freshness is not
+    # always establishable (no branch, detached HEAD, fetch fails), and those
+    # cases must not pass silently, so the manifest marks them instead.
+    ASHARE_FRESHNESS=verified
+    local branch remote merge_ref behind
+    branch=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    remote=""
+    merge_ref=""
+    if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+        remote=$(git -C "$REPO" config --get "branch.$branch.remote" 2>/dev/null || true)
+        merge_ref=$(git -C "$REPO" config --get "branch.$branch.merge" 2>/dev/null || true)
     fi
+    case "$remote" in
+        "" | ".")
+            ASHARE_FRESHNESS=unverified
+            echo "WARNING: $REPO has no upstream for $branch; shipping its current tree" >&2
+            ;;
+        *)
+            if ! timeout 60 git -C "$REPO" fetch --quiet "$remote" 2>/dev/null; then
+                ASHARE_FRESHNESS=unverified
+                echo "WARNING: could not fetch $remote for $REPO; shipping its current tree" >&2
+            else
+                behind=$(git -C "$REPO" rev-list --count \
+                    "HEAD..$remote/${merge_ref#refs/heads/}" 2>/dev/null) || behind=""
+                if [ -z "$behind" ]; then
+                    ASHARE_FRESHNESS=unverified
+                    echo "WARNING: cannot compare $REPO with $remote/${merge_ref#refs/heads/}" >&2
+                elif [ "$behind" -gt 0 ]; then
+                    echo "ERROR: $REPO is $behind commits behind $remote; pull before shipping" >&2
+                    return 1
+                fi
+            fi
+            ;;
+    esac
+    export ASHARE_FRESHNESS
+
     if ! bash "$REPO/scripts/stage_gpu_code.sh" "$REPO" "$STAGING"; then
         return 1
     fi

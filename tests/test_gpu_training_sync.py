@@ -158,5 +158,50 @@ def test_a_tree_behind_its_upstream_is_refused(tmp_path):
 
     result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=120)
 
-    assert "behind its upstream" in result.stderr, result.stdout + result.stderr
+    assert "commits behind origin" in result.stderr, result.stdout + result.stderr
     assert "RC=1" in result.stdout
+
+
+def test_a_detached_checkout_ships_marked_unverified(tmp_path):
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(seed)], check=True, capture_output=True)
+    (seed / "ashare_lab").mkdir()
+    (seed / "ashare_lab" / "m.py").write_text("x = 1\n")
+    (seed / "configs").mkdir()
+    (seed / "configs" / "c.yaml").write_text("a: 1\n")
+    (seed / "scripts").mkdir()
+    for name in ("stage_gpu_code.sh", "deploy_verify.py"):
+        (seed / "scripts" / name).write_bytes((ROOT / "scripts" / name).read_bytes())
+    _git("add", "-A", cwd=seed)
+    _git("commit", "-qm", "one", cwd=seed)
+    _git("push", "-q", "origin", "HEAD:main", cwd=seed)
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "main", str(bare), str(clone)],
+        check=True, capture_output=True,
+    )
+    _git("checkout", "-q", "--detach", "HEAD", cwd=clone)
+
+    script = tmp_path / "sync.sh"
+    script.write_text(
+        "set -uo pipefail\n"
+        f"REPO={shlex.quote(str(clone))}\n"
+        f"RECEIVER={shlex.quote(str(tmp_path / 'r'))}\n"
+        "GPU_USER=fixture\nGPU_HOST=fixture\n"
+        'scp() { return 0; }\n'
+        'ssh() { return 0; }\n'
+        'timeout() { shift; "$@"; }\n'
+        + _pipeline_function()
+        + '\nsync_code_to_gpu\necho "RC=$? FRESHNESS=$ASHARE_FRESHNESS"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=120)
+
+    # Detached is not a reason to stop the night, but it is a reason to say the
+    # shipped bytes were never compared with anything.
+    assert "RC=0 FRESHNESS=unverified" in result.stdout, result.stdout + result.stderr
+    assert "no upstream" in result.stderr
