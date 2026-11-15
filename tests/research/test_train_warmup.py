@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +9,8 @@ import sys
 from unittest import mock
 
 import pytest
+
+from tests.stack import require
 
 
 class _DatasetObserved(Exception):
@@ -23,13 +24,7 @@ def _skip_unless_training_stack() -> None:
     interpreter that runs this file; where they are not, the probes cannot run
     at all and say so instead of failing on an import.
     """
-    missing = [name for name in ("qlib", "torch")
-               if importlib.util.find_spec(name) is None]
-    if missing:
-        pytest.skip(
-            "needs " + " and ".join(missing)
-            + "; run this file where the training stack is installed"
-        )
+    require("qlib", "torch")
 
 
 def _real_dataset_case(tmp_path, model_type):

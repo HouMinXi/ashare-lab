@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-torch = pytest.importorskip("torch", reason="torch not installed on this host")
+from tests.stack import require
+
+torch = require("torch")
 DataHandlerLP = pytest.importorskip(
     "qlib.data.dataset.handler", reason="qlib not installed on this host"
 ).DataHandlerLP
