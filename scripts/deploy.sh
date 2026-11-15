@@ -4,6 +4,12 @@
 #
 # Usage: bash scripts/deploy.sh
 #   (or run from any directory -- the script finds/creates the repo)
+#
+# Takes no pipeline lock: a manual deploy can run while ashare-pipeline.sh
+# holds /tmp/ashare-pipeline.lock and mutates $REPO under it. The two paths
+# stage to separate directories, so they cannot delete each other's tree, but
+# a deploy started mid-run still ships whatever the tree looks like at that
+# moment. Run it outside the 17:00-22:00 window.
 set -euo pipefail
 
 REPO="$HOME/code/ashare-lab"
@@ -91,18 +97,38 @@ fi
 # ---- Section 7: SCP predict.py + deps to GPU (staging dir, no remote mkdir -p) ----
 
 echo "==> Staging files for GPU deploy"
-STAGING="/tmp/gpu-deploy"
-rm -rf "$STAGING"
-mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
-cp ashare_lab/research/predict.py "$STAGING/ashare_lab/research/"
-cp ashare_lab/research/model_meta.py "$STAGING/ashare_lab/research/"
-cp ashare_lab/config.py "$STAGING/ashare_lab/"
-touch "$STAGING/ashare_lab/__init__.py"
-touch "$STAGING/ashare_lab/research/__init__.py"
-cp configs/baseline.yaml "$STAGING/configs/"
+STAGING="${GPU_DEPLOY_STAGING:-/tmp/gpu-deploy-manual}"
+if [ ! -f scripts/stage_gpu_code.sh ]; then
+    echo "ERROR: run deploy.sh from the repository root" >&2
+    exit 1
+fi
+# Same staging contract as the scheduled pipeline, so both paths leave the
+# target in the same state and the same verifier can check it.
+bash scripts/stage_gpu_code.sh "$PWD" "$STAGING"
 
-scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/" \
-    || echo "  GPU SCP failed (non-fatal -- may be powered off)"
+# The code transfer is one section of a host setup: a sleeping GPU must not
+# leave the timers uninstalled, so record the failure and keep going, then
+# report it in the exit status (including when a later section aborts).
+CODE_DEPLOY_FAILED=0
+trap '[ "$CODE_DEPLOY_FAILED" -eq 0 ] || echo "NOTE: the GPU tree is not confirmed as the shipped tree" >&2' EXIT
+if ! ( shopt -s dotglob; scp -o ConnectTimeout=10 -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/" ); then
+    echo "ERROR: GPU code transfer failed; the target tree is not the shipped tree" >&2
+    CODE_DEPLOY_FAILED=1
+else
+    if timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 \
+        "${GPU_USER}@${GPU_HOST}" "cd /d H:\\ashare-lab && py deploy_verify.py"; then
+        verify_rc=0
+    else
+        verify_rc=$?
+    fi
+    if [ "$verify_rc" -eq 124 ] || [ "$verify_rc" -eq 255 ]; then
+        echo "ERROR: the deploy check did not complete (rc=$verify_rc); the target tree is unconfirmed" >&2
+        CODE_DEPLOY_FAILED=1
+    elif [ "$verify_rc" -ne 0 ]; then
+        echo "ERROR: the deploy check reported a mismatch; the target tree is not the shipped tree" >&2
+        CODE_DEPLOY_FAILED=1
+    fi
+fi
 rm -rf "$STAGING"
 
 # ---- Section 8: loginctl enable-linger (MANDATORY for 7x24 timers) ----
@@ -240,4 +266,8 @@ systemctl --user list-timers --no-pager
 echo ""
 loginctl show-user "$(whoami)" -p Linger
 echo ""
+if [ "$CODE_DEPLOY_FAILED" -ne 0 ]; then
+    echo "Deploy finished with errors: the GPU tree is not confirmed as the shipped tree; re-run before the 18:00 job." >&2
+    exit 1
+fi
 echo "Deploy complete."

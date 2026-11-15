@@ -1,7 +1,10 @@
 """Tests for sync_gpu_data in scripts/ashare-data-update.sh."""
 
 import re
+import hashlib
+import shlex
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -211,19 +214,126 @@ class TestGpuCodeSyncShipsModelMeta:
     PIPELINE = Path(SCRIPT).resolve().parent / "ashare-pipeline.sh"
     DEPLOY = Path(SCRIPT).resolve().parent / "deploy.sh"
 
-    def test_pipeline_sync_copies_model_meta(self):
+    def test_pipeline_uses_the_shared_staging_script(self):
         src = self.PIPELINE.read_text()
         fn = src[src.index("sync_code_to_gpu()"): src.index("try_gpu_inference()")]
-        assert "model_meta.py" in fn, (
-            "sync_code_to_gpu must copy model_meta.py with predict.py"
+        assert "stage_gpu_code.sh" in fn, (
+            "the scheduled sync and the manual deploy must stage the same tree"
         )
-        assert "predict.py" in fn
+        assert "py deploy_verify.py" in fn, "the guard must run the verifier remotely"
 
-    def test_deploy_sync_copies_model_meta(self):
+    def test_pipeline_refuses_to_run_on_unknown_code(self):
+        src = self.PIPELINE.read_text()
+        assert "sync_code_to_gpu || echo" not in src, (
+            "a failed sync must not fall through to inference"
+        )
+        assert "refusing to run inference on unknown code" in src
+
+    def test_deploy_uses_the_shared_staging_script(self):
         src = self.DEPLOY.read_text()
         staging = src[src.index("Staging files for GPU deploy"): src.index("Section 8")]
-        assert "model_meta.py" in staging
-        assert "predict.py" in staging
+        assert "stage_gpu_code.sh" in staging
+        assert "deploy_verify.py" in staging
+        # A transfer that did not land must not end in "Deploy complete".
+        assert 'ERROR: GPU code transfer failed' in staging
+        assert staging.count("CODE_DEPLOY_FAILED=1") >= 2, (
+            "both the failed transfer and the failed verification must be recorded"
+        )
+        assert 'Deploy finished with errors' in src, (
+            "the run must exit non-zero after installing the host"
+        )
+
+
+class TestStagingScript:
+    """scripts/stage_gpu_code.sh is the single definition of what ships."""
+
+    STAGE = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    ROOT = Path(SCRIPT).resolve().parents[1]
+
+    def test_it_ships_the_package_configs_and_a_manifest(self, tmp_path):
+        staging = tmp_path / "stage"
+        result = subprocess.run(
+            ["bash", str(self.STAGE), str(self.ROOT), str(staging)],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        assert (staging / "ashare_lab/research/sequence_dataset.py").is_file()
+        assert (staging / "ashare_lab/research/sequence_eligibility.py").is_file()
+        assert (staging / "configs/baseline.yaml").is_file()
+        assert (staging / "deploy_verify.py").is_file()
+        # The trading engine and local databases stay on the source host.
+        assert not (staging / "ashare_lab/paper").exists()
+        assert not list(staging.rglob("*.db"))
+
+        manifest = staging / "deploy-manifest.sha256"
+        header = manifest.read_text().splitlines()[0]
+        assert header.startswith("# revision "), header
+        # The tree here has uncommitted edits, so the id must say so.
+        assert len(header.split()[-1].removesuffix("-dirty")) == 40, header
+        listed = {
+            line.split(None, 1)[1].strip()
+            for line in manifest.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        shipped = {
+            path.relative_to(staging).as_posix()
+            for path in staging.rglob("*")
+            if path.is_file() and path.name != "deploy-manifest.sha256"
+        }
+        assert listed == shipped
+        assert not any(name.startswith("ashare_lab/paper/") for name in listed)
+
+
+class TestDeployVerify:
+    """scripts/deploy_verify.py decides whether a sync landed."""
+
+    VERIFY = Path(SCRIPT).resolve().parent / "deploy_verify.py"
+
+    def _tree(self, tmp_path, content="x = 1\n", drop=False):
+        root = tmp_path / "deploy"
+        (root / "ashare_lab").mkdir(parents=True)
+        (root / "configs").mkdir()
+        (root / "ashare_lab" / "mod.py").write_text(content)
+        (root / "configs" / "baseline.yaml").write_text("universe: {}\n")
+        lines = []
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            rel = path.relative_to(root).as_posix()
+            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}")
+        if not drop:
+            (root / "deploy-manifest.sha256").write_text("\n".join(lines) + "\n")
+        (root / "deploy_verify.py").write_text(self.VERIFY.read_text())
+        return root
+
+    def test_a_changed_file_is_reported(self, tmp_path):
+        root = self._tree(tmp_path)
+        (root / "ashare_lab" / "mod.py").write_text("x = 2\n")
+        result = subprocess.run(
+            [sys.executable, "deploy_verify.py"], cwd=root,
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "1 changed" in result.stdout
+        assert "ashare_lab/mod.py" in result.stdout
+
+    def test_a_missing_file_is_reported(self, tmp_path):
+        root = self._tree(tmp_path)
+        (root / "ashare_lab" / "mod.py").unlink()
+        result = subprocess.run(
+            [sys.executable, "deploy_verify.py"], cwd=root,
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "1 missing" in result.stdout
+
+    def test_a_missing_manifest_is_refused(self, tmp_path):
+        root = self._tree(tmp_path, drop=True)
+        result = subprocess.run(
+            [sys.executable, "deploy_verify.py"], cwd=root,
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "manifest" in result.stdout
 
 
 class TestGpuLastConsumer:
@@ -900,3 +1010,155 @@ class TestRetrainGatePicksTheNewestByTrainDate:
             {"w115.pt": ("", 1_800_000_000), "w12.pt": ("2026-06-30", 1_700_000_000)},
         )
         assert chosen == "w12.pt"
+
+
+def test_staging_refuses_to_clear_the_repository(tmp_path):
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    repo = tmp_path / "repo"
+    (repo / "ashare_lab").mkdir(parents=True)
+    (repo / "ashare_lab" / "mod.py").write_text("x = 1\n")
+
+    result = subprocess.run(
+        ["bash", str(stage), str(repo), str(repo)],
+        capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "refusing to stage" in result.stderr
+    assert (repo / "ashare_lab" / "mod.py").exists()
+
+
+def test_staging_refuses_a_directory_that_contains_the_repository(tmp_path):
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    repo = tmp_path / "repo"
+    (repo / "ashare_lab").mkdir(parents=True)
+    (repo / "ashare_lab" / "mod.py").write_text("x = 1\n")
+
+    result = subprocess.run(
+        ["bash", str(stage), str(repo), str(tmp_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "contains the repository" in result.stderr
+    assert (repo / "ashare_lab" / "mod.py").exists()
+
+
+def test_staging_refuses_the_filesystem_root(tmp_path):
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    repo = tmp_path / "repo"
+    (repo / "ashare_lab").mkdir(parents=True)
+
+    result = subprocess.run(
+        ["bash", str(stage), str(repo), "/"],
+        capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "refusing to stage into /" in result.stderr
+
+
+def test_staging_refuses_a_dotdot_path_into_the_repository(tmp_path):
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    repo = tmp_path / "repo"
+    (repo / "ashare_lab").mkdir(parents=True)
+    (repo / "ashare_lab" / "mod.py").write_text("x = 1\n")
+
+    result = subprocess.run(
+        ["bash", str(stage), str(repo), str(repo / "..")],
+        capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "refusing to clear" in result.stderr
+    assert (repo / "ashare_lab" / "mod.py").exists()
+
+
+def _run_deploy_section7(tmp_path, scp_ok, ssh_ok):
+    """Execute deploy.sh's code-ship section with a failing transport."""
+    deploy = Path(SCRIPT).resolve().parent / "deploy.sh"
+    source = deploy.read_text()
+    block = source[
+        source.index('echo "==> Staging files for GPU deploy"'):
+        source.index("# ---- Section 8")
+    ]
+    script = tmp_path / "run.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"cd {shlex.quote(str(deploy.resolve().parents[1]))}\n"
+        "GPU_USER=fixture\n"
+        "GPU_HOST=fixture\n"
+        f"GPU_DEPLOY_STAGING={shlex.quote(str(tmp_path / 'staging'))}\n"
+        f"scp() {{ return {0 if scp_ok else 1}; }}\n"
+        f"ssh() {{ return {0 if ssh_ok else 1}; }}\n"
+        'timeout() { shift; "$@"; }\n'
+        + block
+        + 'echo "REACHED_HOST_SETUP flag=$CODE_DEPLOY_FAILED"\n',
+        encoding="utf-8",
+    )
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=180)
+
+
+def test_a_failed_transfer_still_installs_the_host(tmp_path):
+    result = _run_deploy_section7(tmp_path, scp_ok=False, ssh_ok=False)
+
+    assert "REACHED_HOST_SETUP flag=1" in result.stdout, result.stdout + result.stderr
+    assert "not the shipped tree" in result.stderr
+    assert "NOTE:" in result.stderr
+
+
+def test_a_failed_verification_after_a_good_transfer_is_reported(tmp_path):
+    result = _run_deploy_section7(tmp_path, scp_ok=True, ssh_ok=False)
+
+    assert "REACHED_HOST_SETUP flag=1" in result.stdout
+    assert "reported a mismatch" in result.stderr
+
+
+def test_a_timed_out_verification_says_the_tree_is_unconfirmed(tmp_path):
+    deploy = Path(SCRIPT).resolve().parent / "deploy.sh"
+    source = deploy.read_text()
+    block = source[
+        source.index('echo "==> Staging files for GPU deploy"'):
+        source.index("# ---- Section 8")
+    ]
+    script = tmp_path / "run.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"cd {shlex.quote(str(deploy.resolve().parents[1]))}\n"
+        "GPU_USER=fixture\nGPU_HOST=fixture\n"
+        f"GPU_DEPLOY_STAGING={shlex.quote(str(tmp_path / 'staging'))}\n"
+        "scp() { return 0; }\n"
+        "ssh() { return 1; }\n"
+        'timeout() { shift; return 124; }\n'
+        + block
+        + 'echo "REACHED_HOST_SETUP flag=$CODE_DEPLOY_FAILED"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=180)
+
+    assert "REACHED_HOST_SETUP flag=1" in result.stdout
+    assert "did not complete (rc=124)" in result.stderr
+
+
+def test_staging_refuses_a_symlinked_staging_directory(tmp_path):
+    # `rm -rf link/` follows the trailing slash into the target, so a staging
+    # path that is a symlink would clear whatever it points at.
+    stage = Path(SCRIPT).resolve().parent / "stage_gpu_code.sh"
+    repo = tmp_path / "repo"
+    for name in ("ashare_lab", "configs", "scripts"):
+        (repo / name).mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "keep.txt").write_text("keep\n")
+    link = tmp_path / "staging-link"
+    link.symlink_to(data)
+
+    result = subprocess.run(
+        ["bash", str(stage), str(repo), f"{link}/"],
+        capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "symbolic link" in result.stderr
+    assert (data / "keep.txt").read_text() == "keep\n"

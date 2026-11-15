@@ -110,42 +110,33 @@ else
     echo "WARNING: no data stamp found, proceeding anyway"
 fi
 
-# ---- Step 2b: Sync code to GPU (guard: predict.py must have --provider-uri) ----
+# ---- Step 2b: Sync code to GPU (guard: the predictor imports resolve there) ----
 
 sync_code_to_gpu() {
     local STAGING="/tmp/gpu-deploy"
-    rm -rf "$STAGING"
-    mkdir -p "$STAGING/ashare_lab/research" "$STAGING/configs"
-    cp "$REPO/ashare_lab/research/predict.py" "$STAGING/ashare_lab/research/"
-    # The retrain runs on this host too, and it imports train.py and the window
-    # helper train.py exports.  Leaving them out pinned the GPU at whatever
-    # version was deployed by hand: the 2026-11 retrain failed on a train.py
-    # that predated --serve-now by three months.
-    cp "$REPO/ashare_lab/research/train.py" "$STAGING/ashare_lab/research/"
-    cp "$REPO/ashare_lab/research/smoke_test.py" "$STAGING/ashare_lab/research/"
-    cp "$REPO/ashare_lab/research/windows.py" "$STAGING/ashare_lab/research/"
-    cp "$REPO/ashare_lab/research/model_meta.py" "$STAGING/ashare_lab/research/"
-    cp "$REPO/ashare_lab/research/shadow_predict.py" "$STAGING/ashare_lab/research/"
-    # matrix_runner and matrix configs may not exist on fresh deploys.
-    cp "$REPO/ashare_lab/research/matrix_runner.py" "$STAGING/ashare_lab/research/" 2>/dev/null || true
-    cp "$REPO/ashare_lab/config.py" "$STAGING/ashare_lab/"
-    cp "$REPO/ashare_lab/bridge.py" "$STAGING/ashare_lab/"
-    touch "$STAGING/ashare_lab/__init__.py"
-    touch "$STAGING/ashare_lab/research/__init__.py"
-    cp "$REPO/configs/baseline.yaml" "$STAGING/configs/"
-    cp "$REPO"/configs/matrix_*.yaml "$STAGING/configs/" 2>/dev/null || true
+    if ! bash "$REPO/scripts/stage_gpu_code.sh" "$REPO" "$STAGING"; then
+        return 1
+    fi
 
-    if ! scp -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/"; then
-        echo "WARNING: GPU code sync failed (non-fatal)"
+    if ! ( shopt -s dotglob; scp -o ConnectTimeout=10 -r "$STAGING"/* "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/" ); then
+        echo "ERROR: GPU code transfer failed" >&2
         rm -rf "$STAGING"
         return 1
     fi
     rm -rf "$STAGING"
 
-    # Guard: verify GPU predict.py accepts --provider-uri
-    if ! ssh -o ConnectTimeout=5 "${GPU_USER}@${GPU_HOST}" \
-        "cd /d H:\\ashare-lab && py -m ashare_lab.research.predict --help" 2>&1 | grep -q "provider-uri"; then
-        echo "ERROR: GPU predict.py missing --provider-uri after sync"
+    # Verify the remote tree byte-for-byte against the manifest, then import
+    # the closure predict_for_date needs. A missing or changed file fails here
+    # instead of at 18:00. The check imports torch and qlib on a cold box, so
+    # it is bounded: a stall here would hold the flock until the deadman.
+    timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
+        "cd /d H:\\ashare-lab && py deploy_verify.py"
+    local verify_rc=$?
+    if [ "$verify_rc" -eq 124 ] || [ "$verify_rc" -eq 255 ]; then
+        echo "ERROR: the deploy check did not finish (rc=$verify_rc); the target tree is unconfirmed" >&2
+        return 1
+    elif [ "$verify_rc" -ne 0 ]; then
+        echo "ERROR: the deploy check reported a mismatch" >&2
         return 1
     fi
     echo "GPU code synced and verified"
@@ -172,7 +163,10 @@ try_gpu_inference() {
     fi
 
     # Sync code to GPU before inference
-    sync_code_to_gpu || echo "WARNING: code sync failed, proceeding with existing GPU code"
+    if ! sync_code_to_gpu; then
+        echo "ERROR: GPU code sync failed; refusing to run inference on unknown code" >&2
+        return 1
+    fi
 
     # Verify GPU has today's trade date in qlib calendar (prevent stale data race)
     local gpu_has_date
@@ -226,12 +220,12 @@ try_gpu_inference() {
 
     # SCP predictions back
     mkdir -p "$PREDICTIONS_DIR"
-    if ! scp "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.parquet" "$PREDICTIONS_DIR/"; then
+    if ! timeout 300 scp -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.parquet" "$PREDICTIONS_DIR/"; then
         echo "ERROR: SCP predictions failed"
         return 1
     fi
     # SCP meta.json (non-fatal: parquet is the critical file)
-    scp "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.meta.json" "$PREDICTIONS_DIR/" 2>/dev/null || true
+    timeout 120 scp -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}":"H:/ashare-lab/predictions/${TRADE_DATE}.meta.json" "$PREDICTIONS_DIR/" 2>/dev/null || true
 
     return 0
 }
