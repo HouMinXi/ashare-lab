@@ -1240,3 +1240,24 @@ def test_the_manifest_marks_a_tree_whose_freshness_was_not_established(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     header = (out / "deploy-manifest.sha256").read_text().splitlines()[0]
     assert header.endswith("-unverified"), header
+
+
+def test_the_calendar_runway_pages_on_its_own_stamp():
+    """The wiring, not just its two halves.
+
+    A renamed environment variable would put the runway warning back on the
+    shared failure stamp, where a nightly failure alert and this warning
+    silence each other, and every other test would still pass.
+    """
+    src = (Path(SCRIPT).resolve().parent / "ashare-pipeline.sh").read_text()
+
+    block_start = src.index("# ---- Step 1b: Calendar runway ----")
+    block = src[block_start:src.index("Validate TRADE_DATE format", block_start)]
+
+    assert 'ASHARE_ALERT_STAMP="$HOME/.cache/ashare-alert-runway.stamp"' in block
+    assert '"$RUNWAY_DAYS" -lt 21' in block
+    # The warning form, not the failure form: --warn sends the text as written
+    # instead of "[ashare-lab] <stage> failed".
+    assert "alert.py\" --warn" in block
+    # A probe that cannot answer must say so rather than leave the pager quiet.
+    assert "cannot read the calendar runway" in block

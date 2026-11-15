@@ -120,7 +120,10 @@ def main() -> None:
         clear_stamp()
         return
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--warn":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--warn":
+        if len(sys.argv) < 3 or not sys.argv[2].strip():
+            print("Usage: alert.py --warn MESSAGE", file=sys.stderr)
+            sys.exit(2)
         if not _should_alert():
             sys.exit(0)
         if _send_qqbot(f"[ashare-lab] {sys.argv[2]}"):

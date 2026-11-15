@@ -56,7 +56,7 @@ TRADE_DATE=$(python3 -c "
 from ashare_lab.data.calendar import latest_trading_day
 import datetime as dt
 print(latest_trading_day(dt.date.today()))
-") || { echo "ERROR: failed to resolve trade date"
+" 2>>"$STDERR_LOG") || { echo "ERROR: failed to resolve trade date"
     python3 "$REPO/scripts/alert.py" "1" "calendar" "0" "$STDERR_LOG" || true
     exit 1; }
 
@@ -64,7 +64,7 @@ IS_TRADING=$(python3 -c "
 from ashare_lab.data.calendar import is_trading_day
 import datetime as dt
 print(is_trading_day(dt.date.today()))
-") || { echo "ERROR: failed to check trading day"
+" 2>>"$STDERR_LOG") || { echo "ERROR: failed to check trading day"
     python3 "$REPO/scripts/alert.py" "1" "calendar" "0" "$STDERR_LOG" || true
     exit 1; }
 
@@ -73,13 +73,18 @@ print(is_trading_day(dt.date.today()))
 # step 1. Page while there is still time, on its own stamp so a nightly failure
 # alert and this warning do not silence each other.
 RUNWAY=$(python3 -c "
-from ashare_lab.data.calendar import days_until_calendar_end
-print(days_until_calendar_end())
-" 2>/dev/null) || RUNWAY=""
-if [ -n "$RUNWAY" ] && [ "$RUNWAY" -lt 21 ] 2>/dev/null; then
+from ashare_lab.data.calendar import days_until_calendar_end, _get_calendar
+print(days_until_calendar_end(), _get_calendar().last_session.date())
+" 2>>"$STDERR_LOG") || { echo "WARNING: cannot read the calendar runway" >&2; RUNWAY=""; }
+RUNWAY_DAYS="${RUNWAY%% *}"
+RUNWAY_END="${RUNWAY##* }"
+if [ -n "$RUNWAY_DAYS" ] && [ "$RUNWAY_DAYS" -lt 21 ] 2>/dev/null; then
+    # Upgrading the package does not add the next year's holidays: the release
+    # that first carried a year's dates landed after that year's first session.
+    # The list itself has to be extended.
     ASHARE_ALERT_STAMP="$HOME/.cache/ashare-alert-runway.stamp" \
         python3 "$REPO/scripts/alert.py" --warn \
-        "exchange calendar ends in ${RUNWAY} day(s); update exchange_calendars" || true
+        "exchange calendar ends ${RUNWAY_END} (${RUNWAY_DAYS} day(s)); the packaged holiday list must be extended before then" || true
 fi
 
 # Validate TRADE_DATE format (guard against Python stderr leaking into var)

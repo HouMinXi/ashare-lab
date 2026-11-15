@@ -79,6 +79,7 @@ echo "python3 $@" >> "$SHIM_LOG"
 case " $* " in
     *latest_trading_day*) echo "2026-08-10"; exit 0;;
     *is_trading_day*)     echo "True";       exit 0;;
+    *days_until_calendar_end*) echo "46 2026-12-31"; exit 0;;
     *"FROM runs"*)       exec /usr/bin/python3 "$@";;
     *)                    exit 0;;
 esac

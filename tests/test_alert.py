@@ -2,6 +2,8 @@
 
 import ast
 import importlib.util
+
+import pytest
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -161,3 +163,14 @@ def test_a_warning_uses_its_own_stamp(monkeypatch, tmp_path):
 
     assert sent == ["[ashare-lab] calendar ends in 3 day(s)"]
     assert stamp.is_file()
+
+
+def test_a_warning_without_a_message_is_a_usage_error(monkeypatch, capsys):
+    monkeypatch.setattr(_alert_mod.sys, "argv", ["alert.py", "--warn"])
+    monkeypatch.setattr(_alert_mod, "_send_qqbot", lambda text: pytest.fail("sent an empty warning"))
+
+    with pytest.raises(SystemExit) as exc:
+        _alert_mod.main()
+
+    assert exc.value.code == 2
+    assert "Usage" in capsys.readouterr().err
