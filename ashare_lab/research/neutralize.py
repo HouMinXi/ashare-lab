@@ -109,7 +109,7 @@ def compute_style_factors(
             in qlib; close * volume approximates daily turnover value).
         volatility: Std($close, 20) / Mean($close, 20) -- 20-day coefficient
             of variation.
-        momentum: Ref($close, -20) / $close - 1 -- 20-day price momentum.
+        momentum: $close / Ref($close, 20) - 1 -- the past 20-session return.
 
     Each factor is cross-sectionally z-score normalized per date (mean=0,
     std=1) so regression coefficients are comparable.
@@ -130,7 +130,9 @@ def compute_style_factors(
         "$close",
         "$volume",
         "Std($close, 20)/Mean($close, 20)",
-        "Ref($close, -20)/$close - 1",
+        # A negative Ref looks forward: Ref($close, -20) is the close twenty
+        # sessions from now, which is a future return and unavailable live.
+        "$close/Ref($close, 20) - 1",
     ]
 
     raw = D.features(
@@ -156,7 +158,7 @@ def compute_style_factors(
     volume = raw["$volume"]
     size_raw = np.log(close * volume)
     volatility_raw = raw["Std($close, 20)/Mean($close, 20)"]
-    momentum_raw = raw["Ref($close, -20)/$close - 1"]
+    momentum_raw = raw["$close/Ref($close, 20) - 1"]
 
     factors = pd.DataFrame(
         {
@@ -166,6 +168,18 @@ def compute_style_factors(
         },
         index=raw.index,
     )
+
+    # A single-date call is the live path: a factor with no value anywhere in
+    # the cross-section cannot be estimated, and zero-filling it below would
+    # quietly neutralize against a different set of factors than the one the
+    # blend was validated on.
+    if pd.Timestamp(start_time) == pd.Timestamp(end_time):
+        dead = [name for name in factors.columns if factors[name].isna().all()]
+        if dead:
+            raise RuntimeError(
+                f"style factors {dead} have no value on {end_time}; the "
+                "provider has too little history to neutralize this day"
+            )
 
     # Cross-sectional z-score normalization per date.
     grouped = factors.groupby(level="datetime")

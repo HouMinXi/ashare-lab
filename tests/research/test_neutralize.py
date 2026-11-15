@@ -70,7 +70,7 @@ def _make_factor_features_df(dates, instruments, close, volume):
             "$close": [r[2] for r in rows],
             "$volume": [r[3] for r in rows],
             "Std($close, 20)/Mean($close, 20)": [0.05 + i * 0.01 for i in range(len(rows))],
-            "Ref($close, -20)/$close - 1": [0.02 + i * 0.005 for i in range(len(rows))],
+            "$close/Ref($close, 20) - 1": [0.02 + i * 0.005 for i in range(len(rows))],
         },
         index=idx,
     )
@@ -117,7 +117,7 @@ def synthetic_50_stocks():
             "$close": close_vals,
             "$volume": volume_vals,
             "Std($close, 20)/Mean($close, 20)": np.abs(vol_signal) * 0.05 + 0.01,
-            "Ref($close, -20)/$close - 1": mom_signal * 0.05,
+            "$close/Ref($close, 20) - 1": mom_signal * 0.05,
         },
         index=idx,
     )
@@ -149,6 +149,49 @@ class TestComputeStyleFactors:
         assert set(result.columns) == {"size", "volatility", "momentum"}
         assert result.index.names == ["datetime", "instrument"]
         assert len(result) == len(mock_df)
+
+    def test_momentum_looks_backwards(self, synthetic_50_stocks):
+        """Momentum must be the past 20-session return.
+
+        A negative Ref looks forward in qlib, so the old expression returned a
+        future return: it is unavailable on the day being predicted, where it
+        silently collapsed to zero.
+        """
+        _pred, mock_df, instruments = synthetic_50_stocks
+        seen = {}
+
+        def capture(**kwargs):
+            seen["fields"] = list(kwargs["fields"])
+            return mock_df
+
+        with patch("qlib.data.D") as mock_D:
+            mock_D.features.side_effect = capture
+            from ashare_lab.research.neutralize import compute_style_factors
+
+            compute_style_factors(
+                instruments=instruments,
+                start_time="2024-01-15",
+                end_time="2024-01-15",
+            )
+
+        momentum = [f for f in seen["fields"] if "close" in f and "Ref" in f]
+        assert momentum == ["$close/Ref($close, 20) - 1"], seen["fields"]
+
+    def test_a_factor_with_no_value_on_the_day_refuses(self, synthetic_50_stocks):
+        """A dead factor must stop the run, not silently neutralize without it."""
+        _pred, mock_df, instruments = synthetic_50_stocks
+        mock_df["$close/Ref($close, 20) - 1"] = np.nan
+
+        with patch("qlib.data.D") as mock_D:
+            mock_D.features.return_value = mock_df
+            from ashare_lab.research.neutralize import compute_style_factors
+
+            with pytest.raises(RuntimeError, match="no value on 2024-01-15"):
+                compute_style_factors(
+                    instruments=instruments,
+                    start_time="2024-01-15",
+                    end_time="2024-01-15",
+                )
 
 
 # ---------------------------------------------------------------------------
