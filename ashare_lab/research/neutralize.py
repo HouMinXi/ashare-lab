@@ -145,6 +145,10 @@ def compute_style_factors(
         end_time=end_time,
     )
 
+    if (raw is None or raw.empty) and str(start_time) == str(end_time):
+        raise RuntimeError(
+            f"no price rows on {end_time}; the provider has no bar for that day"
+        )
     if raw is None or raw.empty:
         log.warning("compute_style_factors: no data returned from D.features")
         return pd.DataFrame(
@@ -172,15 +176,24 @@ def compute_style_factors(
         index=raw.index,
     )
 
-    # A factor with no value at all cannot be estimated, and zero-filling it
-    # below would quietly neutralize against a different set of factors than
-    # the one the blend was validated on — live, where the day has no future
-    # data, and in a walk-forward, where 18 of 60 sessions once went that way.
-    dead = [name for name in factors.columns if factors[name].isna().all()]
-    if dead:
+    # A session where a factor has no value anywhere in the cross-section
+    # cannot be estimated, and zero-filling it below would quietly neutralize
+    # against a different set of factors than the one the blend was validated
+    # on. Checking the whole range at once misses the commonest shape: the
+    # first sessions of a window, where the factor has no history yet.
+    per_date = factors.groupby(level="datetime").apply(
+        lambda day: [name for name in factors.columns if day[name].isna().all()],
+        include_groups=False,
+    )
+    dead = per_date[per_date.map(len) > 0]
+    if len(dead) > 0:
+        names = sorted({name for names in dead for name in names})
+        days = [str(pd.Timestamp(index).date()) for index in dead.index[:3]]
+        more = "" if len(dead) <= 3 else f" and {len(dead) - 3} more"
         raise RuntimeError(
-            f"style factors {dead} have no value between {start_time} and "
-            f"{end_time}; the provider has too little history to neutralize"
+            f"style factors {names} have no value on {len(dead)} session(s) "
+            f"between {start_time} and {end_time} ({', '.join(days)}{more}); "
+            "the provider has too little history to neutralize them"
         )
 
     # Cross-sectional z-score normalization per date.

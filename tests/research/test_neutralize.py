@@ -186,7 +186,7 @@ class TestComputeStyleFactors:
             mock_D.features.return_value = mock_df
             from ashare_lab.research.neutralize import compute_style_factors
 
-            with pytest.raises(RuntimeError, match="no value between 2024-01-15 and 2024-01-15"):
+            with pytest.raises(RuntimeError, match="momentum.*1 session.*2024-01-15"):
                 compute_style_factors(
                     instruments=instruments,
                     start_time="2024-01-15",
@@ -343,4 +343,39 @@ class TestNeutralizePredictions:
                     instruments=instruments,
                     start_time="2024-01-15",
                     end_time="2024-01-17",
+                )
+
+    def test_a_range_whose_first_sessions_are_dead_refuses(self, ):
+        """A range with only its opening sessions dead is the quiet case.
+
+        Measured on the real store: a window starting at its first session
+        returns 20 of 60 days with every momentum value filled with zero,
+        because the whole-range check sees the 40 live days and stays silent.
+        """
+        dates = pd.bdate_range("2024-01-15", periods=4)
+        instruments = ["SH600000", "SH600001"]
+        idx = pd.MultiIndex.from_product(
+            [dates, instruments], names=["datetime", "instrument"]
+        )
+        momentum = [np.nan, np.nan, 0.01, 0.02] * 2
+        momentum.sort()
+        mock_df = pd.DataFrame(
+            {
+                "$close": 10.0,
+                "$volume": 1e6,
+                "Std($close, 20)/Mean($close, 20)": 0.05,
+                "$close/Ref($close, 20) - 1": momentum,
+            },
+            index=idx,
+        )
+
+        with patch("qlib.data.D") as mock_D:
+            mock_D.features.return_value = mock_df
+            from ashare_lab.research.neutralize import compute_style_factors
+
+            with pytest.raises(RuntimeError, match="2 session"):
+                compute_style_factors(
+                    instruments=instruments,
+                    start_time="2024-01-15",
+                    end_time="2024-01-18",
                 )

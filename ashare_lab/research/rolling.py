@@ -208,10 +208,19 @@ def run_full_walk_forward(
         )
 
     if transform_failures:
-        log.warning(
+        # The transform is the thing under test: a window that fell back to raw
+        # scores is not the strategy the verdict claims to have measured, and a
+        # verdict built from a mixture of the two is not comparable with one
+        # built from either.
+        log.error(
             "walk-forward: signal_transform failed on %d windows: %s",
             len(transform_failures),
             transform_failures,
+        )
+        raise RuntimeError(
+            f"walk-forward: signal_transform failed on windows "
+            f"{transform_failures}; the remaining windows scored raw "
+            "predictions, so no verdict can be built from this run"
         )
 
     log.info(

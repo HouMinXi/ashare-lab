@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 from ashare_lab.config import load_config
-from ashare_lab.research.blend import blend_tra_ntra
+from ashare_lab.research.blend import TRA_WEIGHT, blend_tra_ntra
 from ashare_lab.research.rolling import run_full_walk_forward
 from ashare_lab.research.verdict import build_verdict, write_verdict
 
@@ -50,8 +50,10 @@ def run_blend_verdict(
     topk: int = cfg["strategy"]["topk"]
     gate_config: dict = cfg["gate"]
 
-    # Fixed blend ratio from the locked default.
-    tra_weight = 0.60
+    # Fixed blend ratio from the locked default, read from the one place it is
+    # defined so the track name cannot describe a different strategy than the
+    # transform actually ran.
+    tra_weight = TRA_WEIGHT
 
     log.info(
         "blend_verdict: universe=%s, topk=%d, n_drop=%d, tra_weight=%.2f",

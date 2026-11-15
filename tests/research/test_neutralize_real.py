@@ -32,10 +32,13 @@ def _probe():
     instruments = ["SH600000", "SH600009", "SH600016", "SH600028", "SH600030",
                    "SH600036", "SH600048", "SH600050", "SH600104", "SH600276",
                    "SH600309", "SH600585", "SH600690", "SH600745", "SH600809"]
-    raw = D.features(instruments, ["$close"], "2026-06-01", "2026-12-31")
+    sessions = D.calendar()
+    end = pd.Timestamp(sessions[-1])
+    start = pd.Timestamp(sessions[-120])
+    raw = D.features(instruments, ["$close"], str(start.date()), str(end.date()))
     close = raw["$close"].unstack("instrument")
     if len(close) < 50:
-        raise SystemExit("provider too short for this check")
+        raise SystemExit(77)
 
     pos = len(close) - 25
     day = pd.Timestamp(close.index[pos])
@@ -53,15 +56,21 @@ def _probe():
 
 
 def test_momentum_is_the_past_return_on_the_real_store():
-    require("qlib", "torch")
+    require("qlib")
     if not PROVIDER.exists():
         pytest.skip(f"no qlib provider at {PROVIDER}")
 
+    root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-B", str(Path(__file__).resolve()), "--probe"],
         capture_output=True, text=True, timeout=300,
-        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="1"),
+        # The child runs with this file's directory first on sys.path, so the
+        # repository root has to come through the environment.
+        env=dict(os.environ, PYTHONPATH=str(root),
+                 PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="1"),
     )
+    if result.returncode == 77:
+        pytest.skip(f"no {PROVIDER} window long enough for this check")
     assert result.returncode == 0, result.stdout + result.stderr
 
 

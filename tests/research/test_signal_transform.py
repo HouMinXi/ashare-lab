@@ -328,7 +328,7 @@ class TestSignalTransformICComputedOnTransformed:
 
 
 class TestSignalTransformException:
-    """When signal_transform raises, raw pred is kept and failure recorded."""
+    """When signal_transform raises, the window keeps raw pred and the run refuses."""
 
     @patch("ashare_lab.research.rolling.get_all_windows")
     @patch("ashare_lab.research.rolling.train_window")
@@ -367,16 +367,16 @@ class TestSignalTransformException:
 
         from ashare_lab.research.rolling import run_full_walk_forward
 
-        # Should not raise -- failure is caught per-window.
-        results, failed = run_full_walk_forward(
-            exp_dir=tmp_path,
-            n_drop=1,
-            universe="csi500",
-            signal_transform=failing_transform,
-        )
-
-        assert len(results) == 1
-        assert len(failed) == 0
+        # The window still falls back to the raw scores while the run proceeds,
+        # but the run as a whole refuses to hand back a result: a verdict built
+        # from a mixture of transformed and raw windows describes neither.
+        with pytest.raises(RuntimeError, match="signal_transform failed on windows"):
+            run_full_walk_forward(
+                exp_dir=tmp_path,
+                n_drop=1,
+                universe="csi500",
+                signal_transform=failing_transform,
+            )
 
         # Verify backtest received the ORIGINAL (unfailed) pred.
         call_args = mock_backtest.call_args
