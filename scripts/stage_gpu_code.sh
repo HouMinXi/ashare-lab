@@ -77,17 +77,22 @@ fi
 # must not be reported under a clean commit id.
 revision=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
 # status --porcelain reports staged edits, unstaged edits, deletions and
-# untracked files alike; diff --quiet sees only the unstaged half.
-if [ "$revision" != unknown ] \
-    && [ -n "$(git -C "$REPO" status --porcelain -- ashare_lab configs scripts/deploy_verify.py 2>/dev/null)" ]; then
+# untracked files alike; --ignored adds what rsync ships but git tracks
+# nowhere. Only the byte-compiled caches rsync skips are excluded here.
+dirty=$(git -C "$REPO" status --porcelain --ignored=matching -- \
+    ashare_lab configs scripts/deploy_verify.py 2>/dev/null \
+    | grep -v -e '__pycache__' -e '\.pyc$' || true)
+if [ "$revision" != unknown ] && [ -n "$dirty" ]; then
     revision="$revision-dirty"
 fi
-# "verified" means the pipeline confirmed the tree is level with its upstream.
-# Anything else has to be visible in the one line the verifier prints.
-if [ "${ASHARE_FRESHNESS:-verified}" != verified ]; then
+# "verified" means the pipeline compared this tree with its upstream and found
+# them level. A caller that never compared must not get that answer by
+# default, so the unverified state is the default.
+if [ "${ASHARE_FRESHNESS:-unverified}" != verified ]; then
     revision="$revision-unverified"
 fi
 if ! { printf '# revision %s\n' "$revision"
+       printf '# staged %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
        ( cd "$STAGING" && find . -type f ! -name deploy-manifest.sha256 -print0 \
         | sed -z 's|^\./||' | LC_ALL=C sort -z | xargs -0 sha256sum ); } \
         > "$STAGING/deploy-manifest.sha256"; then

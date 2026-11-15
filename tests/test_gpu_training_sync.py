@@ -205,3 +205,65 @@ def test_a_detached_checkout_ships_marked_unverified(tmp_path):
     # shipped bytes were never compared with anything.
     assert "RC=0 FRESHNESS=unverified" in result.stdout, result.stdout + result.stderr
     assert "no upstream" in result.stderr
+
+
+def _sync_repo(tmp_path, name="clone"):
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(seed)], check=True, capture_output=True)
+    (seed / "ashare_lab").mkdir()
+    (seed / "ashare_lab" / "m.py").write_text("x = 1\n")
+    (seed / "configs").mkdir()
+    (seed / "configs" / "c.yaml").write_text("a: 1\n")
+    (seed / "scripts").mkdir()
+    for script in ("stage_gpu_code.sh", "deploy_verify.py"):
+        (seed / "scripts" / script).write_bytes((ROOT / "scripts" / script).read_bytes())
+    _git("add", "-A", cwd=seed)
+    _git("commit", "-qm", "one", cwd=seed)
+    _git("push", "-q", "origin", "HEAD:main", cwd=seed)
+    clone = tmp_path / name
+    subprocess.run(
+        ["git", "clone", "-q", "-b", "main", str(bare), str(clone)],
+        check=True, capture_output=True,
+    )
+    return bare, seed, clone
+
+
+def _run_sync(tmp_path, repo, name="sync"):
+    script = tmp_path / f"{name}.sh"
+    script.write_text(
+        "set -uo pipefail\n"
+        f"REPO={shlex.quote(str(repo))}\n"
+        f"RECEIVER={shlex.quote(str(tmp_path / 'r'))}\n"
+        "GPU_USER=fixture\nGPU_HOST=fixture\n"
+        'scp() { return 0; }\n'
+        'ssh() { return 0; }\n'
+        'timeout() { shift; "$@"; }\n'
+        + _pipeline_function()
+        + '\nsync_code_to_gpu\necho "RC=$? FRESHNESS=$ASHARE_FRESHNESS"\n',
+        encoding="utf-8",
+    )
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=120)
+
+
+def test_unpushed_commits_are_shipped_as_unverified(tmp_path):
+    _, seed, clone = _sync_repo(tmp_path)
+    (clone / "ashare_lab" / "m.py").write_text("x = 2\n")
+    _git("commit", "-qam", "local only", cwd=clone)
+
+    result = _run_sync(tmp_path, clone)
+
+    assert "RC=0 FRESHNESS=unverified" in result.stdout, result.stdout + result.stderr
+    assert "commits origin does not" in result.stderr
+
+
+def test_a_failed_fetch_ships_marked_unverified(tmp_path):
+    _, _, clone = _sync_repo(tmp_path)
+    # Point the branch at a remote that does not exist any more.
+    _git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=clone)
+
+    result = _run_sync(tmp_path, clone)
+
+    assert "RC=0 FRESHNESS=unverified" in result.stdout, result.stdout + result.stderr
+    assert "could not fetch" in result.stderr

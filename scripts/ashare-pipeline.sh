@@ -115,12 +115,12 @@ fi
 sync_code_to_gpu() {
     local STAGING="/tmp/gpu-deploy"
 
-    # A tree behind its upstream ships code nobody reviewed: the manifest
-    # certifies those bytes and every later check passes. Freshness is not
-    # always establishable (no branch, detached HEAD, fetch fails), and those
-    # cases must not pass silently, so the manifest marks them instead.
-    ASHARE_FRESHNESS=verified
-    local branch remote merge_ref behind
+    # A tree that is not level with its upstream ships bytes nobody reviewed:
+    # the manifest certifies them and every later check passes. Only a compare
+    # that actually ran counts as verified; everything else is marked unknown
+    # so the verifier's one printed line says so.
+    ASHARE_FRESHNESS=unverified
+    local branch remote merge_ref tip behind ahead
     branch=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     remote=""
     merge_ref=""
@@ -130,22 +130,30 @@ sync_code_to_gpu() {
     fi
     case "$remote" in
         "" | ".")
-            ASHARE_FRESHNESS=unverified
             echo "WARNING: $REPO has no upstream for $branch; shipping its current tree" >&2
             ;;
         *)
-            if ! timeout 60 git -C "$REPO" fetch --quiet "$remote" 2>/dev/null; then
-                ASHARE_FRESHNESS=unverified
-                echo "WARNING: could not fetch $remote for $REPO; shipping its current tree" >&2
+            if ! timeout 60 git -C "$REPO" fetch --quiet "$remote" "$merge_ref" 2>/dev/null; then
+                echo "WARNING: could not fetch $merge_ref from $remote; shipping its current tree" >&2
             else
-                behind=$(git -C "$REPO" rev-list --count \
-                    "HEAD..$remote/${merge_ref#refs/heads/}" 2>/dev/null) || behind=""
-                if [ -z "$behind" ]; then
-                    ASHARE_FRESHNESS=unverified
-                    echo "WARNING: cannot compare $REPO with $remote/${merge_ref#refs/heads/}" >&2
+                # FETCH_HEAD is what this fetch actually brought back; a
+                # tracking ref can be stale or narrowed by the refspec.
+                tip=$(git -C "$REPO" rev-parse FETCH_HEAD 2>/dev/null || echo "")
+                behind=""
+                ahead=""
+                if [ -n "$tip" ]; then
+                    behind=$(git -C "$REPO" rev-list --count "HEAD..$tip" 2>/dev/null || echo "")
+                    ahead=$(git -C "$REPO" rev-list --count "$tip..HEAD" 2>/dev/null || echo "")
+                fi
+                if [ -z "$tip" ] || [ -z "$behind" ] || [ -z "$ahead" ]; then
+                    echo "WARNING: cannot compare $REPO with $remote; shipping its current tree" >&2
                 elif [ "$behind" -gt 0 ]; then
                     echo "ERROR: $REPO is $behind commits behind $remote; pull before shipping" >&2
                     return 1
+                elif [ "$ahead" -gt 0 ]; then
+                    echo "WARNING: $REPO has $ahead commits $remote does not; shipping unverified" >&2
+                else
+                    ASHARE_FRESHNESS=verified
                 fi
             fi
             ;;
@@ -177,7 +185,11 @@ sync_code_to_gpu() {
         echo "ERROR: the deploy check reported a mismatch" >&2
         return 1
     fi
-    echo "GPU code synced and verified"
+    if [ "$ASHARE_FRESHNESS" = verified ]; then
+        echo "GPU code synced and verified"
+    else
+        echo "GPU code synced (freshness unverified)"
+    fi
     return 0
 }
 

@@ -1186,7 +1186,9 @@ def test_the_manifest_revision_marks_a_dirty_tree(tmp_path):
         mutate()
         out = tmp_path / "stage"
         result = subprocess.run(["bash", str(stage), str(repo), str(out)],
-                                capture_output=True, text=True, timeout=120)
+                                capture_output=True, text=True, timeout=120,
+                                env={"ASHARE_FRESHNESS": "verified",
+                                     "PATH": "/usr/bin:/bin"})
         assert result.returncode == 0, result.stdout + result.stderr
         return (out / "deploy-manifest.sha256").read_text().splitlines()[0]
 

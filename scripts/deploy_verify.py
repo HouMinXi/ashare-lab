@@ -35,6 +35,13 @@ CLOSURE = (
 )
 
 
+def _staged_at():
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# staged "):
+            return line.split(None, 2)[2].strip()
+    return "unknown"
+
+
 def _revision():
     for line in MANIFEST.read_text(encoding="utf-8").splitlines():
         if line.startswith("# revision "):
@@ -87,7 +94,7 @@ def main() -> int:
     load_config()
     print(
         f"deployment verified: {sum(1 for _ in _entries())} files, "
-        f"{len(CLOSURE)} modules, revision {_revision()}"
+        f"{len(CLOSURE)} modules, revision {_revision()}, staged {_staged_at()}"
     )
     return 0
 
