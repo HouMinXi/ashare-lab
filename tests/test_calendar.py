@@ -108,3 +108,16 @@ def test_every_entry_point_reports_a_calendar_that_ran_out_the_same_way():
     ):
         with pytest.raises(RuntimeError, match="calendar data needs updating"):
             call()
+
+
+def test_days_until_calendar_end_counts_to_the_last_session():
+    """The runway is what the pipeline pages on before the cliff is reached."""
+    from ashare_lab.data.calendar import _get_calendar, days_until_calendar_end
+
+    last = _get_calendar().last_session.date()
+
+    assert days_until_calendar_end(last) == 0
+    assert days_until_calendar_end(last - dt.timedelta(days=10)) == 10
+    # Past the end the number is negative rather than zero, so a caller can
+    # tell "the last day" from "the calendar is stale".
+    assert days_until_calendar_end(last + dt.timedelta(days=1)) == -1

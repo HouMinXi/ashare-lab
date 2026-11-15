@@ -133,3 +133,15 @@ def previous_trading_day(date: dt.date) -> dt.date:
         return cal.session_offset(ts, -1).date()
     prev = cal.previous_close(ts).normalize()
     return prev.date()
+
+
+def days_until_calendar_end(as_of: dt.date | None = None) -> int:
+    """Days between *as_of* and the last session the package knows.
+
+    Negative once the package has run out. The pipeline pages on this while a
+    fix is still possible, instead of finding out from a failed run.
+    """
+    if as_of is None:
+        as_of = market_today()
+    cal = _get_calendar()
+    return (cal.last_session.date() - as_of).days

@@ -11,7 +11,11 @@ from datetime import date, datetime, timedelta, timezone
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-DEFAULT_STAMP = os.path.expanduser("~/.cache/ashare-alert-last.stamp")
+# A warning pages on its own schedule; a shared stamp would let one kind of
+# message silence the other.
+DEFAULT_STAMP = os.environ.get("ASHARE_ALERT_STAMP") or os.path.expanduser(
+    "~/.cache/ashare-alert-last.stamp"
+)
 
 # ponytail: weekday proxy for trading days -- no exchange_calendars
 # available outside venv. Add XSHG holiday list if precision matters.
@@ -114,6 +118,13 @@ def _format_alert(
 def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "--clear-stamp":
         clear_stamp()
+        return
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--warn":
+        if not _should_alert():
+            sys.exit(0)
+        if _send_qqbot(f"[ashare-lab] {sys.argv[2]}"):
+            _write_stamp()
         return
 
     if len(sys.argv) < 4:

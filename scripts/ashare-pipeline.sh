@@ -68,6 +68,20 @@ print(is_trading_day(dt.date.today()))
     python3 "$REPO/scripts/alert.py" "1" "calendar" "0" "$STDERR_LOG" || true
     exit 1; }
 
+# ---- Step 1b: Calendar runway ----
+# The packaged calendar ends on a fixed date; once it does every run fails at
+# step 1. Page while there is still time, on its own stamp so a nightly failure
+# alert and this warning do not silence each other.
+RUNWAY=$(python3 -c "
+from ashare_lab.data.calendar import days_until_calendar_end
+print(days_until_calendar_end())
+" 2>/dev/null) || RUNWAY=""
+if [ -n "$RUNWAY" ] && [ "$RUNWAY" -lt 21 ] 2>/dev/null; then
+    ASHARE_ALERT_STAMP="$HOME/.cache/ashare-alert-runway.stamp" \
+        python3 "$REPO/scripts/alert.py" --warn \
+        "exchange calendar ends in ${RUNWAY} day(s); update exchange_calendars" || true
+fi
+
 # Validate TRADE_DATE format (guard against Python stderr leaking into var)
 if ! [[ "$TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
     echo "ERROR: invalid TRADE_DATE '$TRADE_DATE'"

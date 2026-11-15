@@ -138,3 +138,26 @@ class TestTheIntervalUsesTheExchangeDay:
         stamp.write_text(sentinel.isoformat())
 
         assert _should_alert(str(stamp)) is False
+
+
+def test_a_warning_uses_its_own_stamp(monkeypatch, tmp_path):
+    """A warning must not be silenced by, or silence, a failure alert."""
+    stamp = tmp_path / "runway.stamp"
+    monkeypatch.setenv("ASHARE_ALERT_STAMP", str(stamp))
+
+    # The module reads the stamp path at import, so a fresh copy is the only
+    # way to see the environment the pipeline will run it with.
+    spec = importlib.util.spec_from_file_location(
+        "alert_runway", Path(__file__).resolve().parent.parent / "scripts" / "alert.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    sent = []
+    monkeypatch.setattr(mod, "_send_qqbot", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(mod.sys, "argv", ["alert.py", "--warn", "calendar ends in 3 day(s)"])
+
+    mod.main()
+
+    assert sent == ["[ashare-lab] calendar ends in 3 day(s)"]
+    assert stamp.is_file()
