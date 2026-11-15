@@ -306,6 +306,11 @@ class TestBlendVerdictIC:
         assert verdict["window_details"][0]["mean_rank_ic"] == pytest.approx(0.08)
         assert verdict["window_details"][1]["mean_rank_ic"] == pytest.approx(0.04)
 
+        # A verdict is only comparable with one measured by the same estimator.
+        estimator = verdict["estimator"]
+        assert estimator["blend_tra_weight"] == pytest.approx(0.60)
+        assert "$close/Ref($close, 20) - 1" in estimator["style_factors"]
+
 
 class TestBlendExceptionPropagation:
     """Exceptions from neutralize_predictions propagate (Contract 1 catches them)."""

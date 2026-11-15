@@ -357,8 +357,10 @@ class TestNeutralizePredictions:
         idx = pd.MultiIndex.from_product(
             [dates, instruments], names=["datetime", "instrument"]
         )
-        momentum = [np.nan, np.nan, 0.01, 0.02] * 2
-        momentum.sort()
+        # Opening sessions dead, later ones alive -- the shape a window that
+        # starts before the factor has history produces.
+        per_name = [np.nan, np.nan, 0.01, 0.02]
+        momentum = per_name + per_name
         mock_df = pd.DataFrame(
             {
                 "$close": 10.0,

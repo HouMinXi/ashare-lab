@@ -299,7 +299,13 @@ def _protect_live_ledger(monkeypatch):
 _STACK_SKIPS: list[str] = []
 
 
-_STACK_MARKERS = ("training stack", "torch", "qlib")
+_STACK_MARKERS = (
+    "training stack",
+    "needs torch",
+    "needs qlib",
+    "torch not installed",
+    "qlib not installed",
+)
 
 
 def _note_stack_skip(report) -> None:

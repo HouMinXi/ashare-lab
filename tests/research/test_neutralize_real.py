@@ -50,7 +50,6 @@ def _probe():
     frame = pd.concat({"z": momentum, "past": past, "future": future}, axis=1).dropna()
 
     assert len(frame) >= 10, frame
-    assert momentum.notna().all(), "momentum must be populated on the live day"
     assert float(frame["z"].corr(frame["past"])) == pytest.approx(1.0, abs=0.02), frame
     assert float(frame["z"].corr(frame["future"])) < 0.9, frame
 

@@ -116,7 +116,7 @@ if ! ( shopt -s dotglob; scp -o ConnectTimeout=10 -r "$STAGING"/* "${GPU_USER}@$
     echo "ERROR: GPU code transfer failed; the target tree is not the shipped tree" >&2
     CODE_DEPLOY_FAILED=1
 else
-    if timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 \
+    if timeout 300 ssh -o BatchMode=yes -o ConnectTimeout=10 \
         "${GPU_USER}@${GPU_HOST}" "cd /d H:\\ashare-lab && py deploy_verify.py"; then
         verify_rc=0
     else

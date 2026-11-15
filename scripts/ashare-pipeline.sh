@@ -179,7 +179,7 @@ sync_code_to_gpu() {
     # the closure predict_for_date needs. A missing or changed file fails here
     # instead of at 18:00. The check imports torch and qlib on a cold box, so
     # it is bounded: a stall here would hold the flock until the deadman.
-    timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
+    timeout 300 ssh -o BatchMode=yes -o ConnectTimeout=10 "${GPU_USER}@${GPU_HOST}" \
         "cd /d H:\\ashare-lab && py deploy_verify.py"
     local verify_rc=$?
     if [ "$verify_rc" -eq 124 ] || [ "$verify_rc" -eq 255 ]; then
